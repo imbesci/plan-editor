@@ -250,6 +250,20 @@ Lifecycle invariants:
 - **`anchors[0]` mirrors `selector`/`text`** so single-anchor consumers need no
   branching.
 
+## Chrome UI invariants
+
+- **Nothing fails silently.** Every failure path goes through `toast()` or
+  `setStatus()`. `console.error` alone is how a broken morph and a dead server
+  came to look identical to "nothing is happening".
+- **EventSource reconnects silently** — it retries on its own with no UI signal,
+  so the disconnection bar and the `open`-after-`error` re-patch are what stop a
+  dead server from reading as an idle one.
+- **`hasViewer` gates browser launch.** Re-running `plan-editor <file>` used to
+  spawn a tab every time; the tabs pile up, each with its own stream, all
+  morphing and reporting independently. `--force-open` overrides.
+- **`chat` must be rendered.** Agent replies were stored, synced, and never
+  displayed for several revisions — the data being present is not the feature.
+
 ## Things that are deliberately absent
 
 No multiplayer, no CRDT, no identity model. The artifact is agent-owned and humans

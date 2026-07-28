@@ -137,12 +137,18 @@ async function openCommand(args: string[]): Promise<unknown> {
     const detail = (await response.json().catch(() => ({}))) as { error?: string };
     throw new CliError(detail.error ?? `Could not open session (${response.status})`);
   }
-  const session = (await response.json()) as { key: string; url: string; token: string };
+  const session = (await response.json()) as { key: string; url: string; token: string; hasViewer?: boolean };
 
-  if (!args.includes("--no-open")) await open(session.url);
+  // Only launch a browser when nothing is already watching. Re-running this
+  // during development otherwise leaves a pile of tabs, each holding its own
+  // stream and morphing independently.
+  const alreadyOpen = Boolean(session.hasViewer);
+  if (!args.includes("--no-open") && (!alreadyOpen || args.includes("--force-open"))) {
+    await open(session.url);
+  }
 
   return {
-    session: { file: canonical, url: session.url },
+    session: { file: canonical, url: session.url, reused_existing_tab: alreadyOpen },
     next_step:
       `The artifact is open. Now run \`plan-editor poll ${canonical}\`. It long-polls until the human submits an edit ` +
       `and stays silent while waiting — that is normal, never kill it. When edits arrive, apply them by editing ${canonical} ` +

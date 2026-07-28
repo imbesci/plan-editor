@@ -156,6 +156,11 @@ export async function serve(options: ServeOptions = {}) {
     }
   }
 
+  /** True when at least one browser is already watching this session. */
+  function hasViewer(key: string): boolean {
+    return (sseClients.get(key)?.size ?? 0) > 0;
+  }
+
   function emitPresence(key: string): void {
     void agentView(key).then((agent) => broadcast(key, { type: "presence", state: presenceOf(key), agent }));
   }
@@ -233,7 +238,45 @@ export async function serve(options: ServeOptions = {}) {
         key: session.key,
         token: session.token,
         file: session.file,
+        // Lets the CLI skip launching a browser when one is already watching.
+        // Re-running `plan-editor <file>` otherwise piles up tabs, each with its
+        // own SSE stream, all morphing and reporting independently.
+        hasViewer: hasViewer(session.key),
         url: `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}/s/${session.key}?t=${session.token}`,
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * Open sessions, for the in-browser switcher. Token-gated: a caller must
+   * already hold a valid token for *some* session. Every session belongs to the
+   * same local user and the state directory is already readable by them, so
+   * returning sibling URLs grants nothing they could not read off disk — but it
+   * does mean this route must never be reachable without a token.
+   */
+  app.get("/api/sessions", async (req, res, next) => {
+    try {
+      const token = String(req.query.t ?? "");
+      const all = await store.list();
+      const authorized = all.some((entry) => entry.token === token && token.length > 0);
+      if (!authorized) {
+        res.status(403).json({ error: "invalid session token" });
+        return;
+      }
+      res.json({
+        sessions: all
+          .filter((entry) => entry.status === "open")
+          .map((entry) => ({
+            key: entry.key,
+            file: entry.file,
+            name: entry.file.split("/").pop() ?? entry.file,
+            url: `/s/${entry.key}?t=${entry.token}`,
+            open: entry.annotations.filter((a) => a.status === "submitted").length,
+            addressed: entry.annotations.filter((a) => a.status === "addressed").length,
+            viewers: sseClients.get(entry.key)?.size ?? 0,
+          })),
       });
     } catch (error) {
       next(error);

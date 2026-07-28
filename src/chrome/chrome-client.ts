@@ -15,37 +15,44 @@ interface Bootstrap {
 const bootstrap = JSON.parse(document.getElementById("pe-session")!.textContent!) as Bootstrap;
 const { key, token } = bootstrap;
 
-const frame = document.getElementById("artifact") as HTMLIFrameElement;
-const list = document.getElementById("list")!;
-const input = document.getElementById("input") as HTMLTextAreaElement;
-const submitButton = document.getElementById("submit") as HTMLButtonElement;
-const endButton = document.getElementById("end") as HTMLButtonElement;
-const modeToggle = document.getElementById("modeToggle") as HTMLInputElement;
-const presence = document.getElementById("presence")!;
-const undoButton = document.getElementById("undo") as HTMLButtonElement;
-const historyButton = document.getElementById("history") as HTMLButtonElement;
-const exportButton = document.getElementById("export") as HTMLButtonElement;
-const overlay = document.getElementById("overlay")!;
+const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const frame = $<HTMLIFrameElement>("artifact");
+const list = $("list");
+const input = $<HTMLTextAreaElement>("input");
+const search = $<HTMLInputElement>("search");
+const submitButton = $<HTMLButtonElement>("submit");
+const endButton = $<HTMLButtonElement>("end");
+const modeToggle = $<HTMLInputElement>("modeToggle");
+const presence = $("presence");
+const undoButton = $<HTMLButtonElement>("undo");
+const overlay = $("overlay");
+const toasts = $("toasts");
+const statusBar = $("statusBar");
+const statusText = $("statusText");
+const statusAction = $<HTMLButtonElement>("statusAction");
+const chatLog = $("chatLog");
+const targetHint = $("targetHint");
+const layout = $("layout");
 
 interface Draft {
   clientId: string;
-  /** One entry per element this edit covers; several when chunk-selected. */
   anchors: Array<{ selector: string; text: string }>;
   kind: "element" | "text";
   body: string;
 }
+
+type Filter = "open" | "review" | "done" | "all";
 
 let annotations: Annotation[] = [];
 let chat: ChatMessage[] = [];
 let versions: VersionMeta[] = [];
 let presenceState: AgentPresence = "waiting";
 let agentView: AgentIdentityView = { session: null, lastContact: null, viaHooks: false };
-/** Staged edits, not yet sent. Several can be queued before one submit. */
 let drafts: Draft[] = [];
-/** The draft currently being typed into, if any. */
 let armed: Draft | null = null;
-/** Annotation awaiting a new anchor from the next artifact click. */
 let repointing: string | null = null;
+let filter: Filter = "open";
+let query = "";
 const trackedIds = new Set<string>();
 
 frame.src = `/artifact/${key}/index.html?t=${encodeURIComponent(token)}`;
@@ -63,6 +70,59 @@ function toFrame(message: unknown): void {
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"]/g, (char) => `&${{ "&": "amp", "<": "lt", ">": "gt", '"': "quot" }[char]};`);
+}
+
+// --- user-visible failure ---------------------------------------------------
+
+/**
+ * Every failure path used to be a console.error, so a broken morph or a dead
+ * server looked identical to "nothing is happening". Anything the user needs to
+ * know about goes through here instead.
+ */
+function toast(message: string, kind: "info" | "error" = "info", ms = 4200): void {
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.textContent = message;
+  toasts.appendChild(el);
+  setTimeout(() => {
+    el.classList.add("out");
+    setTimeout(() => el.remove(), 300);
+  }, ms);
+}
+
+function setStatus(message: string | null, action?: { label: string; run: () => void }): void {
+  if (!message) {
+    statusBar.hidden = true;
+    return;
+  }
+  statusBar.hidden = false;
+  statusText.textContent = message;
+  if (action) {
+    statusAction.hidden = false;
+    statusAction.textContent = action.label;
+    statusAction.onclick = action.run;
+  } else {
+    statusAction.hidden = true;
+  }
+}
+
+async function guard<T>(what: string, run: () => Promise<T>): Promise<T | null> {
+  try {
+    return await run();
+  } catch (error) {
+    console.error(what, error);
+    toast(`${what} failed — ${String((error as Error)?.message ?? error)}`, "error");
+    return null;
+  }
+}
+
+function ago(iso: string | undefined): string {
+  if (!iso) return "";
+  const seconds = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (seconds < 45) return "just now";
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+  return `${Math.round(seconds / 86400)}d ago`;
 }
 
 /**
@@ -95,17 +155,40 @@ const STATUS_LABEL: Record<Annotation["status"], string> = {
   orphaned: "target changed",
 };
 
+type Bucket = "open" | "review" | "done";
+
+const BUCKET: Record<Annotation["status"], Bucket> = {
+  draft: "open",
+  submitted: "open",
+  orphaned: "open",
+  addressed: "review",
+  resolved: "done",
+};
+
+function matchesFilter(annotation: Annotation): boolean {
+  if (filter !== "all" && BUCKET[annotation.status] !== filter) return false;
+  if (!query) return true;
+  return `${annotation.body} ${annotation.text} ${annotation.selector}`.toLowerCase().includes(query);
+}
+
 function render(): void {
-  const open = annotations.filter((entry) => entry.status === "submitted").length;
+  const counts: Record<Bucket, number> = { open: 0, review: 0, done: 0 };
+  for (const annotation of annotations) counts[BUCKET[annotation.status]] += 1;
+  $("countOpen").textContent = String(counts.open);
+  $("countReview").textContent = String(counts.review);
+  $("countDone").textContent = String(counts.done);
+  $("chatCount").textContent = String(chat.length);
+
+  const visible = annotations.filter(matchesFilter);
   const banner =
-    open > 0 && presenceState === "waiting"
-      ? `<div class="alert"><strong>${open} edit${open === 1 ? "" : "s"} waiting to be picked up.</strong>
+    counts.open > 0 && presenceState === "waiting"
+      ? `<div class="alert"><strong>${counts.open} edit${counts.open === 1 ? "" : "s"} waiting to be picked up.</strong>
            <span>${
              agentView.session
-               ? "An agent is bound to this artifact but has not checked in. Send it any message, or install hooks so edits arrive automatically."
+               ? "An agent is bound to this artifact but has not checked in. Send it any message, or have it run watch."
                : "No agent is bound. Install hooks, then edits reach the Claude session you're already in."
            }</span>
-           <code>plan-editor setup hooks</code></div>`
+           <code>plan-editor watch ${escapeHtml(bootstrap.file)}</code></div>`
       : "";
 
   const repointBanner = repointing
@@ -113,15 +196,40 @@ function render(): void {
          <button class="link" data-cancel-repoint>Cancel</button></div>`
     : "";
 
-  const cards = [...annotations.map(renderCard), ...drafts.map(renderDraft)];
+  const cards = [...visible.map(renderCard), ...drafts.map(renderDraft)];
   const body = cards.length
     ? cards.join("")
-    : `<p class="empty">Turn on Annotate, then click an element — or select some text — and describe the change. It gets applied in place, no reload.</p>`;
+    : `<p class="empty">${
+        annotations.length === 0
+          ? "Turn on Annotate, then click an element — or select some text — and describe the change. It is applied in place, no reload."
+          : query
+            ? "Nothing matches that filter."
+            : "Nothing here. Try another filter."
+      }</p>`;
 
   list.innerHTML = banner + repointBanner + body;
+  renderChat();
+
   undoButton.disabled = versions.length < 2;
   submitButton.disabled = drafts.length === 0 && !input.value.trim();
-  submitButton.textContent = drafts.length > 1 ? `Submit ${drafts.length} edits` : "Submit";
+  submitButton.textContent = drafts.length > 1 ? `Submit ${drafts.length}` : "Submit";
+  targetHint.textContent = armed
+    ? armed.anchors.length > 1
+      ? `${armed.anchors.length} elements selected — ⇧-click to add or remove`
+      : `Anchored to “${(armed.anchors[0]?.text ?? "").slice(0, 60)}”`
+    : "";
+}
+
+function renderChat(): void {
+  chatLog.innerHTML = chat.length
+    ? chat
+        .map(
+          (message) =>
+            `<div class="msg ${message.role}"><b>${message.role === "agent" ? "Agent" : "You"}</b>
+              <span>${escapeHtml(message.text)}</span><time>${ago(message.at)}</time></div>`,
+        )
+        .join("")
+    : `<p class="empty">Replies from your agent appear here.</p>`;
 }
 
 function anchorLabel(anchors: Array<{ selector: string; text: string }>, kind: string): string {
@@ -145,7 +253,10 @@ function renderDraft(draft: Draft): string {
 
 function renderCard(annotation: Annotation): string {
   const thread = (annotation.thread ?? [])
-    .map((message) => `<div class="msg ${message.role}"><b>${message.role === "human" ? "You" : "Agent"}</b> ${escapeHtml(message.text)}</div>`)
+    .map(
+      (message) =>
+        `<div class="msg ${message.role}"><b>${message.role === "human" ? "You" : "Agent"}</b><span>${escapeHtml(message.text)}</span></div>`,
+    )
     .join("");
 
   const actions: string[] = [];
@@ -153,19 +264,17 @@ function renderCard(annotation: Annotation): string {
     actions.push(`<button class="link accept" data-accept="${annotation.id}">Accept</button>`);
     actions.push(`<button class="link reject" data-reject="${annotation.id}">Reject…</button>`);
   }
-  if (annotation.status === "orphaned") {
-    actions.push(`<button class="link" data-repoint="${annotation.id}">Re-point…</button>`);
-  }
-  if (annotation.tag !== "message") {
-    actions.push(`<button class="link" data-jump="${annotation.id}">Show</button>`);
-  }
+  if (annotation.status === "orphaned") actions.push(`<button class="link" data-repoint="${annotation.id}">Re-point…</button>`);
+  if (annotation.tag !== "message") actions.push(`<button class="link" data-jump="${annotation.id}">Show</button>`);
   actions.push(`<button class="link" data-reply="${annotation.id}">Reply…</button>`);
 
+  const when = annotation.addressedAt ?? annotation.submittedAt ?? annotation.createdAt;
   return `<article class="card" data-status="${annotation.status}" data-id="${escapeHtml(annotation.id)}">
     <div class="anchor">${anchorLabel(annotation.anchors ?? [{ selector: annotation.selector, text: annotation.text }], annotation.tag)}</div>
     <div class="body">${escapeHtml(annotation.body)}</div>
+    ${annotation.agentNote ? `<div class="note">${escapeHtml(annotation.agentNote)}</div>` : ""}
     ${thread ? `<div class="thread">${thread}</div>` : ""}
-    <div class="meta"><span class="status">${STATUS_LABEL[annotation.status]}</span>${actions.join("")}</div>
+    <div class="meta"><span class="status">${STATUS_LABEL[annotation.status]}</span><time>${ago(when)}</time>${actions.join("")}</div>
   </article>`;
 }
 
@@ -177,35 +286,23 @@ function setMode(next: boolean): void {
 }
 
 modeToggle.addEventListener("change", () => setMode(modeToggle.checked));
-
-document.addEventListener(
-  "keydown",
-  (event) => {
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "i") {
-      event.preventDefault();
-      setMode(!modeToggle.checked);
-    }
-    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-      event.preventDefault();
-      void submit();
-    }
-    if (event.key === "Escape") closeOverlay();
-    if (!overlay.hidden && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
-      event.preventDefault();
-      void stepVersion(event.key === "ArrowRight" ? 1 : -1);
-    }
-  },
-  true,
-);
-
 input.addEventListener("input", () => {
   if (armed) armed.body = input.value;
   render();
 });
-
+search.addEventListener("input", () => {
+  query = search.value.trim().toLowerCase();
+  render();
+});
+$("filters").addEventListener("click", (event) => {
+  const chip = (event.target as HTMLElement).closest<HTMLElement>("[data-filter]");
+  if (!chip) return;
+  filter = chip.dataset.filter as Filter;
+  for (const other of $("filters").querySelectorAll(".chip")) other.classList.toggle("active", other === chip);
+  render();
+});
 submitButton.addEventListener("click", () => void submit());
 
-/** Moves the in-progress draft into the queue so another element can be picked. */
 function stageArmed(): void {
   if (!armed) return;
   armed.body = input.value.trim();
@@ -232,30 +329,29 @@ async function submit(): Promise<void> {
   if (payload.length === 0) return;
 
   submitButton.disabled = true;
-  try {
+  const result = await guard("Submitting", async () => {
     const response = await api("/annotations", { method: "POST", body: JSON.stringify({ annotations: payload }) });
-    if (!response.ok) throw new Error(`submit failed: ${response.status}`);
-    const result = (await response.json()) as { annotations: Annotation[] };
-    // Hand each server-assigned id to the SDK so morph reports use the same
-    // identity the store knows about.
+    if (!response.ok) throw new Error(`server said ${response.status}`);
+    return (await response.json()) as { annotations: Annotation[] };
+  });
+
+  if (result) {
     drafts.forEach((draft, index) => {
       const created = result.annotations[index];
       if (created) toFrame({ type: "pe:bind", clientId: draft.clientId, id: created.id });
     });
     drafts = [];
     input.value = "";
-  } catch (error) {
-    console.error(error);
-  } finally {
-    render();
+    toast(`${payload.length} edit${payload.length === 1 ? "" : "s"} sent to your agent`);
   }
+  render();
 }
 
 // --- card actions -----------------------------------------------------------
 
 list.addEventListener("click", (event) => {
   const target = event.target as HTMLElement;
-  const action = <K extends string>(name: K) => target.closest(`[data-${name}]`)?.getAttribute(`data-${name}`);
+  const action = (name: string) => target.closest(`[data-${name}]`)?.getAttribute(`data-${name}`);
 
   const drop = action("drop-draft");
   if (drop) {
@@ -277,13 +373,18 @@ list.addEventListener("click", (event) => {
   }
 
   const accept = action("accept");
-  if (accept) return void api(`/annotations/${accept}/accept`, { method: "POST", body: "{}" });
+  if (accept) {
+    void guard("Accepting", () => api(`/annotations/${accept}/accept`, { method: "POST", body: "{}" }));
+    return;
+  }
 
   const reject = action("reject");
   if (reject) {
     const reason = prompt("What's wrong with the change?");
     if (reason?.trim()) {
-      void api(`/annotations/${reject}/reject`, { method: "POST", body: JSON.stringify({ text: reason.trim() }) });
+      void guard("Rejecting", () =>
+        api(`/annotations/${reject}/reject`, { method: "POST", body: JSON.stringify({ text: reason.trim() }) }),
+      );
     }
     return;
   }
@@ -292,7 +393,9 @@ list.addEventListener("click", (event) => {
   if (reply) {
     const text = prompt("Reply to the agent about this edit:");
     if (text?.trim()) {
-      void api(`/annotations/${reply}/reply`, { method: "POST", body: JSON.stringify({ text: text.trim() }) });
+      void guard("Replying", () =>
+        api(`/annotations/${reply}/reply`, { method: "POST", body: JSON.stringify({ text: text.trim() }) }),
+      );
     }
     return;
   }
@@ -306,18 +409,87 @@ list.addEventListener("click", (event) => {
   }
 });
 
-// --- versions, undo, diff ---------------------------------------------------
+// --- toolbar ----------------------------------------------------------------
 
 undoButton.addEventListener("click", async () => {
   undoButton.disabled = true;
-  await api("/restore", { method: "POST", body: "{}" }).catch((error) => console.error(error));
+  const done = await guard("Undo", () => api("/restore", { method: "POST", body: "{}" }));
+  if (done) toast("Restored the previous version");
 });
 
-exportButton.addEventListener("click", () => {
+$("export").addEventListener("click", () => {
   window.open(`/api/${key}/export?t=${encodeURIComponent(token)}`, "_blank");
 });
 
-historyButton.addEventListener("click", () => void openHistory());
+$("share").addEventListener("click", async () => {
+  await navigator.clipboard.writeText(location.href).then(
+    () => toast("Session link copied"),
+    () => toast("Could not copy — the link is in your address bar", "error"),
+  );
+});
+
+$("collapse").addEventListener("click", () => layout.classList.toggle("collapsed"));
+$("history").addEventListener("click", () => void openHistory());
+$("help").addEventListener("click", openHelp);
+$("switcher").addEventListener("click", () => void openSwitcher());
+
+// --- keyboard ---------------------------------------------------------------
+
+function isTyping(event: KeyboardEvent): boolean {
+  const el = event.target as HTMLElement;
+  return el.tagName === "TEXTAREA" || el.tagName === "INPUT";
+}
+
+document.addEventListener(
+  "keydown",
+  (event) => {
+    const meta = event.metaKey || event.ctrlKey;
+    if (meta && event.key.toLowerCase() === "i") {
+      event.preventDefault();
+      return setMode(!modeToggle.checked);
+    }
+    if (meta && event.key === "Enter") {
+      event.preventDefault();
+      return void submit();
+    }
+    if (meta && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      return search.focus();
+    }
+    if (meta && event.key.toLowerCase() === "z") {
+      event.preventDefault();
+      return undoButton.click();
+    }
+    if (meta && event.key.toLowerCase() === "h") {
+      event.preventDefault();
+      return void openHistory();
+    }
+    if (meta && event.key === "\\") {
+      event.preventDefault();
+      return layout.classList.toggle("collapsed");
+    }
+    if (event.key === "Escape") {
+      if (!overlay.hidden) return closeOverlay();
+      if (repointing) {
+        repointing = null;
+        toFrame({ type: "pe:repoint", id: null });
+        return render();
+      }
+      return;
+    }
+    if (event.key === "?" && !isTyping(event)) {
+      event.preventDefault();
+      return openHelp();
+    }
+    if (!overlay.hidden && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      event.preventDefault();
+      void stepVersion(event.key === "ArrowRight" ? 1 : -1);
+    }
+  },
+  true,
+);
+
+// --- overlays ---------------------------------------------------------------
 
 function closeOverlay(): void {
   overlay.hidden = true;
@@ -333,47 +505,69 @@ overlay.addEventListener("click", (event) => {
   if (event.target === overlay) closeOverlay();
 });
 
-async function openHistory(): Promise<void> {
-  const rows = [...versions].reverse();
+function openSheet(title: string, inner: string): void {
   overlay.hidden = false;
   overlay.innerHTML = `<div class="sheet">
-    <header><h2>History</h2><button class="link" data-close>Close</button></header>
-    <p class="scrub-hint">Click a version to see it in place. <kbd>←</kbd> <kbd>→</kbd> to scrub.</p>
-    <div class="versions">${rows
-      .map(
-        (version, index) => `<button class="version" data-seq="${version.seq}">
-          <span class="seq">v${version.seq}</span>
-          <span class="when">${new Date(version.at).toLocaleTimeString()}</span>
-          <span class="origin">${version.origin === "open" ? "initial" : version.origin}</span>
-          ${index === 0 ? '<span class="current">current</span>' : ""}
-        </button>`,
-      )
-      .join("")}</div>
-    <div class="diff" id="diffPane"><p class="empty">Pick a version to see what changed since it.</p></div>
+    <header><h2>${escapeHtml(title)}</h2><button class="link" data-close>Close</button></header>
+    ${inner}
   </div>`;
-
   overlay.querySelector("[data-close]")?.addEventListener("click", closeOverlay);
-  for (const button of overlay.querySelectorAll<HTMLButtonElement>(".version")) {
-    button.addEventListener("click", () => {
-      const seq = Number(button.dataset.seq);
-      selectVersion(seq);
-      void previewVersion(seq);
-      void showDiff(seq);
-    });
-  }
-  // Warm the two most likely reads so the first click is instant.
-  const latest = versions[versions.length - 1];
-  if (latest) void fetchVersion(latest.seq);
-  const previous = versions[versions.length - 2];
-  if (previous) void fetchVersion(previous.seq);
 }
 
-/**
- * Snapshots are immutable, so one fetch per version is enough. Re-fetching both
- * documents on every click — including the current one, every time — is what
- * made scrubbing feel like loading rather than moving.
- */
+function openHelp(): void {
+  const rows: Array<[string, string]> = [
+    ["⌘I", "Toggle annotate mode"],
+    ["Click", "Anchor an edit to an element"],
+    ["Select text, then click", "Anchor to the selection instead"],
+    ["⇧-click", "Add another element to the same edit (again to remove)"],
+    ["⌘Enter", "Submit staged edits"],
+    ["⌘F", "Filter edits"],
+    ["⌘Z", "Undo the last change"],
+    ["⌘H", "Version history"],
+    ["← →", "Scrub versions while history is open"],
+    ["⌘\\", "Hide or show the panel"],
+    ["Esc", "Close an overlay or cancel re-pointing"],
+    ["?", "This list"],
+  ];
+  openSheet(
+    "Shortcuts",
+    `<div class="shortcuts">${rows
+      .map(([keys, what]) => `<div><kbd>${escapeHtml(keys)}</kbd><span>${escapeHtml(what)}</span></div>`)
+      .join("")}</div>`,
+  );
+}
+
+async function openSwitcher(): Promise<void> {
+  const data = await guard("Loading artifacts", async () => {
+    const response = await fetch(`/api/sessions?t=${encodeURIComponent(token)}`);
+    if (!response.ok) throw new Error(`server said ${response.status}`);
+    return (await response.json()) as {
+      sessions: Array<{ key: string; name: string; file: string; url: string; open: number; addressed: number }>;
+    };
+  });
+  if (!data) return;
+
+  openSheet(
+    "Open artifacts",
+    `<div class="sessions">${data.sessions
+      .map(
+        (entry) => `<a class="session ${entry.key === key ? "current" : ""}" href="${escapeHtml(entry.url)}">
+          <span class="name">${escapeHtml(entry.name)}</span>
+          <span class="path">${escapeHtml(entry.file)}</span>
+          <span class="badges">${entry.open ? `<b class="open">${entry.open} open</b>` : ""}${
+            entry.addressed ? `<b class="review">${entry.addressed} to review</b>` : ""
+          }${entry.key === key ? '<b class="here">this one</b>' : ""}</span>
+        </a>`,
+      )
+      .join("")}</div>`,
+  );
+}
+
+// --- versions ---------------------------------------------------------------
+
+/** Snapshots are immutable, so one fetch per version is enough. */
 const versionCache = new Map<number, string>();
+let previewing: number | null = null;
 
 async function fetchVersion(seq: number): Promise<string> {
   const cached = versionCache.get(seq);
@@ -384,16 +578,12 @@ async function fetchVersion(seq: number): Promise<string> {
   return html;
 }
 
-/** Which version the artifact frame is currently showing, if previewing. */
-let previewing: number | null = null;
-
 function selectVersion(seq: number): void {
   for (const button of overlay.querySelectorAll<HTMLButtonElement>(".version")) {
     button.classList.toggle("active", Number(button.dataset.seq) === seq);
   }
 }
 
-/** Morphs the artifact frame to a snapshot so scrubbing shows the document. */
 async function previewVersion(seq: number): Promise<void> {
   const html = await fetchVersion(seq);
   if (!html) return;
@@ -410,6 +600,38 @@ async function stepVersion(delta: number): Promise<void> {
   await Promise.all([previewVersion(next.seq), showDiff(next.seq)]);
 }
 
+async function openHistory(): Promise<void> {
+  const rows = [...versions].reverse();
+  openSheet(
+    "History",
+    `<p class="scrub-hint">Click a version to see it in place. <kbd>←</kbd> <kbd>→</kbd> to scrub.</p>
+     <div class="versions">${rows
+       .map(
+         (version, index) => `<button class="version${index === 0 ? " active" : ""}" data-seq="${version.seq}">
+           <span class="seq">v${version.seq}</span>
+           <span class="when">${ago(version.at)}</span>
+           <span class="origin">${version.origin === "open" ? "initial" : version.origin}</span>
+           ${index === 0 ? '<span class="current">current</span>' : ""}
+         </button>`,
+       )
+       .join("")}</div>
+     <div class="diff" id="diffPane"><p class="empty">Pick a version to see what changed since it.</p></div>`,
+  );
+
+  for (const button of overlay.querySelectorAll<HTMLButtonElement>(".version")) {
+    button.addEventListener("click", () => {
+      const seq = Number(button.dataset.seq);
+      selectVersion(seq);
+      void previewVersion(seq);
+      void showDiff(seq);
+    });
+  }
+  const latest = versions[versions.length - 1];
+  if (latest) void fetchVersion(latest.seq);
+  const previous = versions[versions.length - 2];
+  if (previous) void fetchVersion(previous.seq);
+}
+
 async function showDiff(seq: number): Promise<void> {
   const pane = document.getElementById("diffPane");
   if (!pane) return;
@@ -419,23 +641,22 @@ async function showDiff(seq: number): Promise<void> {
 
   const [oldHtml, newHtml] = await Promise.all([fetchVersion(seq), fetchVersion(current.seq)]);
   const diff = diffDocuments(oldHtml, newHtml);
+  const restore = seq === current.seq ? "" : `<button class="restore" data-restore="${seq}">Restore v${seq}</button>`;
 
-  const restore =
-    seq === current.seq
-      ? ""
-      : `<button class="restore" data-restore="${seq}">Restore v${seq}</button>`;
-
-  if (diff.sections.length === 0) {
-    pane.innerHTML = `${restore}<p class="empty">${
-      diff.unattributed ? "Content changed, but not inside any element with an id." : "No differences from the current version."
-    }</p>`;
-  } else {
-    pane.innerHTML = restore + diff.sections.map(renderSectionDiff).join("");
-  }
+  pane.innerHTML =
+    diff.sections.length === 0
+      ? `${restore}<p class="empty">${
+          diff.unattributed
+            ? "Content changed, but not inside any element with an id."
+            : "No differences from the current version."
+        }</p>`
+      : restore + diff.sections.map(renderSectionDiff).join("");
 
   pane.querySelector("[data-restore]")?.addEventListener("click", async () => {
-    await api("/restore", { method: "POST", body: JSON.stringify({ seq }) });
+    await guard("Restore", () => api("/restore", { method: "POST", body: JSON.stringify({ seq }) }));
+    previewing = null;
     closeOverlay();
+    toast(`Restored v${seq}`);
   });
 }
 
@@ -454,19 +675,12 @@ function renderSectionDiff(section: SectionChange): string {
   return `<div class="dsection">${head}<div class="dbody">${words}</div></div>`;
 }
 
-/**
- * Ending is a clean exit, not a state to sit in. It marks the session closed so
- * the hooks stop surfacing it, then gets out of the way — the human goes back to
- * their terminal and the conversation carries on as if nothing happened.
- */
+// --- ending -----------------------------------------------------------------
+
 endButton.addEventListener("click", async () => {
   endButton.disabled = true;
   endButton.textContent = "Ending…";
-  try {
-    await api("/end", { method: "POST", body: "{}" });
-  } catch (error) {
-    console.error("failed to end session", error);
-  }
+  await guard("Ending the session", () => api("/end", { method: "POST", body: "{}" }));
   stream.close();
   setMode(false);
   window.close();
@@ -511,8 +725,6 @@ window.addEventListener("message", (event: MessageEvent) => {
         // a new edit — keep whatever has been typed so far.
         armed.anchors = anchors;
       } else {
-        // A plain click on a different element stages the previous draft rather
-        // than discarding it, so several related edits can be sent as one batch.
         stageArmed();
         armed = { clientId, anchors, kind: data.kind === "text" ? "text" : "element", body: "" };
       }
@@ -522,12 +734,13 @@ window.addEventListener("message", (event: MessageEvent) => {
     }
 
     case "pe:repointed": {
-      const id = String(data.id);
       repointing = null;
-      void api(`/annotations/${id}/repoint`, {
-        method: "POST",
-        body: JSON.stringify({ selector: String(data.selector), text: String(data.text) }),
-      });
+      void guard("Re-pointing", () =>
+        api(`/annotations/${String(data.id)}/repoint`, {
+          method: "POST",
+          body: JSON.stringify({ selector: String(data.selector), text: String(data.text) }),
+        }),
+      );
       render();
       break;
     }
@@ -540,9 +753,10 @@ window.addEventListener("message", (event: MessageEvent) => {
       break;
 
     case "pe:morphFailed":
-      // Morphing arbitrary agent-written HTML is a heuristic. When it fails we
-      // still have to show the truth, so fall back to what always works.
-      console.warn("morph failed, reloading frame:", data.message);
+      // Morphing arbitrary agent-written HTML is a heuristic. Say so out loud
+      // rather than silently reloading — a blank frame with no explanation is
+      // the worst thing this tool can do.
+      toast("Could not patch in place — reloading the artifact", "error");
       frame.src = `/artifact/${key}/index.html?t=${encodeURIComponent(token)}&r=${Date.now()}`;
       break;
   }
@@ -551,6 +765,25 @@ window.addEventListener("message", (event: MessageEvent) => {
 // --- server stream ----------------------------------------------------------
 
 const stream = new EventSource(`/events/${key}?t=${encodeURIComponent(token)}`);
+let dropped = false;
+
+stream.addEventListener("open", () => {
+  if (!dropped) return;
+  dropped = false;
+  setStatus(null);
+  toast("Reconnected");
+  void applyPatch();
+});
+
+// EventSource retries on its own, but silently — so a dead server looked exactly
+// like an idle one, which is most of why this felt unresponsive.
+stream.addEventListener("error", () => {
+  dropped = true;
+  setStatus("Disconnected from the plan-editor server — retrying…", {
+    label: "Reload",
+    run: () => location.reload(),
+  });
+});
 
 stream.addEventListener("message", (event) => {
   const payload = JSON.parse(event.data) as ServerEvent;
@@ -582,14 +815,17 @@ stream.addEventListener("message", (event) => {
               ? `agent idle · ${agentView.session}`
               : "no agent";
       presence.title = agentView.session
-        ? `Bound to Claude session ${agentView.session}…` +
-          (agentView.lastContact ? `\nLast seen ${new Date(agentView.lastContact).toLocaleTimeString()}` : "\nNot seen yet — install hooks or run a poll")
+        ? `Bound to Claude session ${agentView.session}…${
+            agentView.lastContact ? `\nLast seen ${new Date(agentView.lastContact).toLocaleTimeString()}` : "\nNot seen yet"
+          }`
         : "No agent session is bound to this artifact";
       render();
       break;
     }
     case "agent-reply":
       chat.push({ role: "agent", text: payload.text, at: new Date().toISOString() });
+      $("conversation").setAttribute("open", "");
+      toast("Your agent replied");
       render();
       break;
   }
@@ -598,8 +834,14 @@ stream.addEventListener("message", (event) => {
 /** Fetches the new artifact HTML and hands it to the SDK to morph in place. */
 async function applyPatch(): Promise<void> {
   const response = await fetch(`/artifact/${key}/raw?t=${encodeURIComponent(token)}`);
-  if (!response.ok) return;
+  if (!response.ok) {
+    toast("Could not read the artifact", "error");
+    return;
+  }
   toFrame({ type: "pe:morph", html: await response.text() });
 }
+
+// Relative timestamps go stale on a page left open for an hour.
+setInterval(render, 60_000);
 
 render();
