@@ -224,9 +224,51 @@ export function formatPollResult(file: string, result: PollResult): unknown {
     next_step:
       `Apply each edit by editing ${file} directly. The open browser patches itself in place — never ask the user to reload. ` +
       `Give top-level sections stable \`id\` attributes so edits can be matched precisely. ` +
-      `Then run \`plan-editor poll ${file} --reply "<what you changed>"\` to report back and keep waiting.` +
+      `Then run \`plan-editor watch ${file}\` so the next edit reaches you in milliseconds instead of waiting for the human to message you.` +
       (result.sessionEnded ? " Note: the human ended the session with this batch, so do not poll again." : ""),
   };
+}
+
+/**
+ * Blocks until the human submits an edit, then returns it.
+ *
+ * This is the difference between responsive and not. Hook delivery is
+ * pull-on-prompt: an edit sits in the store until the human happens to send the
+ * agent a message, so the wait is unbounded and feels broken. A waiting agent
+ * gets the same edit in ~40ms. The cost is that the turn is parked — which is
+ * the right trade while the human is working in the browser, and interruptible
+ * the moment it is not.
+ */
+async function watchCommand(args: string[]): Promise<unknown> {
+  const file = args.find((arg) => !arg.startsWith("--"));
+  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor watch <file.html>`"]);
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const { token } = await tokenFor(canonical);
+
+  const maxIndex = args.indexOf("--max-ms");
+  const maxMs = maxIndex !== -1 && args[maxIndex + 1] ? Number(args[maxIndex + 1]) : 15 * 60_000;
+
+  process.stderr.write(
+    `[plan-editor] Waiting for your next edit on ${path.basename(canonical)}. ` +
+      `It is picked up the instant you press Submit — no need to message me. Press Esc to talk here instead.\n`,
+  );
+
+  const url =
+    `${baseUrl()}/api/poll?file=${encodeURIComponent(canonical)}&t=${encodeURIComponent(token)}` +
+    `&timeoutMs=${encodeURIComponent(String(maxMs))}`;
+  const response = await fetch(url);
+  const result = (await response.json()) as PollResult;
+
+  if (result.status === "waiting") {
+    return {
+      status: "idle",
+      next_step:
+        `No edit arrived within the wait window. The human is probably not editing right now — reply to them normally. ` +
+        `Run \`plan-editor watch ${canonical}\` again whenever they go back to the browser.`,
+    };
+  }
+  return formatPollResult(canonical, result);
 }
 
 async function endCommand(args: string[]): Promise<unknown> {
@@ -450,6 +492,7 @@ const HELP = `plan-editor — click an element, say what to change, watch it cha
 
 Usage:
   plan-editor <file.html> [--no-open]   Open the artifact for review
+  plan-editor watch <file.html>         Park until the human submits an edit (the responsive path)
   plan-editor poll <file.html>          Wait for edits (long-polls; never kill it)
       [--reply "..."] [--timeout-ms n]
   plan-editor end <file.html>           End the session
@@ -471,6 +514,7 @@ async function main(): Promise<void> {
     stop: stopCommand,
     setup: setupCommand,
     hook: hookCommand,
+    watch: watchCommand,
     export: exportCommand,
     undo: undoCommand,
     "notify-edit": notifyEditCommand,

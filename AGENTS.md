@@ -148,6 +148,27 @@ Two things this got wrong once and must not again:
 The Stop hook only ever blocks the **authoring** session. Holding an unrelated
 session hostage because another project has open edits is intolerable.
 
+## Latency: the agent must be *waiting*, not waiting to be poked
+
+Measured on this machine: a submitted edit reaches an already-waiting agent in
+**~40ms**, and an agent's file write reaches the browser in **~144ms**. The
+pipeline is not slow.
+
+What is slow is hook delivery, because it is *pull-on-prompt*: `UserPromptSubmit`
+only fires when the human types, so an edit sits in the store until they happen
+to message the agent. From the human's side that reads as "I pressed Submit and
+nothing happened" — the wait is unbounded and has nothing to do with the tool.
+
+So: **after applying edits, end the turn with `plan-editor watch <file>`.** It
+parks until the next edit arrives and returns it in milliseconds. The cost is a
+parked turn, which is the right trade while the human is working in the browser
+and interruptible (Esc) the moment it is not. Hooks remain the safety net for
+everything `watch` cannot cover — an interrupted watch, a compaction, a turn that
+ended for another reason.
+
+Do not "fix" latency by shortening timers or polling more often. Nothing in the
+pipeline is polling.
+
 ## Getting edits into the agent's context
 
 Three mechanisms, in order of how well they work:
