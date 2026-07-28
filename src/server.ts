@@ -309,7 +309,10 @@ export async function serve(options: ServeOptions = {}) {
         res.status(404).json({ error: "session not found" });
         return;
       }
-      workingSessions.add(session.key);
+      // Deliberately NOT workingSessions.add: the human submitting an edit says
+      // nothing about the agent. Marking it here left presence stuck on "agent
+      // working…" from the moment you pressed Submit until something else
+      // cleared it. Only real agent activity (the PostToolUse hook) sets that.
       events.emit("feedback", session.key);
       emitPresence(session.key);
       await syncBrowsers(session.key);

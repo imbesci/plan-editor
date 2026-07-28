@@ -72,12 +72,20 @@ This is the whole reason the tool can show which feedback landed.
   so the entire page silently refuses to morph. Use `ignoreActiveValue`, which
   protects a focused field's value without skipping anything. There is a regression
   test for this.
-- **Morph input is parsed to a node, not passed as a string.** Artifact files start
-  with a doctype, and morphing `<html>` from a doctype-carrying string raises
-  `HierarchyRequestError`.
-- **The root element is never recorded as changed.** Idiomorph hands the callback a
-  normalized clone for the root, so `<html>` compares as different even for an
-  identical document; recording it would flash the whole page on every patch.
+- **Morph `<head>` and `<body>` separately; never morph `documentElement`.**
+  `morphStyle: "outerHTML"` on the root passes jsdom and throws in a real browser
+  (`newContent is not iterable`). Because idiomorph mutates as it walks, a
+  mid-walk throw leaves the document half-destroyed — the symptom is a blank
+  page, not a caught error. Verified with a real-browser harness; jsdom alone
+  will not catch a regression here.
+- **`html`/`head`/`body` are never recorded as changed** (`isStructuralRoot`).
+  Idiomorph passes the callback a normalized *clone* of the element it is morphing
+  into, not the live node — so identity comparison cannot exclude them and they
+  always compare as different, even for an identical document. Recording one
+  flashes the whole page and marks every open edit addressed.
+- **Submitting an edit must not set `workingSessions`.** The human pressing Submit
+  says nothing about the agent; doing so pinned presence to "agent working…" from
+  the moment of submit. Only the PostToolUse hook sets it.
 - **The session token gates every session-scoped route.** The key alone must never
   grant access. `POST /api/sessions` also validates extension and `stat` server-side —
   a CLI-only check is what let the tool this replaces register any path and read it

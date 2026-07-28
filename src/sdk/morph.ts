@@ -32,6 +32,19 @@ function isUiNode(node: Node): boolean {
   );
 }
 
+/**
+ * html/head/body are never a useful "change". Idiomorph passes the callback a
+ * normalized *clone* of the element it is morphing into — not the live node — so
+ * identity comparison cannot exclude them, and they always compare as different
+ * even for an identical document. Recording one would flash the entire page on
+ * every patch and mark every open edit addressed. Their descendants report the
+ * real edit anyway.
+ */
+function isStructuralRoot(element: Element): boolean {
+  const name = element.nodeName;
+  return name === "HTML" || name === "HEAD" || name === "BODY";
+}
+
 function isSdkScript(node: Node): boolean {
   const element = node as Element;
   return element.nodeName === "SCRIPT" && (element.getAttribute?.("src") ?? "").endsWith("/sdk.js");
@@ -50,14 +63,20 @@ export function morphDocument(root: Element, html: string, tracked: Iterable<Tra
   const changed = new Set<Element>();
   const ownerDocument = root.ownerDocument;
 
-  // Parse to a node rather than handing idiomorph the raw string. Artifact files
-  // start with a doctype, and morphing <html> from a string that carries one
-  // raises HierarchyRequestError ("Invalid insertion of html node in #document
-  // node") because the doctype comes along with the parsed fragment.
-  const incoming = new DOMParser().parseFromString(html, "text/html").documentElement;
+  // Morph <head> and <body> separately rather than replacing <html> wholesale.
+  //
+  // Morphing documentElement with morphStyle "outerHTML" passes jsdom but fails
+  // in a real browser ("newContent is not iterable"), and because idiomorph
+  // mutates as it walks, a mid-walk throw leaves the document half-destroyed —
+  // a blank page, not a clean failure. Head/body innerHTML morphs never touch
+  // the root and were the only variant that survived a real-browser check.
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  const ownerDoc = ownerDocument ?? root.ownerDocument;
+  const liveHead = ownerDoc?.head ?? root.querySelector("head");
+  const liveBody = ownerDoc?.body ?? root.querySelector("body");
 
-  Idiomorph.morph(root, incoming, {
-    morphStyle: "outerHTML",
+  const options = {
+    morphStyle: "innerHTML" as const,
     // NOT `ignoreActive` — that skips the active element and its whole subtree,
     // and with nothing focused the active element is <body>, so the entire page
     // would silently refuse to morph. `ignoreActiveValue` preserves what the
@@ -73,15 +92,15 @@ export function morphDocument(root: Element, html: string, tracked: Iterable<Tra
         // Identical subtree: skip entirely. Saves work and keeps it out of the
         // changed set, which is what makes the highlight precise.
         if (oldElement.outerHTML === newElement.outerHTML) return false;
-        // The root is never a useful "change": idiomorph hands us a normalized
-        // clone here, so <html> compares as different even for an identical
-        // document. Recording it would flash the whole page on every patch.
-        if (oldElement !== root) changed.add(oldElement);
+        if (!isStructuralRoot(oldElement)) changed.add(oldElement);
         return true;
       },
       beforeNodeRemoved: (node: Node) => !isUiNode(node),
     },
-  });
+  };
+
+  if (liveHead && parsed.head) Idiomorph.morph(liveHead, parsed.head, options);
+  if (liveBody && parsed.body) Idiomorph.morph(liveBody, parsed.body, options);
 
   const changedList = [...changed];
   const deepest = changedList.filter(
