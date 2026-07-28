@@ -27,6 +27,7 @@ export function renderChrome(session: Session): string {
 <script id="pe-session" type="application/json">${escapeJson(bootstrap)}</script>
 </head>
 <body>
+<div class="status-bar" id="statusBar" hidden><span id="statusText"></span><button class="link" id="statusAction" hidden></button></div>
 <div class="layout" id="layout">
   <main class="stage">
     <header class="bar">
@@ -89,7 +90,6 @@ export function renderChrome(session: Session): string {
   </aside>
 </div>
 
-<div class="status-bar" id="statusBar" hidden><span id="statusText"></span><button class="link" id="statusAction" hidden></button></div>
 <div class="toasts" id="toasts"></div>
 <div class="overlay" id="overlay" hidden></div>
 <script type="module" src="/chrome.js"></script>

@@ -19,6 +19,10 @@
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
+/* The status bar is a layout row, never an overlay: as `position: fixed` it sat
+   on top of the toolbar and made the whole header unusable. */
+body { display: flex; flex-direction: column; }
+.layout { flex: 1; min-height: 0; }
 body {
   font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
   color: var(--fg);
@@ -287,10 +291,11 @@ button:disabled { opacity: .5; cursor: default; }
 @keyframes pe-toast-in { from { transform: translateY(8px); opacity: 0; } }
 
 .status-bar {
-  position: fixed; top: 0; left: 0; right: 0; z-index: 70;
+  flex: 0 0 auto;
   background: var(--pending); color: #1a1205;
   font-size: 13px; padding: 7px 14px; display: flex; gap: 12px; align-items: center;
 }
+.status-bar[hidden] { display: none; }
 .status-bar .link { color: #1a1205; font-weight: 600; }
 
 /* --- overlays: help + switcher --- */
@@ -322,7 +327,11 @@ button:disabled { opacity: .5; cursor: default; }
 .layout.collapsed .panel { display: none; }
 
 .frame { position: relative; }
+/* `hidden` only sets display:none in the UA stylesheet, so any author
+   `display:` rule silently beats it. Without this the overlay sat opaque over
+   the artifact forever and the page looked completely broken. */
 .frame-overlay {
   position: absolute; inset: 0; display: grid; place-items: center;
   background: var(--bg); color: var(--muted); font-size: 14px;
 }
+.frame-overlay[hidden] { display: none; }

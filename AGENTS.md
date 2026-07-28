@@ -252,6 +252,18 @@ Lifecycle invariants:
 
 ## Chrome UI invariants
 
+- **Any element rendered with `hidden` needs an explicit `[hidden] { display: none }`
+  rule.** The `hidden` attribute only sets `display: none` in the UA stylesheet, so
+  any author `display:` rule silently beats it. `.frame-overlay` had `display: grid`
+  with an opaque background and sat permanently over the artifact — the entire page
+  looked broken. `.status-bar` had the same shape as `position: fixed` and covered
+  the toolbar. Audit `grep -o 'id=\"[a-zA-Z]*\" hidden' src/chrome/chrome-html.ts`
+  against the guards in `chrome.css` when adding one.
+- **Verify the chrome page visually, not just structurally.** Both of those bugs
+  passed typecheck, passed 106 tests, and served correct HTML. Headless Chrome
+  cannot screenshot the chrome page directly (the SSE stream keeps it from going
+  idle) — proxy to the live server, inline the CSS/JS, and stub `/events/`.
+
 - **Nothing fails silently.** Every failure path goes through `toast()` or
   `setStatus()`. `console.error` alone is how a broken morph and a dead server
   came to look identical to "nothing is happening".
