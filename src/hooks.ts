@@ -8,6 +8,7 @@
 // A runaway Stop hook is far worse than the bug it fixes, so this one is bounded
 // three ways: a per-session block counter, a hard cap, and an env kill switch.
 
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -19,6 +20,8 @@ export const MAX_CONSECUTIVE_BLOCKS = 2;
 
 interface StopHookInput {
   stop_hook_active?: boolean;
+  session_id?: string;
+  cwd?: string;
 }
 
 interface GuardState {
@@ -58,7 +61,7 @@ export interface StopDecision {
  * testable without a live session.
  */
 export function decideStop(input: {
-  openSessions: Array<{ file: string; openEdits: number; key: string }>;
+  openSessions: Array<{ file: string; openEdits: number; key: string; ownership?: Ownership }>;
   blocks: Record<string, number>;
   killSwitch: boolean;
   stopHookActive: boolean;
@@ -68,7 +71,11 @@ export function decideStop(input: {
   // hook. Never stack on top of that.
   if (input.stopHookActive) return { block: false };
 
-  const pending = input.openSessions.filter((session) => session.openEdits > 0);
+  // Only the agent that owns the artifact gets held back. Blocking an unrelated
+  // session because some other project has open edits is intolerable.
+  const pending = input.openSessions.filter(
+    (session) => session.openEdits > 0 && (session.ownership ?? "authoring") === "authoring",
+  );
   if (pending.length === 0) return { block: false };
 
   const blockable = pending.filter((session) => (input.blocks[session.key] ?? 0) < MAX_CONSECUTIVE_BLOCKS);
@@ -95,6 +102,7 @@ export async function runStopHook(rawInput: string): Promise<{ output: string; e
     return { output: "", exitCode: 0 };
   }
 
+  const agent: AgentIdentity = { sessionId: parsed.session_id, cwd: canonicalDir(parsed.cwd) };
   const store = new SessionStore(stateDir());
   const sessions = await store.list();
   const openSessions = sessions
@@ -102,6 +110,7 @@ export async function runStopHook(rawInput: string): Promise<{ output: string; e
     .map((session) => ({
       key: session.key,
       file: session.file,
+      ownership: ownershipOf(session, agent),
       openEdits: session.annotations.filter((entry) => entry.status === "submitted").length,
     }));
 
@@ -138,9 +147,68 @@ export async function runStopHook(rawInput: string): Promise<{ output: string; e
 // anything, and they are simply there.
 // ---------------------------------------------------------------------------
 
+export interface AgentIdentity {
+  /** The Claude Code session this hook fired in. */
+  sessionId?: string;
+  cwd?: string;
+}
+
+export type Ownership = "authoring" | "same-project" | "foreign";
+
+function isWithin(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Directory comparison must go through realpath on both sides. `process.cwd()`
+ * already returns a resolved path, but a hook reports whatever the agent's cwd
+ * string is — and on macOS /tmp is a symlink to /private/tmp, so the two
+ * disagree for the exact same directory and routing silently fails.
+ */
+export function canonicalDir(dir: string | undefined): string | undefined {
+  if (!dir) return undefined;
+  try {
+    return realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+/**
+ * Decides whether a given agent session should hear about an artifact's edits.
+ *
+ * This is the whole point of the tool: an inline edit is only worth much to the
+ * agent that produced the plan, because that agent holds the conversation the
+ * plan came out of. Broadcasting to every open session both spams unrelated work
+ * and hands the edit to an agent with no idea why the plan says what it says.
+ */
+export function ownershipOf(
+  session: { authoredBy?: string; authoredIn?: string },
+  agent: AgentIdentity,
+): Ownership {
+  if (session.authoredBy && agent.sessionId) {
+    if (session.authoredBy === agent.sessionId) return "authoring";
+    // Claimed by a different agent session. Fall through to the directory check
+    // rather than returning "foreign" outright: the human may have started a
+    // fresh session to carry on with the same plan, and silently dropping their
+    // edit is worse than handing it over with a caveat.
+  }
+  if (session.authoredIn && agent.cwd && (isWithin(session.authoredIn, agent.cwd) || isWithin(agent.cwd, session.authoredIn))) {
+    return session.authoredBy && session.authoredBy !== agent.sessionId ? "same-project" : "authoring";
+  }
+  // No provenance recorded at all (opened before this existed, or outside a
+  // Claude session): surfacing beats losing the edit.
+  if (!session.authoredBy && !session.authoredIn) return "authoring";
+  return "foreign";
+}
+
 export interface InjectionEntry {
   file: string;
-  open: Array<{ id: string; body: string; text: string; selector: string; deliveredAt?: string }>;
+  ownership: Ownership;
+  open: Array<{ id: string; body: string; text: string; selector: string; deliveredTo?: string[] }>;
+  /** Identifies the agent asking, so delivery is tracked per session. */
+  agentKey: string;
 }
 
 export interface Injection {
@@ -150,17 +218,22 @@ export interface Injection {
 }
 
 export function buildContextInjection(entries: InjectionEntry[]): Injection | null {
-  const withOpen = entries.filter((entry) => entry.open.length > 0);
+  const withOpen = entries.filter((entry) => entry.open.length > 0 && entry.ownership !== "foreign");
   if (withOpen.length === 0) return null;
 
   const lines: string[] = [];
   const deliver: string[] = [];
 
   for (const entry of withOpen) {
-    const fresh = entry.open.filter((annotation) => !annotation.deliveredAt);
-    const repeated = entry.open.filter((annotation) => annotation.deliveredAt);
+    const seen = (annotation: { deliveredTo?: string[] }) => (annotation.deliveredTo ?? []).includes(entry.agentKey);
+    const fresh = entry.open.filter((annotation) => !seen(annotation));
+    const repeated = entry.open.filter(seen);
 
-    lines.push(`Open edits on ${entry.file}:`);
+    lines.push(
+      entry.ownership === "same-project"
+        ? `Open edits on ${entry.file} (opened by a different agent session — read the file before applying, you may not have the context behind it):`
+        : `Open edits on ${entry.file}:`,
+    );
     for (const annotation of fresh) {
       const anchor = annotation.text
         ? ` (on: "${annotation.text.slice(0, 80)}"${annotation.selector ? ` — ${annotation.selector}` : ""})`
@@ -184,12 +257,19 @@ export function buildContextInjection(entries: InjectionEntry[]): Injection | nu
   return { text: lines.join("\n"), deliver };
 }
 
-export async function runContextHook(event: "UserPromptSubmit" | "SessionStart"): Promise<string> {
+export async function runContextHook(
+  event: "UserPromptSubmit" | "SessionStart",
+  rawAgent: AgentIdentity,
+): Promise<string> {
+  const agent: AgentIdentity = { sessionId: rawAgent.sessionId, cwd: canonicalDir(rawAgent.cwd) };
   const store = new SessionStore(stateDir());
   const sessions = (await store.list()).filter((session) => session.status === "open");
 
+  const agentKey = agent.sessionId ?? `cwd:${agent.cwd ?? "unknown"}`;
   const entries: InjectionEntry[] = sessions.map((session) => ({
     file: session.file,
+    ownership: ownershipOf(session, agent),
+    agentKey,
     open: session.annotations
       .filter((annotation) => annotation.status === "submitted")
       .map((annotation) => ({
@@ -197,7 +277,7 @@ export async function runContextHook(event: "UserPromptSubmit" | "SessionStart")
         body: annotation.body,
         text: annotation.text,
         selector: annotation.selector,
-        deliveredAt: annotation.deliveredAt,
+        deliveredTo: annotation.deliveredTo,
       })),
   }));
 
@@ -205,8 +285,9 @@ export async function runContextHook(event: "UserPromptSubmit" | "SessionStart")
   if (!injection) return "";
 
   for (const session of sessions) {
+    if (ownershipOf(session, agent) === "foreign") continue;
     const ids = injection.deliver.filter((id) => session.annotations.some((entry) => entry.id === id));
-    if (ids.length > 0) await store.markDelivered(session.key, ids);
+    if (ids.length > 0) await store.markDelivered(session.key, ids, agentKey);
   }
 
   return JSON.stringify({

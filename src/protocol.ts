@@ -23,8 +23,12 @@ export interface Annotation {
   status: AnnotationStatus;
   createdAt: string;
   submittedAt?: string;
-  /** When this edit was last injected into an agent's context. */
-  deliveredAt?: string;
+  /**
+   * Agent sessions this edit's full text has already been injected into.
+   * Per-session rather than a single stamp: otherwise one agent seeing it first
+   * downgrades every other agent — including the authoring one — to a bare count.
+   */
+  deliveredTo?: string[];
   addressedAt?: string;
   /** Optional note the agent leaves when it marks something addressed. */
   agentNote?: string;
@@ -44,6 +48,13 @@ export interface Session {
   file: string;
   status: "open" | "ended";
   endedBy?: "user" | "agent";
+  /**
+   * The Claude Code session that opened this artifact — i.e. the agent that
+   * holds the conversation the plan came out of. Edits are routed back to it.
+   */
+  authoredBy?: string;
+  /** cwd at open time; the fallback route when there is no session id. */
+  authoredIn?: string;
   annotations: Annotation[];
   chat: ChatMessage[];
   createdAt: string;

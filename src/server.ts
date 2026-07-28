@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import chokidar, { type FSWatcher } from "chokidar";
 import express, { type NextFunction, type Request, type Response } from "express";
 
+import { canonicalDir } from "./hooks.ts";
 import { injectSdk } from "./html-transform.ts";
 import { allowedHostnames, bindHost, defaultPort, hostnameFromHeader, stateDir } from "./paths.ts";
 import {
@@ -189,7 +190,11 @@ export async function serve(options: ServeOptions = {}) {
       const info = await stat(canonical);
       if (!info.isFile()) throw new ValidationError("artifact must be a regular file");
 
-      const session = await store.open(canonical);
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const session = await store.open(canonical, {
+        authoredBy: typeof body.authoredBy === "string" ? body.authoredBy.slice(0, 64) : undefined,
+        authoredIn: typeof body.authoredIn === "string" ? canonicalDir(body.authoredIn.slice(0, 1024)) : undefined,
+      });
       await watch(session);
       log(`session opened key=${session.key} file=${session.file}`);
       res.json({

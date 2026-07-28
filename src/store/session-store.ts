@@ -95,11 +95,15 @@ export class SessionStore {
     return sessions.sort((a, b) => a.file.localeCompare(b.file));
   }
 
-  async open(canonicalPath: string): Promise<Session> {
+  async open(canonicalPath: string, origin: { authoredBy?: string; authoredIn?: string } = {}): Promise<Session> {
     const key = sessionKey(canonicalPath);
     return queued(key, async () => {
       const existing = await this.read(key);
       if (existing) {
+        // Reopening from a different agent session re-points ownership: the
+        // agent that just opened it is the one now working on it.
+        if (origin.authoredBy) existing.authoredBy = origin.authoredBy;
+        if (origin.authoredIn) existing.authoredIn = origin.authoredIn;
         // Reopening keeps the token stable so an already-open browser tab does
         // not lose access, and keeps annotations so an in-flight review survives
         // a server restart.
@@ -114,6 +118,8 @@ export class SessionStore {
         token: mintToken(),
         file: canonicalPath,
         status: "open",
+        ...(origin.authoredBy ? { authoredBy: origin.authoredBy } : {}),
+        ...(origin.authoredIn ? { authoredIn: origin.authoredIn } : {}),
         annotations: [],
         chat: [],
         createdAt: now,
@@ -182,13 +188,15 @@ export class SessionStore {
     });
   }
 
-  /** Stamps edits as injected so they are not re-sent verbatim every prompt. */
-  async markDelivered(key: string, ids: string[]): Promise<void> {
+  /** Records that these edits' full text reached a particular agent session. */
+  async markDelivered(key: string, ids: string[], agentKey: string): Promise<void> {
     const wanted = new Set(ids);
     await this.mutate(key, (session) => {
-      const now = new Date().toISOString();
       for (const annotation of session.annotations) {
-        if (wanted.has(annotation.id)) annotation.deliveredAt = now;
+        if (!wanted.has(annotation.id)) continue;
+        const seen = new Set(annotation.deliveredTo ?? []);
+        seen.add(agentKey);
+        annotation.deliveredTo = [...seen].slice(-20);
       }
     });
   }

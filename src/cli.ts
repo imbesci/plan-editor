@@ -96,7 +96,13 @@ async function openCommand(args: string[]): Promise<unknown> {
   const response = await fetch(`${baseUrl()}/api/sessions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ file: canonical }),
+    // Captures which Claude Code session is opening this, so the edits the human
+    // makes come back to the agent that actually wrote the plan.
+    body: JSON.stringify({
+      file: canonical,
+      authoredBy: process.env.CLAUDE_CODE_SESSION_ID,
+      authoredIn: process.cwd(),
+    }),
   });
   if (!response.ok) {
     const detail = (await response.json().catch(() => ({}))) as { error?: string };
@@ -217,7 +223,14 @@ async function hookCommand(args: string[]): Promise<unknown> {
 
   if (args[0] === "user-prompt-submit" || args[0] === "session-start") {
     const event = args[0] === "session-start" ? "SessionStart" : "UserPromptSubmit";
-    const output = await runContextHook(event);
+    const payload = (() => {
+      try {
+        return JSON.parse(raw || "{}") as { session_id?: string; cwd?: string };
+      } catch {
+        return {};
+      }
+    })();
+    const output = await runContextHook(event, { sessionId: payload.session_id, cwd: payload.cwd });
     if (output) process.stdout.write(output);
     process.exit(0);
   }

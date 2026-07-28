@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { describe, test } from "node:test";
 
 import {
   buildContextInjection,
+  canonicalDir,
+  ownershipOf,
   decideStop,
   fileFromToolInput,
   MAX_CONSECUTIVE_BLOCKS,
@@ -140,7 +143,7 @@ describe("mergeHookSettings", () => {
 });
 
 describe("buildContextInjection", () => {
-  const edit = (over: Partial<{ id: string; body: string; text: string; selector: string; deliveredAt: string }> = {}) => ({
+  const edit = (over: Partial<{ id: string; body: string; text: string; selector: string; deliveredTo: string[] }> = {}) => ({
     id: "e1",
     body: "Change this to Action plan",
     text: "Launch plan",
@@ -150,11 +153,11 @@ describe("buildContextInjection", () => {
 
   test("returns null when nothing is outstanding", () => {
     assert.equal(buildContextInjection([]), null);
-    assert.equal(buildContextInjection([{ file: "/tmp/a.html", open: [] }]), null);
+    assert.equal(buildContextInjection([{ file: "/tmp/a.html", ownership: "authoring" as const, agentKey: "A", open: [] }]), null);
   });
 
   test("includes the full request and its anchor the first time", () => {
-    const injection = buildContextInjection([{ file: "/tmp/a.html", open: [edit()] }])!;
+    const injection = buildContextInjection([{ file: "/tmp/a.html", ownership: "authoring" as const, agentKey: "A", open: [edit()] }])!;
     assert.match(injection.text, /Change this to Action plan/);
     assert.match(injection.text, /Launch plan/);
     assert.match(injection.text, /#heading/);
@@ -163,7 +166,7 @@ describe("buildContextInjection", () => {
 
   test("compacts already-delivered edits instead of repeating them", () => {
     const injection = buildContextInjection([
-      { file: "/tmp/a.html", open: [edit({ deliveredAt: "2026-01-01T00:00:00Z" })] },
+      { file: "/tmp/a.html", ownership: "authoring" as const, agentKey: "A", open: [edit({ deliveredTo: ["A"] })] },
     ])!;
     assert.doesNotMatch(injection.text, /Change this to Action plan/, "full text must not repeat every prompt");
     assert.match(injection.text, /1 previously listed edit still unapplied/);
@@ -174,7 +177,9 @@ describe("buildContextInjection", () => {
     const injection = buildContextInjection([
       {
         file: "/tmp/a.html",
-        open: [edit({ id: "old", deliveredAt: "2026-01-01T00:00:00Z" }), edit({ id: "new", body: "Add a date" })],
+        ownership: "authoring" as const,
+        agentKey: "A",
+        open: [edit({ id: "old", deliveredTo: ["A"] }), edit({ id: "new", body: "Add a date" })],
       },
     ])!;
     assert.match(injection.text, /Add a date/);
@@ -184,8 +189,8 @@ describe("buildContextInjection", () => {
 
   test("groups by file across several sessions", () => {
     const injection = buildContextInjection([
-      { file: "/tmp/a.html", open: [edit({ id: "a" })] },
-      { file: "/tmp/b.html", open: [edit({ id: "b", body: "Tighten the intro" })] },
+      { file: "/tmp/a.html", ownership: "authoring" as const, agentKey: "A", open: [edit({ id: "a" })] },
+      { file: "/tmp/b.html", ownership: "authoring" as const, agentKey: "A", open: [edit({ id: "b", body: "Tighten the intro" })] },
     ])!;
     assert.match(injection.text, /\/tmp\/a\.html/);
     assert.match(injection.text, /\/tmp\/b\.html/);
@@ -193,7 +198,135 @@ describe("buildContextInjection", () => {
   });
 
   test("always tells the agent not to ask for a reload", () => {
-    const injection = buildContextInjection([{ file: "/tmp/a.html", open: [edit()] }])!;
+    const injection = buildContextInjection([{ file: "/tmp/a.html", ownership: "authoring" as const, agentKey: "A", open: [edit()] }])!;
     assert.match(injection.text, /never tell the user to reload/);
+  });
+});
+
+describe("ownershipOf — routing edits back to the agent that wrote the plan", () => {
+  const AUTHOR = "11111111-1111-1111-1111-111111111111";
+  const OTHER = "22222222-2222-2222-2222-222222222222";
+  const session = { authoredBy: AUTHOR, authoredIn: "/work/proj" };
+
+  test("the authoring session owns it", () => {
+    assert.equal(ownershipOf(session, { sessionId: AUTHOR, cwd: "/work/proj" }), "authoring");
+  });
+
+  test("an unrelated session in an unrelated directory hears nothing", () => {
+    // This is the bug the global broadcast had: someone working on a different
+    // project got the edits and had no idea what they referred to.
+    assert.equal(ownershipOf(session, { sessionId: OTHER, cwd: "/work/other" }), "foreign");
+  });
+
+  test("a different session in the same project gets it, flagged", () => {
+    // The human may have started a fresh session to carry on with the same plan.
+    // Dropping their edit silently is worse than handing it over with a caveat.
+    assert.equal(ownershipOf(session, { sessionId: OTHER, cwd: "/work/proj" }), "same-project");
+  });
+
+  test("a subdirectory of the authoring cwd still counts as the project", () => {
+    assert.equal(ownershipOf(session, { sessionId: OTHER, cwd: "/work/proj/src/deep" }), "same-project");
+  });
+
+  test("the authoring session still owns it from a subdirectory", () => {
+    assert.equal(ownershipOf(session, { sessionId: AUTHOR, cwd: "/work/proj/src" }), "authoring");
+  });
+
+  test("a session opened outside Claude Code falls back to directory scope", () => {
+    const noAuthor = { authoredIn: "/work/proj" };
+    assert.equal(ownershipOf(noAuthor, { sessionId: OTHER, cwd: "/work/proj" }), "authoring");
+    assert.equal(ownershipOf(noAuthor, { sessionId: OTHER, cwd: "/elsewhere" }), "foreign");
+  });
+
+  test("a session with no provenance at all is surfaced rather than lost", () => {
+    assert.equal(ownershipOf({}, { sessionId: OTHER, cwd: "/anywhere" }), "authoring");
+  });
+});
+
+describe("scoping applied to injection and blocking", () => {
+  const edit2 = { id: "x", body: "Tighten this", text: "Some text", selector: "#a" };
+
+  test("foreign sessions are excluded from the injection entirely", () => {
+    assert.equal(
+      buildContextInjection([{ file: "/tmp/a.html", ownership: "foreign", agentKey: "A", open: [edit2] }]),
+      null,
+      "an agent with no connection to the plan must not be handed its edits",
+    );
+  });
+
+  test("same-project injections carry a warning about missing context", () => {
+    const injection = buildContextInjection([{ file: "/tmp/a.html", ownership: "same-project", agentKey: "A", open: [edit2] }])!;
+    assert.match(injection.text, /different agent session/);
+    assert.match(injection.text, /read the file before applying/);
+  });
+
+  test("authoring injections carry no such warning", () => {
+    const injection = buildContextInjection([{ file: "/tmp/a.html", ownership: "authoring", agentKey: "A", open: [edit2] }])!;
+    assert.doesNotMatch(injection.text, /different agent session/);
+  });
+
+  test("Stop never blocks a session that does not own the artifact", () => {
+    for (const ownership of ["foreign", "same-project"] as const) {
+      const decision = decideStop({
+        openSessions: [{ file: "/tmp/a.html", key: "k", openEdits: 3, ownership }],
+        blocks: {},
+        killSwitch: false,
+        stopHookActive: false,
+      });
+      assert.equal(decision.block, false, `${ownership} sessions must be free to finish`);
+    }
+  });
+
+  test("Stop still blocks the authoring session", () => {
+    const decision = decideStop({
+      openSessions: [{ file: "/tmp/a.html", key: "k", openEdits: 3, ownership: "authoring" }],
+      blocks: {},
+      killSwitch: false,
+      stopHookActive: false,
+    });
+    assert.equal(decision.block, true);
+  });
+});
+
+describe("canonicalDir", () => {
+  test("resolves a symlinked directory so both sides of a comparison agree", () => {
+    // macOS: /tmp is a symlink to /private/tmp. process.cwd() reports the
+    // resolved form while a hook reports the literal one, so without this the
+    // same directory compares as two different projects and routing silently
+    // drops the edit.
+    const viaSymlink = canonicalDir("/tmp");
+    const direct = canonicalDir(canonicalDir("/tmp"));
+    assert.equal(viaSymlink, direct, "canonicalisation must be idempotent");
+    assert.ok(path.isAbsolute(viaSymlink!));
+  });
+
+  test("passes through a path that cannot be resolved", () => {
+    assert.equal(canonicalDir("/definitely/not/here"), path.resolve("/definitely/not/here"));
+  });
+
+  test("undefined stays undefined", () => {
+    assert.equal(canonicalDir(undefined), undefined);
+  });
+});
+
+describe("delivery is tracked per agent session", () => {
+  const base = { id: "e1", body: "Rename the heading", text: "Launch plan", selector: "#h" };
+
+  test("a second agent seeing it first does not downgrade the authoring agent", () => {
+    // The failure this prevents: with one global delivered stamp, whichever
+    // session's hook fired first consumed the full text and every other session —
+    // including the one that actually wrote the plan — got a bare count.
+    const seenByOther = { ...base, deliveredTo: ["other-session"] };
+
+    const toAuthor = buildContextInjection([
+      { file: "/tmp/a.html", ownership: "authoring", agentKey: "author-session", open: [seenByOther] },
+    ])!;
+    assert.match(toAuthor.text, /Rename the heading/, "the authoring agent still gets the full request");
+    assert.deepEqual(toAuthor.deliver, ["e1"]);
+
+    const toOther = buildContextInjection([
+      { file: "/tmp/a.html", ownership: "same-project", agentKey: "other-session", open: [seenByOther] },
+    ])!;
+    assert.doesNotMatch(toOther.text, /Rename the heading/, "the agent that already saw it gets the short form");
   });
 });

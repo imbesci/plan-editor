@@ -92,6 +92,35 @@ This is the whole reason the tool can show which feedback landed.
 - Symlink-confinement tests need the target to be genuinely outside the *artifact's
   own directory*. A sibling of the artifact is legitimately in scope.
 
+## Routing edits back to the authoring agent
+
+An inline edit is only worth much to the agent that *produced* the plan — that
+agent holds the conversation the plan came out of. `plan-editor <file>` therefore
+records `authoredBy` (from `CLAUDE_CODE_SESSION_ID`, which Claude Code exposes to
+Bash) and `authoredIn` (cwd). Hooks receive `session_id` and `cwd`, and
+`ownershipOf` matches them:
+
+- **authoring** — same session id, or same project with no competing claim. Full
+  injection.
+- **same-project** — a different session in the same directory tree. Injected
+  *with a warning* that the agent may lack the context, because the human may
+  have started a fresh session and silently dropping their edit is worse.
+- **foreign** — neither. Never injected, never blocked.
+
+Two things this got wrong once and must not again:
+
+- **Directory comparison goes through `canonicalDir` (realpath) on both sides.**
+  `process.cwd()` resolves symlinks and a hook's reported `cwd` does not, so on
+  macOS `/tmp` vs `/private/tmp` made the same directory look like two projects
+  and routing silently dropped the edit.
+- **Delivery is tracked per agent session (`deliveredTo: string[]`), not one
+  global stamp.** With a single stamp, whichever session's hook fired first
+  consumed the full text and everyone else — including the authoring agent — got
+  a bare count.
+
+The Stop hook only ever blocks the **authoring** session. Holding an unrelated
+session hostage because another project has open edits is intolerable.
+
 ## Getting edits into the agent's context
 
 Three mechanisms, in order of how well they work:
