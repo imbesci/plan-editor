@@ -7,8 +7,19 @@ export type AnnotationStatus =
   | "draft" // exists in the browser only; never reaches the server
   | "submitted" // waiting for the agent
   | "addressed" // the agent's edit touched the anchored element
-  | "resolved" // human confirmed
+  | "resolved" // human accepted the change
   | "orphaned"; // the anchored element vanished across an edit
+
+export interface Anchor {
+  selector: string;
+  text: string;
+}
+
+export interface ThreadMessage {
+  role: "human" | "agent";
+  text: string;
+  at: string;
+}
 
 export interface Annotation {
   id: string;
@@ -18,8 +29,13 @@ export interface Annotation {
   selector: string;
   /** Snippet of the anchored content, for agent context and for re-anchoring. */
   text: string;
-  /** "element" for a pinned annotation, "message" for freeform chat. */
-  tag: "element" | "message";
+  /**
+   * Every element this edit covers, when it spans more than one. `selector` and
+   * `text` mirror the first entry so single-anchor consumers need no changes.
+   */
+  anchors?: Anchor[];
+  /** How the anchor was made: a clicked element, a text selection, or chat. */
+  tag: "element" | "text" | "message";
   status: AnnotationStatus;
   createdAt: string;
   submittedAt?: string;
@@ -32,6 +48,10 @@ export interface Annotation {
   addressedAt?: string;
   /** Optional note the agent leaves when it marks something addressed. */
   agentNote?: string;
+  /** Back-and-forth on this specific edit, including rejection reasons. */
+  thread?: ThreadMessage[];
+  /** Artifact version this edit was made against. */
+  versionSeq?: number;
 }
 
 export interface ChatMessage {
@@ -67,7 +87,15 @@ export type ServerEvent =
   | { type: "agent-activity"; active: boolean }
   | { type: "agent-reply"; text: string }
   | { type: "sync"; annotations: Annotation[]; chat: ChatMessage[] }
+  | { type: "versions"; list: VersionMeta[] }
   | { type: "presence"; state: AgentPresence };
+
+export interface VersionMeta {
+  seq: number;
+  at: string;
+  bytes: number;
+  origin: "open" | "edit" | "restore";
+}
 
 export type AgentPresence = "waiting" | "listening" | "working";
 
@@ -112,12 +140,22 @@ export function parseIncomingAnnotation(input: unknown): Omit<Annotation, "id" |
   const raw = input as Record<string, unknown>;
   const body = str(raw.body ?? "", MAX_BODY, "body").trim();
   if (!body) throw new ValidationError("body must not be empty");
-  const tag = raw.tag === "message" ? "message" : "element";
+  const tag = raw.tag === "message" ? "message" : raw.tag === "text" ? "text" : "element";
+  const anchors = Array.isArray(raw.anchors)
+    ? raw.anchors.slice(0, 40).map((entry) => {
+        const anchor = (entry ?? {}) as Record<string, unknown>;
+        return {
+          selector: str(anchor.selector ?? "", MAX_SELECTOR, "anchor.selector"),
+          text: str(anchor.text ?? "", MAX_TEXT, "anchor.text"),
+        };
+      })
+    : [];
   return {
     body,
-    selector: str(raw.selector ?? "", MAX_SELECTOR, "selector"),
-    text: str(raw.text ?? "", MAX_TEXT, "text"),
+    selector: str(raw.selector ?? anchors[0]?.selector ?? "", MAX_SELECTOR, "selector"),
+    text: str(raw.text ?? anchors[0]?.text ?? "", MAX_TEXT, "text"),
     tag,
+    ...(anchors.length > 1 ? { anchors } : {}),
   };
 }
 
@@ -139,4 +177,20 @@ export function parseMorphReport(input: unknown): { addressed: string[]; orphane
 
 export function isOpenAnnotation(annotation: Annotation): boolean {
   return annotation.status === "submitted";
+}
+
+/** Parses a re-anchor request for an orphaned edit. */
+export function parseRepoint(input: unknown): { selector: string; text: string } {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  return {
+    selector: str(raw.selector ?? "", MAX_SELECTOR, "selector"),
+    text: str(raw.text ?? "", MAX_TEXT, "text"),
+  };
+}
+
+export function parseThreadText(input: unknown): string {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const text = str(raw.text ?? "", MAX_BODY, "text").trim();
+  if (!text) throw new ValidationError("text must not be empty");
+  return text;
 }

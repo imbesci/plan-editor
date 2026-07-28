@@ -2,7 +2,8 @@
 // `allow-same-origin`, so it has an opaque origin and cannot usefully call the
 // API — which is also why the session token never leaves this file.
 
-import type { AgentPresence, Annotation, ChatMessage, ServerEvent } from "../protocol.ts";
+import { diffDocuments, diffWords, type SectionChange } from "../sdk/diff.ts";
+import type { AgentPresence, Annotation, ChatMessage, ServerEvent, VersionMeta } from "../protocol.ts";
 
 interface Bootstrap {
   key: string;
@@ -21,28 +22,30 @@ const submitButton = document.getElementById("submit") as HTMLButtonElement;
 const endButton = document.getElementById("end") as HTMLButtonElement;
 const modeToggle = document.getElementById("modeToggle") as HTMLInputElement;
 const presence = document.getElementById("presence")!;
+const undoButton = document.getElementById("undo") as HTMLButtonElement;
+const historyButton = document.getElementById("history") as HTMLButtonElement;
+const exportButton = document.getElementById("export") as HTMLButtonElement;
+const overlay = document.getElementById("overlay")!;
+
+interface Draft {
+  clientId: string;
+  /** One entry per element this edit covers; several when chunk-selected. */
+  anchors: Array<{ selector: string; text: string }>;
+  kind: "element" | "text";
+  body: string;
+}
 
 let annotations: Annotation[] = [];
 let chat: ChatMessage[] = [];
+let versions: VersionMeta[] = [];
 let presenceState: AgentPresence = "waiting";
-/** The element the user just clicked, awaiting a body. */
-let armed: { clientId: string; selector: string; text: string } | null = null;
-/** Annotation ids already handed to the SDK, so re-syncs do not re-send. */
+/** Staged edits, not yet sent. Several can be queued before one submit. */
+let drafts: Draft[] = [];
+/** The draft currently being typed into, if any. */
+let armed: Draft | null = null;
+/** Annotation awaiting a new anchor from the next artifact click. */
+let repointing: string | null = null;
 const trackedIds = new Set<string>();
-
-/**
- * Hands every still-open annotation to the SDK so it can re-anchor them. The
- * SDK's anchor map is per page load, so without this an annotation submitted
- * before a reload can never be marked addressed.
- */
-function syncTracking(): void {
-  for (const annotation of annotations) {
-    if (annotation.status !== "submitted" || annotation.tag !== "element") continue;
-    if (trackedIds.has(annotation.id)) continue;
-    trackedIds.add(annotation.id);
-    toFrame({ type: "pe:track", id: annotation.id, selector: annotation.selector, text: annotation.text });
-  }
-}
 
 frame.src = `/artifact/${key}/index.html?t=${encodeURIComponent(token)}`;
 
@@ -57,56 +60,108 @@ function toFrame(message: unknown): void {
   frame.contentWindow?.postMessage(message, "*");
 }
 
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"]/g, (char) => `&${{ "&": "amp", "<": "lt", ">": "gt", '"': "quot" }[char]};`);
+}
+
+/**
+ * Hands every still-open annotation to the SDK so it can re-anchor them. The
+ * SDK's anchor map is per page load, so without this an annotation submitted
+ * before a reload can never be marked addressed.
+ */
+function syncTracking(): void {
+  for (const annotation of annotations) {
+    if (annotation.status !== "submitted" || annotation.tag === "message") continue;
+    if (trackedIds.has(annotation.id)) continue;
+    trackedIds.add(annotation.id);
+    toFrame({
+      type: "pe:track",
+      id: annotation.id,
+      selector: annotation.selector,
+      text: annotation.text,
+      anchors: annotation.anchors,
+    });
+  }
+}
+
 // --- rendering --------------------------------------------------------------
 
 const STATUS_LABEL: Record<Annotation["status"], string> = {
   draft: "draft",
   submitted: "waiting for agent",
-  addressed: "applied",
-  resolved: "resolved",
+  addressed: "applied — review it",
+  resolved: "accepted",
   orphaned: "target changed",
 };
 
 function render(): void {
-  const draft = armed
-    ? [{ id: armed.clientId, body: input.value || "…", selector: armed.selector, text: armed.text, tag: "element", status: "draft", createdAt: "" } as Annotation]
-    : [];
-  const rows = [...annotations, ...draft];
   const open = annotations.filter((entry) => entry.status === "submitted").length;
-
-  // Without this, a submitted edit just sits on "waiting for agent" with no
-  // indication that nothing is listening or what to do about it.
   const banner =
     open > 0 && presenceState === "waiting"
       ? `<div class="alert"><strong>${open} edit${open === 1 ? "" : "s"} waiting to be picked up.</strong>
-           <span>With hooks installed, just send any message in the Claude session you're already in — these arrive automatically. No new agent needed.</span>
-           <code>plan-editor setup hooks</code>
-           <span class="alt">Without hooks, an agent has to poll for them:</span>
-           <code>plan-editor poll ${escapeHtml(bootstrap.file)}</code></div>`
+           <span>With hooks installed, just send any message in the Claude session you're already in — these arrive automatically.</span>
+           <code>plan-editor setup hooks</code></div>`
       : "";
 
-  if (rows.length === 0) {
-    list.innerHTML = `${banner}<p class="empty">Turn on Annotate, click an element, and describe the change. It gets applied in place — no reload.</p>`;
-    return;
-  }
-  list.innerHTML =
-    banner +
-    rows
-    .map((entry) => {
-      const anchor = entry.text ? escapeHtml(entry.text.slice(0, 90)) : escapeHtml(entry.selector || "whole page");
-      return `<article class="card" data-status="${entry.status}" data-id="${escapeHtml(entry.id)}">
-        <div class="anchor">${anchor}</div>
-        <div class="body">${escapeHtml(entry.body)}</div>
-        <div class="meta"><span class="status">${STATUS_LABEL[entry.status]}</span>${
-          entry.agentNote ? `<span>${escapeHtml(entry.agentNote)}</span>` : ""
-        }</div>
-      </article>`;
-    })
-    .join("");
+  const repointBanner = repointing
+    ? `<div class="alert repoint"><strong>Pick a new anchor.</strong><span>Click the element this edit should point at.</span>
+         <button class="link" data-cancel-repoint>Cancel</button></div>`
+    : "";
+
+  const cards = [...annotations.map(renderCard), ...drafts.map(renderDraft)];
+  const body = cards.length
+    ? cards.join("")
+    : `<p class="empty">Turn on Annotate, then click an element — or select some text — and describe the change. It gets applied in place, no reload.</p>`;
+
+  list.innerHTML = banner + repointBanner + body;
+  undoButton.disabled = versions.length < 2;
+  submitButton.disabled = drafts.length === 0 && !input.value.trim();
+  submitButton.textContent = drafts.length > 1 ? `Submit ${drafts.length} edits` : "Submit";
 }
 
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"]/g, (char) => `&${{ "&": "amp", "<": "lt", ">": "gt", '"': "quot" }[char]};`);
+function anchorLabel(anchors: Array<{ selector: string; text: string }>, kind: string): string {
+  if (anchors.length > 1) {
+    return `<span class="chunk">${anchors.length} elements</span> ${escapeHtml(
+      anchors.map((anchor) => anchor.text.slice(0, 24)).join(" · ").slice(0, 90),
+    )}`;
+  }
+  const first = anchors[0];
+  return `${kind === "text" ? "❝ " : ""}${escapeHtml(first?.text.slice(0, 90) || first?.selector || "whole page")}`;
+}
+
+function renderDraft(draft: Draft): string {
+  return `<article class="card" data-status="draft">
+    <div class="anchor">${anchorLabel(draft.anchors, draft.kind)}</div>
+    <div class="body">${escapeHtml(draft.body || "…")}</div>
+    <div class="meta"><span class="status">draft</span>
+      <button class="link" data-drop-draft="${draft.clientId}">remove</button></div>
+  </article>`;
+}
+
+function renderCard(annotation: Annotation): string {
+  const thread = (annotation.thread ?? [])
+    .map((message) => `<div class="msg ${message.role}"><b>${message.role === "human" ? "You" : "Agent"}</b> ${escapeHtml(message.text)}</div>`)
+    .join("");
+
+  const actions: string[] = [];
+  if (annotation.status === "addressed") {
+    actions.push(`<button class="link accept" data-accept="${annotation.id}">Accept</button>`);
+    actions.push(`<button class="link reject" data-reject="${annotation.id}">Reject…</button>`);
+  }
+  if (annotation.status === "orphaned") {
+    actions.push(`<button class="link" data-repoint="${annotation.id}">Re-point…</button>`);
+  }
+  if (annotation.tag !== "message") {
+    actions.push(`<button class="link" data-jump="${annotation.id}">Show</button>`);
+  }
+  actions.push(`<button class="link" data-reply="${annotation.id}">Reply…</button>`);
+
+  return `<article class="card" data-status="${annotation.status}" data-id="${escapeHtml(annotation.id)}">
+    <div class="anchor">${anchorLabel(annotation.anchors ?? [{ selector: annotation.selector, text: annotation.text }], annotation.tag)}</div>
+    <div class="body">${escapeHtml(annotation.body)}</div>
+    ${thread ? `<div class="thread">${thread}</div>` : ""}
+    <div class="meta"><span class="status">${STATUS_LABEL[annotation.status]}</span>${actions.join("")}</div>
+  </article>`;
 }
 
 // --- annotation flow --------------------------------------------------------
@@ -114,13 +169,6 @@ function escapeHtml(value: string): string {
 function setMode(next: boolean): void {
   modeToggle.checked = next;
   toFrame({ type: "pe:setMode", value: next });
-  if (!next) disarm();
-}
-
-function disarm(): void {
-  if (armed) toFrame({ type: "pe:cancel", clientId: armed.clientId });
-  armed = null;
-  render();
 }
 
 modeToggle.addEventListener("change", () => setMode(modeToggle.checked));
@@ -136,40 +184,212 @@ document.addEventListener(
       event.preventDefault();
       void submit();
     }
+    if (event.key === "Escape") closeOverlay();
   },
   true,
 );
 
 input.addEventListener("input", () => {
-  if (armed) render();
+  if (armed) armed.body = input.value;
+  render();
 });
 
 submitButton.addEventListener("click", () => void submit());
 
+/** Moves the in-progress draft into the queue so another element can be picked. */
+function stageArmed(): void {
+  if (!armed) return;
+  armed.body = input.value.trim();
+  if (!armed.body) {
+    toFrame({ type: "pe:cancel", clientId: armed.clientId });
+  } else if (!drafts.includes(armed)) {
+    drafts.push(armed);
+  }
+  armed = null;
+  input.value = "";
+}
+
 async function submit(): Promise<void> {
-  const body = input.value.trim();
-  if (!body) return;
+  stageArmed();
+  const freeform = input.value.trim();
+  const payload: Array<Record<string, unknown>> = drafts.map((draft) => ({
+    body: draft.body,
+    selector: draft.anchors[0]?.selector ?? "",
+    text: draft.anchors[0]?.text ?? "",
+    anchors: draft.anchors,
+    tag: draft.kind,
+  }));
+  if (freeform) payload.push({ body: freeform, selector: "", text: "", tag: "message" });
+  if (payload.length === 0) return;
+
   submitButton.disabled = true;
   try {
-    const payload = armed
-      ? [{ body, selector: armed.selector, text: armed.text, tag: "element" }]
-      : [{ body, selector: "", text: "", tag: "message" }];
     const response = await api("/annotations", { method: "POST", body: JSON.stringify({ annotations: payload }) });
     if (!response.ok) throw new Error(`submit failed: ${response.status}`);
     const result = (await response.json()) as { annotations: Annotation[] };
-    // Hand the server-assigned id to the SDK so its morph report uses the same
+    // Hand each server-assigned id to the SDK so morph reports use the same
     // identity the store knows about.
-    if (armed && result.annotations[0]) {
-      toFrame({ type: "pe:bind", clientId: armed.clientId, id: result.annotations[0].id });
-    }
-    armed = null;
+    drafts.forEach((draft, index) => {
+      const created = result.annotations[index];
+      if (created) toFrame({ type: "pe:bind", clientId: draft.clientId, id: created.id });
+    });
+    drafts = [];
     input.value = "";
   } catch (error) {
     console.error(error);
   } finally {
-    submitButton.disabled = false;
     render();
   }
+}
+
+// --- card actions -----------------------------------------------------------
+
+list.addEventListener("click", (event) => {
+  const target = event.target as HTMLElement;
+  const action = <K extends string>(name: K) => target.closest(`[data-${name}]`)?.getAttribute(`data-${name}`);
+
+  const drop = action("drop-draft");
+  if (drop) {
+    drafts = drafts.filter((draft) => draft.clientId !== drop);
+    toFrame({ type: "pe:cancel", clientId: drop });
+    return render();
+  }
+  if (target.closest("[data-cancel-repoint]")) {
+    repointing = null;
+    toFrame({ type: "pe:repoint", id: null });
+    return render();
+  }
+
+  const jump = action("jump");
+  if (jump) {
+    const annotation = annotations.find((entry) => entry.id === jump);
+    if (annotation) toFrame({ type: "pe:scrollTo", id: jump, selector: annotation.selector, text: annotation.text });
+    return;
+  }
+
+  const accept = action("accept");
+  if (accept) return void api(`/annotations/${accept}/accept`, { method: "POST", body: "{}" });
+
+  const reject = action("reject");
+  if (reject) {
+    const reason = prompt("What's wrong with the change?");
+    if (reason?.trim()) {
+      void api(`/annotations/${reject}/reject`, { method: "POST", body: JSON.stringify({ text: reason.trim() }) });
+    }
+    return;
+  }
+
+  const reply = action("reply");
+  if (reply) {
+    const text = prompt("Reply to the agent about this edit:");
+    if (text?.trim()) {
+      void api(`/annotations/${reply}/reply`, { method: "POST", body: JSON.stringify({ text: text.trim() }) });
+    }
+    return;
+  }
+
+  const repoint = action("repoint");
+  if (repoint) {
+    repointing = repoint;
+    setMode(true);
+    toFrame({ type: "pe:repoint", id: repoint });
+    return render();
+  }
+});
+
+// --- versions, undo, diff ---------------------------------------------------
+
+undoButton.addEventListener("click", async () => {
+  undoButton.disabled = true;
+  await api("/restore", { method: "POST", body: "{}" }).catch((error) => console.error(error));
+});
+
+exportButton.addEventListener("click", () => {
+  window.open(`/api/${key}/export?t=${encodeURIComponent(token)}`, "_blank");
+});
+
+historyButton.addEventListener("click", () => void openHistory());
+
+function closeOverlay(): void {
+  overlay.hidden = true;
+  overlay.innerHTML = "";
+}
+
+overlay.addEventListener("click", (event) => {
+  if (event.target === overlay) closeOverlay();
+});
+
+async function openHistory(): Promise<void> {
+  const rows = [...versions].reverse();
+  overlay.hidden = false;
+  overlay.innerHTML = `<div class="sheet">
+    <header><h2>History</h2><button class="link" data-close>Close</button></header>
+    <div class="versions">${rows
+      .map(
+        (version, index) => `<button class="version" data-seq="${version.seq}">
+          <span class="seq">v${version.seq}</span>
+          <span class="when">${new Date(version.at).toLocaleTimeString()}</span>
+          <span class="origin">${version.origin === "open" ? "initial" : version.origin}</span>
+          ${index === 0 ? '<span class="current">current</span>' : ""}
+        </button>`,
+      )
+      .join("")}</div>
+    <div class="diff" id="diffPane"><p class="empty">Pick a version to see what changed since it.</p></div>
+  </div>`;
+
+  overlay.querySelector("[data-close]")?.addEventListener("click", closeOverlay);
+  for (const button of overlay.querySelectorAll<HTMLButtonElement>(".version")) {
+    button.addEventListener("click", () => void showDiff(Number(button.dataset.seq)));
+  }
+}
+
+async function fetchVersion(seq: number): Promise<string> {
+  const response = await fetch(`/api/${key}/versions/${seq}?t=${encodeURIComponent(token)}`);
+  return response.ok ? response.text() : "";
+}
+
+async function showDiff(seq: number): Promise<void> {
+  const pane = document.getElementById("diffPane");
+  if (!pane) return;
+  const current = versions[versions.length - 1];
+  if (!current) return;
+  pane.innerHTML = `<p class="empty">Comparing…</p>`;
+
+  const [oldHtml, newHtml] = await Promise.all([fetchVersion(seq), fetchVersion(current.seq)]);
+  const diff = diffDocuments(oldHtml, newHtml);
+
+  const restore =
+    seq === current.seq
+      ? ""
+      : `<button class="restore" data-restore="${seq}">Restore v${seq}</button>`;
+
+  if (diff.sections.length === 0) {
+    pane.innerHTML = `${restore}<p class="empty">${
+      diff.unattributed ? "Content changed, but not inside any element with an id." : "No differences from the current version."
+    }</p>`;
+  } else {
+    pane.innerHTML = restore + diff.sections.map(renderSectionDiff).join("");
+  }
+
+  pane.querySelector("[data-restore]")?.addEventListener("click", async () => {
+    await api("/restore", { method: "POST", body: JSON.stringify({ seq }) });
+    closeOverlay();
+  });
+}
+
+function renderSectionDiff(section: SectionChange): string {
+  const head = `<div class="dhead"><span class="dkind ${section.kind}">${section.kind}</span> ${escapeHtml(section.label)}</div>`;
+  if (section.kind !== "changed" || section.before === undefined || section.after === undefined) {
+    return `<div class="dsection">${head}</div>`;
+  }
+  const words = diffWords(section.before, section.after)
+    .map((op) =>
+      op.type === "same"
+        ? escapeHtml(op.text)
+        : `<span class="${op.type === "add" ? "wadd" : "wdel"}">${escapeHtml(op.text)}</span>`,
+    )
+    .join("");
+  return `<div class="dsection">${head}<div class="dbody">${words}</div></div>`;
 }
 
 /**
@@ -187,9 +407,6 @@ endButton.addEventListener("click", async () => {
   }
   stream.close();
   setMode(false);
-
-  // Only works for script-opened windows; browsers refuse otherwise, so we need
-  // the fallback below rather than assuming the tab is gone.
   window.close();
   setTimeout(showEndedScreen, 120);
 });
@@ -216,7 +433,6 @@ window.addEventListener("message", (event: MessageEvent) => {
   switch (data.type) {
     case "pe:ready":
       setMode(modeToggle.checked);
-      // The frame just (re)loaded with an empty anchor map — re-anchor everything.
       trackedIds.clear();
       syncTracking();
       break;
@@ -225,32 +441,50 @@ window.addEventListener("message", (event: MessageEvent) => {
       setMode(!modeToggle.checked);
       break;
 
-    case "pe:annotate":
-      if (armed) toFrame({ type: "pe:cancel", clientId: armed.clientId });
-      armed = { clientId: String(data.clientId), selector: String(data.selector), text: String(data.text) };
+    case "pe:annotate": {
+      const clientId = String(data.clientId);
+      const anchors = (data.anchors ?? []) as Array<{ selector: string; text: string }>;
+      if (armed?.clientId === clientId) {
+        // A modifier-click extended the existing selection rather than starting
+        // a new edit — keep whatever has been typed so far.
+        armed.anchors = anchors;
+      } else {
+        // A plain click on a different element stages the previous draft rather
+        // than discarding it, so several related edits can be sent as one batch.
+        stageArmed();
+        armed = { clientId, anchors, kind: data.kind === "text" ? "text" : "element", body: "" };
+      }
       input.focus();
       render();
       break;
+    }
+
+    case "pe:repointed": {
+      const id = String(data.id);
+      repointing = null;
+      void api(`/annotations/${id}/repoint`, {
+        method: "POST",
+        body: JSON.stringify({ selector: String(data.selector), text: String(data.text) }),
+      });
+      render();
+      break;
+    }
 
     case "pe:morphed":
-      void reportMorph(data as unknown as { addressed: string[]; orphaned: string[] });
+      void api("/morph-report", {
+        method: "POST",
+        body: JSON.stringify({ addressed: data.addressed ?? [], orphaned: data.orphaned ?? [] }),
+      });
       break;
 
     case "pe:morphFailed":
       // Morphing arbitrary agent-written HTML is a heuristic. When it fails we
-      // still have to show the truth, so fall back to the thing that always works.
+      // still have to show the truth, so fall back to what always works.
       console.warn("morph failed, reloading frame:", data.message);
       frame.src = `/artifact/${key}/index.html?t=${encodeURIComponent(token)}&r=${Date.now()}`;
       break;
   }
 });
-
-async function reportMorph(report: { addressed: string[]; orphaned: string[] }): Promise<void> {
-  await api("/morph-report", {
-    method: "POST",
-    body: JSON.stringify({ addressed: report.addressed ?? [], orphaned: report.orphaned ?? [] }),
-  });
-}
 
 // --- server stream ----------------------------------------------------------
 
@@ -268,16 +502,16 @@ stream.addEventListener("message", (event) => {
       syncTracking();
       render();
       break;
+    case "versions":
+      versions = payload.list;
+      render();
+      break;
     case "presence":
       presenceState = payload.state;
       presence.dataset.state = payload.state;
       presence.textContent =
         payload.state === "listening" ? "agent listening" : payload.state === "working" ? "agent working…" : "no agent";
       render();
-      break;
-    case "agent-activity":
-      presence.dataset.state = "working";
-      presence.textContent = "agent working…";
       break;
     case "agent-reply":
       chat.push({ role: "agent", text: payload.text, at: new Date().toISOString() });

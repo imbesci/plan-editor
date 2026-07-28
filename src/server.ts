@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { readFile, realpath, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,8 @@ import { allowedHostnames, bindHost, defaultPort, hostnameFromHeader, stateDir }
 import {
   parseIncomingAnnotations,
   parseMorphReport,
+  parseRepoint,
+  parseThreadText,
   ValidationError,
   type AgentPresence,
   type Annotation,
@@ -20,6 +22,8 @@ import {
   type Session,
 } from "./protocol.ts";
 import { canonicalFile, SessionStore, sessionKey } from "./store/session-store.ts";
+import { VersionStore } from "./store/version-store.ts";
+import { stripSdk } from "./html-transform.ts";
 import { renderChrome } from "./chrome/chrome-html.ts";
 
 // Browser bundles live in dist/ next to src/, whether the server is run from
@@ -47,6 +51,7 @@ export async function serve(options: ServeOptions = {}) {
 
   const store = new SessionStore(directory);
   await store.init();
+  const versions = new VersionStore(directory);
 
   const app = express();
   const events = new EventEmitter();
@@ -156,10 +161,17 @@ export async function serve(options: ServeOptions = {}) {
       // The agent's write lands semi-atomically; settle before morphing so we
       // never patch against a half-written file.
       debounce = setTimeout(() => {
-        log(`artifact changed key=${session.key}`);
-        workingSessions.delete(session.key);
-        broadcast(session.key, { type: "patch", reason: "file-changed" });
-        emitPresence(session.key);
+        void (async () => {
+          log(`artifact changed key=${session.key}`);
+          const html = await readFile(session.file, "utf8").catch(() => null);
+          // Snapshot before telling the browser, so an undo issued the instant
+          // the patch lands already has the version it needs.
+          if (html !== null) await versions.snapshot(session.key, html, "edit");
+          workingSessions.delete(session.key);
+          broadcast(session.key, { type: "patch", reason: "file-changed" });
+          broadcast(session.key, { type: "versions", list: await versions.list(session.key) });
+          emitPresence(session.key);
+        })();
       }, 120);
     });
     watchers.set(session.key, watcher);
@@ -196,6 +208,7 @@ export async function serve(options: ServeOptions = {}) {
         authoredIn: typeof body.authoredIn === "string" ? canonicalDir(body.authoredIn.slice(0, 1024)) : undefined,
       });
       await watch(session);
+      await versions.snapshot(session.key, await readFile(canonical, "utf8"), "open");
       log(`session opened key=${session.key} file=${session.file}`);
       res.json({
         key: session.key,
@@ -345,6 +358,121 @@ export async function serve(options: ServeOptions = {}) {
     }
   });
 
+  app.get("/api/:key/versions", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      res.json({ versions: await versions.list(session.key) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/versions/:seq", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const html = await versions.read(session.key, Number(req.params.seq));
+      if (html === null) {
+        res.status(404).json({ error: "version not found" });
+        return;
+      }
+      res.type("text/plain").send(html);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Undo. Writing an old snapshot back to the artifact is the whole mechanism —
+  // the existing watcher turns it into a patch, so undo animates in place exactly
+  // like an agent edit, and is itself undoable because the write snapshots too.
+  app.post("/api/:key/restore", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const seq = Number(body.seq ?? (await versions.previousSeq(session.key)));
+      if (!Number.isFinite(seq)) {
+        res.status(400).json({ error: "nothing to restore" });
+        return;
+      }
+      const html = await versions.read(session.key, seq);
+      if (html === null) {
+        res.status(404).json({ error: "version not found" });
+        return;
+      }
+      await writeFile(session.file, html);
+      await versions.snapshot(session.key, html, "restore");
+      res.json({ status: "restored", seq });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/annotations/:id/accept", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const updated = await store.acceptAnnotation(session.key, String(req.params.id));
+      await syncBrowsers(session.key);
+      res.json({ status: updated ? "resolved" : "unchanged" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/annotations/:id/reject", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const reason = parseThreadText(req.body);
+      await store.rejectAnnotation(session.key, String(req.params.id), reason);
+      // Reopened, so the agent must hear about it again.
+      events.emit("feedback", session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: "reopened" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/annotations/:id/reply", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.replyToAnnotation(session.key, String(req.params.id), "human", parseThreadText(req.body));
+      events.emit("feedback", session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: "ok" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/annotations/:id/repoint", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.repointAnnotation(session.key, String(req.params.id), parseRepoint(req.body));
+      events.emit("feedback", session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: "repointed" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/export", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const html = stripSdk(await readFile(session.file, "utf8"));
+      res.type("html").set("Content-Disposition", 'attachment; filename="artifact.export.html"').send(html);
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get("/events/:key", async (req, res, next) => {
     try {
       const session = await loadAuthorized(req, res);
@@ -361,6 +489,7 @@ export async function serve(options: ServeOptions = {}) {
 
       res.write(`data: ${JSON.stringify({ type: "sync", annotations: session.annotations, chat: session.chat })}\n\n`);
       res.write(`data: ${JSON.stringify({ type: "presence", state: presenceOf(session.key) })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: "versions", list: await versions.list(session.key) })}\n\n`);
 
       const heartbeat = setInterval(() => {
         if (!res.writableEnded) res.write(": ping\n\n");

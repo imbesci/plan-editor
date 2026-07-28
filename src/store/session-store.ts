@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 
-import type { Annotation, ChatMessage, Session } from "../protocol.ts";
+import type { Annotation, ChatMessage, Session, ThreadMessage } from "../protocol.ts";
 import { queued, writeFileAtomically } from "./atomic.ts";
 
 export function sessionKey(canonicalPath: string): string {
@@ -198,6 +198,71 @@ export class SessionStore {
         seen.add(agentKey);
         annotation.deliveredTo = [...seen].slice(-20);
       }
+    });
+  }
+
+  /**
+   * Human accepts the agent's change. Terminal — the edit is done with.
+   */
+  async acceptAnnotation(key: string, id: string): Promise<Annotation | null> {
+    return this.mutate(key, (session) => {
+      const annotation = session.annotations.find((entry) => entry.id === id);
+      if (!annotation || annotation.status !== "addressed") return null;
+      annotation.status = "resolved";
+      return annotation;
+    });
+  }
+
+  /**
+   * Human rejects the agent's change. This reopens the edit rather than closing
+   * it, and clears the delivery record so the agent gets the full text again —
+   * a rejection the agent never hears about is the worst possible outcome.
+   */
+  async rejectAnnotation(key: string, id: string, reason: string): Promise<Annotation | null> {
+    return this.mutate(key, (session) => {
+      const annotation = session.annotations.find((entry) => entry.id === id);
+      if (!annotation) return null;
+      annotation.status = "submitted";
+      annotation.deliveredTo = [];
+      delete annotation.addressedAt;
+      annotation.thread = [
+        ...(annotation.thread ?? []),
+        { role: "human", text: `Rejected: ${reason}`, at: new Date().toISOString() },
+      ];
+      return annotation;
+    });
+  }
+
+  async replyToAnnotation(
+    key: string,
+    id: string,
+    role: ThreadMessage["role"],
+    text: string,
+  ): Promise<Annotation | null> {
+    return this.mutate(key, (session) => {
+      const annotation = session.annotations.find((entry) => entry.id === id);
+      if (!annotation) return null;
+      annotation.thread = [...(annotation.thread ?? []), { role, text, at: new Date().toISOString() }];
+      // A human reply on a settled edit reopens it; otherwise the agent never
+      // sees the follow-up.
+      if (role === "human" && annotation.status !== "submitted") {
+        annotation.status = "submitted";
+        annotation.deliveredTo = [];
+      }
+      return annotation;
+    });
+  }
+
+  /** Re-anchors an orphaned edit onto a new element the human picked. */
+  async repointAnnotation(key: string, id: string, anchor: { selector: string; text: string }): Promise<Annotation | null> {
+    return this.mutate(key, (session) => {
+      const annotation = session.annotations.find((entry) => entry.id === id);
+      if (!annotation) return null;
+      annotation.selector = anchor.selector;
+      annotation.text = anchor.text;
+      annotation.status = "submitted";
+      annotation.deliveredTo = [];
+      return annotation;
     });
   }
 

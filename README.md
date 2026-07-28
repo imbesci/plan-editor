@@ -57,6 +57,8 @@ membership check instead of a fuzzy match.
 | `plan-editor <file.html>` | Open the artifact for review. Prints a tokenised URL. |
 | `plan-editor poll <file.html>` | Long-poll for submitted edits. Silent while waiting — never kill it. |
 | `plan-editor poll <file> --reply "..."` | Report back to the browser, then keep waiting. |
+| `plan-editor undo <file.html>` | Restore the previous version of the artifact. |
+| `plan-editor export <file.html>` | Write a standalone copy with the SDK stripped `[--out path]`. |
 | `plan-editor status` | List sessions with open and addressed edit counts. |
 | `plan-editor end <file.html>` | End the session. |
 | `plan-editor stop` | Shut down the background server. |
@@ -91,6 +93,27 @@ The Stop hook is bounded three ways, because a runaway one is worse than the bug
 fixes: it never stacks on an already-active stop hook, it gives up after
 `MAX_CONSECUTIVE_BLOCKS` (2) attempts per session, and `PLAN_EDITOR_NO_STOP_HOOK=1`
 disables it entirely without uninstalling.
+
+## In the editor
+
+| | |
+| --- | --- |
+| **Click** an element | Attach an edit to it |
+| **Select text**, then click | Anchor to the selection instead of the whole element |
+| **⇧-click** more elements | Cover a chunk with one instruction; ⇧-click again to drop one |
+| **Click elsewhere** | Stages the current edit and starts another — submit sends them together |
+| **Accept / Reject** | On an applied edit. Reject reopens it with your reason attached |
+| **Reply** | Follow up on a specific edit; reopens it so the agent sees it |
+| **Show** | Scroll the artifact to that edit's anchor and flash it |
+| **Re-point** | Give an orphaned edit a new anchor by clicking one |
+| **Undo** | Restore the previous version — animates in place like any other edit |
+| **History** | Version list with a word-level diff per section, and restore from any point |
+| **Export** | Download a standalone copy |
+
+Edits are never deleted on delivery. They stay `submitted` until the agent's
+change actually touches the anchored element, then become `addressed` for you to
+accept or reject. A chunk edit counts as addressed when *any* of its elements
+changed, and orphaned only when all of them are gone.
 
 ## Writing artifacts that morph well
 

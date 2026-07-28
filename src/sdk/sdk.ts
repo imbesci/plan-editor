@@ -14,8 +14,13 @@
 import { morphDocument, UI_ATTRIBUTE, type TrackedAnchor } from "./morph.ts";
 
 const pending = new Map<string, TrackedAnchor>();
+/** The group currently being built, so a modifier-click can extend it. */
+let armedGroup: { clientId: string; elements: Element[] } | null = null;
 let annotateMode = false;
 let hoverTarget: Element | null = null;
+/** When set, the next click re-anchors this orphaned annotation instead of
+ *  creating a new one. */
+let repointing: string | null = null;
 
 const HIGHLIGHT_CLASS = "pe-changed";
 const PENDING_CLASS = "pe-pending";
@@ -44,6 +49,10 @@ function selectorFor(element: Element): string {
   return parts.join(" > ");
 }
 
+function describe(elements: Element[]): Array<{ selector: string; text: string }> {
+  return elements.map((element) => ({ selector: selectorFor(element), text: snippetFor(element) }));
+}
+
 function snippetFor(element: Element): string {
   return (element.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 300);
 }
@@ -60,6 +69,10 @@ function isInteractive(element: Element): boolean {
     current = current.parentElement;
   }
   return false;
+}
+
+function nearestElement(node: Node): Element | null {
+  return node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
 }
 
 /** Walks up to the nearest element worth annotating, so a click on a bare text
@@ -106,17 +119,59 @@ document.addEventListener(
     if (!(target instanceof Element) || isInteractive(target)) return;
     event.preventDefault();
     event.stopPropagation();
-    const element = annotationTarget(target);
+    // A live text selection is a more precise statement of intent than the
+    // element containing it, so it wins when one exists.
+    const selection = window.getSelection();
+    const selected = selection && !selection.isCollapsed ? selection.toString().replace(/\s+/g, " ").trim() : "";
+    const anchorElement =
+      selected && selection
+        ? nearestElement(selection.getRangeAt(0).commonAncestorContainer) ?? annotationTarget(target)
+        : annotationTarget(target);
+
+    if (repointing) {
+      post({
+        type: "pe:repointed",
+        id: repointing,
+        selector: selectorFor(anchorElement),
+        text: selected || snippetFor(anchorElement),
+      });
+      repointing = null;
+      document.documentElement.classList.remove("pe-repoint");
+      return;
+    }
+
+    // Shift/Cmd-click extends the current selection instead of starting a new
+    // one, so a single instruction can cover a chunk of the document.
+    const extend = Boolean((event.shiftKey || event.metaKey) && armedGroup);
+    if (extend && armedGroup) {
+      if (armedGroup.elements.includes(anchorElement)) {
+        // Clicking a chosen element again removes it — the only sane way to undo
+        // a mis-click mid-selection.
+        armedGroup.elements = armedGroup.elements.filter((element) => element !== anchorElement);
+        anchorElement.classList.remove(PENDING_CLASS);
+      } else {
+        armedGroup.elements.push(anchorElement);
+        anchorElement.classList.add(PENDING_CLASS);
+      }
+      pending.set(armedGroup.clientId, { id: armedGroup.clientId, elements: [...armedGroup.elements] });
+      post({ type: "pe:annotate", clientId: armedGroup.clientId, kind: "element", anchors: describe(armedGroup.elements) });
+      selection?.removeAllRanges();
+      return;
+    }
+
     const clientId = `c${Math.random().toString(36).slice(2, 10)}`;
-    pending.set(clientId, { id: clientId, element });
-    element.classList.add(PENDING_CLASS);
+    armedGroup = { clientId, elements: [anchorElement] };
+    pending.set(clientId, { id: clientId, elements: [anchorElement] });
+    anchorElement.classList.add(PENDING_CLASS);
     post({
       type: "pe:annotate",
       clientId,
-      selector: selectorFor(element),
-      text: snippetFor(element),
-      rect: element.getBoundingClientRect().toJSON(),
+      kind: selected ? "text" : "element",
+      anchors: selected
+        ? [{ selector: selectorFor(anchorElement), text: selected }]
+        : describe([anchorElement]),
     });
+    selection?.removeAllRanges();
   },
   true,
 );
@@ -158,8 +213,9 @@ function applyMorph(html: string): { addressed: string[]; orphaned: string[] } {
   const settled = new Set([...result.addressed, ...result.orphaned]);
   for (const [clientId, entry] of pending) {
     if (!settled.has(entry.id)) continue;
-    entry.element.classList.remove(PENDING_CLASS);
+    for (const element of entry.elements) element.classList.remove(PENDING_CLASS);
     pending.delete(clientId);
+    if (armedGroup?.clientId === clientId) armedGroup = null;
   }
 
   return { addressed: result.addressed, orphaned: result.orphaned };
@@ -181,13 +237,15 @@ window.addEventListener("message", (event: MessageEvent) => {
       const clientId = String(data.clientId);
       const entry = pending.get(clientId);
       if (entry) entry.id = String(data.id);
+      if (armedGroup?.clientId === clientId) armedGroup = null;
       break;
     }
 
     case "pe:cancel": {
-      const entry = pending.get(String(data.clientId));
-      entry?.element.classList.remove(PENDING_CLASS);
-      pending.delete(String(data.clientId));
+      const clientId = String(data.clientId);
+      for (const element of pending.get(clientId)?.elements ?? []) element.classList.remove(PENDING_CLASS);
+      pending.delete(clientId);
+      if (armedGroup?.clientId === clientId) armedGroup = null;
       break;
     }
 
@@ -198,10 +256,15 @@ window.addEventListener("message", (event: MessageEvent) => {
     case "pe:track": {
       const id = String(data.id);
       if ([...pending.values()].some((entry) => entry.id === id)) break;
-      const element = resolveAnchor(String(data.selector ?? ""), String(data.text ?? ""));
-      if (!element) break;
-      pending.set(`s:${id}`, { id, element });
-      element.classList.add(PENDING_CLASS);
+      const specs = Array.isArray(data.anchors) && data.anchors.length
+        ? (data.anchors as Array<{ selector?: string; text?: string }>)
+        : [{ selector: String(data.selector ?? ""), text: String(data.text ?? "") }];
+      const elements = specs
+        .map((spec) => resolveAnchor(String(spec.selector ?? ""), String(spec.text ?? "")))
+        .filter((element): element is Element => Boolean(element));
+      if (elements.length === 0) break;
+      pending.set(`s:${id}`, { id, elements });
+      for (const element of elements) element.classList.add(PENDING_CLASS);
       break;
     }
 
@@ -217,9 +280,22 @@ window.addEventListener("message", (event: MessageEvent) => {
       break;
     }
 
+    // Locate by tracked anchor first; fall back to the stored selector so
+    // settled annotations (which are no longer tracked) still jump.
     case "pe:scrollTo": {
-      const entry = pending.get(String(data.clientId));
-      entry?.element.scrollIntoView({ behavior: "smooth", block: "center" });
+      const id = String(data.id ?? "");
+      const tracked = [...pending.values()].find((entry) => entry.id === id);
+      const element = tracked?.elements[0] ?? resolveAnchor(String(data.selector ?? ""), String(data.text ?? ""));
+      if (!element) break;
+      element.scrollIntoView({ behavior: "smooth", block: "center" });
+      element.classList.add(HIGHLIGHT_CLASS);
+      setTimeout(() => element.classList.remove(HIGHLIGHT_CLASS), 1600);
+      break;
+    }
+
+    case "pe:repoint": {
+      repointing = data.id ? String(data.id) : null;
+      document.documentElement.classList.toggle("pe-repoint", Boolean(repointing));
       break;
     }
   }
@@ -242,6 +318,8 @@ const style = document.createElement("style");
 style.setAttribute(UI_ATTRIBUTE, "");
 style.textContent = `
 .pe-annotate, .pe-annotate * { cursor: crosshair !important; }
+.pe-repoint, .pe-repoint * { cursor: cell !important; }
+.pe-repoint .pe-hover { outline-color: #f59e0b !important; }
 .pe-annotate .pe-hover { outline: 2px solid #6366f1 !important; outline-offset: 2px; background: rgba(99,102,241,.06) !important; }
 .${PENDING_CLASS} { outline: 2px dashed #f59e0b !important; outline-offset: 2px; animation: pe-pulse 1.6s ease-in-out infinite; }
 .${HIGHLIGHT_CLASS} { animation: pe-flash 1.6s ease-out; }

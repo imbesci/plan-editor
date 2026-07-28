@@ -37,7 +37,12 @@ export function renderChrome(session: Session): string {
         <span class="toggle-text">Annotate</span>
         <kbd>⌘I</kbd>
       </label>
-      <span class="presence" id="presence" data-state="waiting">agent idle</span>
+      <span class="presence" id="presence" data-state="waiting">no agent</span>
+      <div class="tools">
+        <button id="undo" class="icon" type="button" title="Undo the last change" disabled>Undo</button>
+        <button id="history" class="icon" type="button" title="Version history and diff">History</button>
+        <button id="export" class="icon" type="button" title="Download a standalone copy">Export</button>
+      </div>
     </header>
     <div class="frame">
       <iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads"></iframe>
@@ -47,7 +52,7 @@ export function renderChrome(session: Session): string {
     <h2>Edits</h2>
     <div class="list" id="list"></div>
     <div class="composer">
-      <textarea id="input" rows="3" placeholder="Click an element, then say what to change…"></textarea>
+      <textarea id="input" rows="3" placeholder="Click an element (⇧-click for several), then say what to change…"></textarea>
       <div class="actions">
         <button id="end" class="ghost" type="button">End session</button>
         <button id="submit" type="button">Submit</button>
@@ -55,6 +60,7 @@ export function renderChrome(session: Session): string {
     </div>
   </aside>
 </div>
+<div class="overlay" id="overlay" hidden></div>
 <script type="module" src="/chrome.js"></script>
 </body>
 </html>`;

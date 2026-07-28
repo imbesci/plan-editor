@@ -9,7 +9,12 @@ export const UI_ATTRIBUTE = "data-pe-ui";
 export interface TrackedAnchor {
   /** Server-assigned annotation id once bound, client id before that. */
   id: string;
-  element: Element;
+  /**
+   * Every element this edit covers. Usually one, but an edit can span a chunk
+   * of the document ("tighten all four of these") — in which case it counts as
+   * addressed when *any* of them changed, and orphaned only when all are gone.
+   */
+  elements: Element[];
 }
 
 export interface MorphResult {
@@ -86,14 +91,16 @@ export function morphDocument(root: Element, html: string, tracked: Iterable<Tra
   const addressed: string[] = [];
   const orphaned: string[] = [];
   for (const anchor of tracked) {
-    const attached = ownerDocument?.contains(anchor.element) ?? root.contains(anchor.element);
-    if (!attached) {
+    const attached = anchor.elements.filter((element) =>
+      ownerDocument ? ownerDocument.contains(element) : root.contains(element),
+    );
+    if (attached.length === 0) {
       // Report rather than guess. A false "done" silently drops feedback the
       // human cared about, which is worse than asking them to confirm.
       orphaned.push(anchor.id);
       continue;
     }
-    if (changed.has(anchor.element)) addressed.push(anchor.id);
+    if (attached.some((element) => changed.has(element))) addressed.push(anchor.id);
   }
 
   return { addressed, orphaned, changed: deepest };

@@ -148,6 +148,31 @@ and `Stop` accept **only** the JSON form. Stop blocks with
 `{"decision":"block","reason":…}`. JSON is only parsed on exit code 0. We always
 emit the JSON form so the same code path works everywhere.
 
+## Versions, diff, and the edit lifecycle
+
+`VersionStore` snapshots the whole artifact per observed change (capped at
+`MAX_VERSIONS`, oldest dropped). Whole files rather than deltas: artifacts are
+small, and it makes restore a single write. **Undo is implemented by writing an
+old snapshot back to the artifact** — the existing watcher turns that into a
+patch, so undo morphs in place exactly like an agent edit, and is itself undoable
+because the restore snapshots too. Identical consecutive content is not recorded,
+or undo becomes a no-op the user has to press twice.
+
+`diffDocuments` (src/sdk/diff.ts) diffs by element `id` and reports only the
+*innermost* changed element. A line diff over HTML is useless — one reflowed
+paragraph rewrites a 400-character line — and reporting ancestors too would flag
+`body` for every edit. Changes with no id to attribute them to are counted, never
+guessed at. It runs in the browser because a real DOM is already there.
+
+Lifecycle invariants:
+
+- **Reject and human replies clear `deliveredTo` and reopen the edit.** A
+  rejection the agent never hears about is the worst possible outcome.
+- **A chunk edit is addressed when ANY covered element changed, and orphaned only
+  when ALL are gone.** `TrackedAnchor.elements` is a list for this reason.
+- **`anchors[0]` mirrors `selector`/`text`** so single-anchor consumers need no
+  branching.
+
 ## Things that are deliberately absent
 
 No multiplayer, no CRDT, no identity model. The artifact is agent-owned and humans

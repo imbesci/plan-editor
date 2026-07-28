@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -263,5 +263,167 @@ describe("live patching", () => {
 
     assert.equal(await sawPatch, true, "a file edit must push a patch event, not a reload");
     controller.abort();
+  });
+});
+
+describe("edit lifecycle: accept, reject, reply, re-point", () => {
+  async function submitOne(body: string) {
+    const response = await fetch(withToken(`/api/${session.key}/annotations`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ annotations: [{ body, selector: "#title", text: "Original title", tag: "element" }] }),
+    });
+    const created = (await response.json()) as { annotations: Array<{ id: string }> };
+    return created.annotations[0]!.id;
+  }
+
+  const markAddressed = (id: string) =>
+    fetch(withToken(`/api/${session.key}/morph-report`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ addressed: [id], orphaned: [] }),
+    });
+
+  test("accepting an applied edit resolves it for good", async () => {
+    const id = await submitOne("accept me");
+    await markAddressed(id);
+    await fetch(withToken(`/api/${session.key}/annotations/${id}/accept`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const stored = await instance.store.read(session.key);
+    assert.equal(stored?.annotations.find((entry) => entry.id === id)?.status, "resolved");
+  });
+
+  test("rejecting reopens the edit and clears its delivery record", async () => {
+    // A rejection the agent never hears about is the worst possible outcome, so
+    // reject must both reopen and make the edit injectable again in full.
+    const id = await submitOne("reject me");
+    await instance.store.markDelivered(session.key, [id], "agent-session");
+    await markAddressed(id);
+
+    await fetch(withToken(`/api/${session.key}/annotations/${id}/reject`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "that made it worse" }),
+    });
+
+    const stored = await instance.store.read(session.key);
+    const annotation = stored?.annotations.find((entry) => entry.id === id);
+    assert.equal(annotation?.status, "submitted");
+    assert.deepEqual(annotation?.deliveredTo, []);
+    assert.match(JSON.stringify(annotation?.thread), /that made it worse/);
+  });
+
+  test("a human reply reopens a settled edit", async () => {
+    const id = await submitOne("reply target");
+    await markAddressed(id);
+    await fetch(withToken(`/api/${session.key}/annotations/${id}/reply`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "one more thing" }),
+    });
+    const stored = await instance.store.read(session.key);
+    const annotation = stored?.annotations.find((entry) => entry.id === id);
+    assert.equal(annotation?.status, "submitted", "a follow-up the agent never sees is a dead end");
+    assert.match(JSON.stringify(annotation?.thread), /one more thing/);
+  });
+
+  test("re-pointing an orphaned edit gives it a new anchor and reopens it", async () => {
+    const id = await submitOne("repoint target");
+    await fetch(withToken(`/api/${session.key}/morph-report`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ addressed: [], orphaned: [id] }),
+    });
+    assert.equal(
+      (await instance.store.read(session.key))?.annotations.find((entry) => entry.id === id)?.status,
+      "orphaned",
+    );
+
+    await fetch(withToken(`/api/${session.key}/annotations/${id}/repoint`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ selector: "#body", text: "Original body." }),
+    });
+
+    const annotation = (await instance.store.read(session.key))?.annotations.find((entry) => entry.id === id);
+    assert.equal(annotation?.status, "submitted");
+    assert.equal(annotation?.selector, "#body");
+    assert.equal(annotation?.text, "Original body.");
+  });
+
+  test("multi-element anchors round-trip", async () => {
+    const response = await fetch(withToken(`/api/${session.key}/annotations`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        annotations: [
+          {
+            body: "tighten all of these",
+            tag: "element",
+            anchors: [
+              { selector: "#title", text: "Original title" },
+              { selector: "#body", text: "Original body." },
+            ],
+          },
+        ],
+      }),
+    });
+    const created = (await response.json()) as { annotations: Array<{ anchors?: unknown[]; selector: string }> };
+    assert.equal(created.annotations[0]?.anchors?.length, 2);
+    assert.equal(created.annotations[0]?.selector, "#title", "selector mirrors the first anchor for single-anchor consumers");
+  });
+});
+
+describe("versions, undo, and export", () => {
+  test("opening a session snapshots the artifact", async () => {
+    const response = await fetch(withToken(`/api/${session.key}/versions`));
+    const { versions } = (await response.json()) as { versions: Array<{ seq: number; origin: string }> };
+    assert.ok(versions.length >= 1);
+    assert.equal(versions[0]?.origin, "open");
+  });
+
+  test("restore writes an old version back and is itself recorded", async () => {
+    const before = (await (await fetch(withToken(`/api/${session.key}/versions`))).json()) as {
+      versions: Array<{ seq: number }>;
+    };
+    const firstSeq = before.versions[0]!.seq;
+    const original = await (await fetch(withToken(`/api/${session.key}/versions/${firstSeq}`))).text();
+
+    await writeFile(artifact, ARTIFACT_HTML.replace("Original title", "Changed for restore"));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const restore = await fetch(withToken(`/api/${session.key}/restore`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seq: firstSeq }),
+    });
+    assert.equal(restore.status, 200);
+
+    const onDisk = await readFile(artifact, "utf8");
+    assert.equal(onDisk, original, "restoring writes the snapshot back to the artifact itself");
+
+    const after = (await (await fetch(withToken(`/api/${session.key}/versions`))).json()) as {
+      versions: Array<{ origin: string }>;
+    };
+    assert.equal(
+      after.versions[after.versions.length - 1]?.origin,
+      "restore",
+      "the restore is itself a version, so undo is undoable",
+    );
+  });
+
+  test("export strips the injected SDK", async () => {
+    const response = await fetch(withToken(`/api/${session.key}/export`));
+    const html = await response.text();
+    assert.doesNotMatch(html, /sdk\.js/);
+    assert.match(response.headers.get("content-disposition") ?? "", /attachment/);
+  });
+
+  test("version routes require the token", async () => {
+    assert.equal((await fetch(`${origin}/api/${session.key}/versions`)).status, 403);
+    assert.equal((await fetch(`${origin}/api/${session.key}/export`)).status, 403);
   });
 });

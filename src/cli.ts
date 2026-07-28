@@ -321,6 +321,53 @@ async function setupCommand(args: string[]): Promise<unknown> {
   };
 }
 
+async function exportCommand(args: string[]): Promise<unknown> {
+  const file = args.find((arg) => !arg.startsWith("--"));
+  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor export <file.html>`"]);
+  const canonical = await canonicalFile(file);
+  const { readFile, writeFile } = await import("node:fs/promises");
+  const { stripSdk } = await import("./html-transform.ts");
+
+  const outIndex = args.indexOf("--out");
+  const out =
+    outIndex !== -1 && args[outIndex + 1]
+      ? path.resolve(String(args[outIndex + 1]))
+      : canonical.replace(/\.html?$/i, "") + ".export.html";
+
+  const html = stripSdk(await readFile(canonical, "utf8"));
+  await writeFile(out, html);
+
+  // Honest about what this does not do: remote and sibling-file references are
+  // left as-is rather than silently producing a file that looks portable but
+  // renders broken somewhere else.
+  const external = [...html.matchAll(/(?:src|href)="([^"#][^"]*)"/g)]
+    .map((match) => match[1]!)
+    .filter((ref) => !/^(https?:|data:|mailto:)/i.test(ref));
+
+  return {
+    exported: out,
+    ...(external.length ? { unresolved_local_references: [...new Set(external)].slice(0, 20) } : {}),
+    help: external.length
+      ? ["These local references are not inlined; copy them next to the export or they will not resolve."]
+      : ["The export is self-contained."],
+  };
+}
+
+async function undoCommand(args: string[]): Promise<unknown> {
+  const file = args.find((arg) => !arg.startsWith("--"));
+  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor undo <file.html>`"]);
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const { key, token } = await tokenFor(canonical);
+  const response = await fetch(`${baseUrl()}/api/${key}/restore?t=${encodeURIComponent(token)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!response.ok) throw new CliError("Nothing to undo for this artifact");
+  return { ...((await response.json()) as object), file: canonical };
+}
+
 async function statusCommand(): Promise<unknown> {
   const store = new SessionStore(stateDir());
   const sessions = await store.list();
@@ -359,6 +406,8 @@ Usage:
   plan-editor poll <file.html>          Wait for edits (long-polls; never kill it)
       [--reply "..."] [--timeout-ms n]
   plan-editor end <file.html>           End the session
+  plan-editor undo <file.html>          Restore the previous version
+  plan-editor export <file.html>        Write a standalone copy [--out path]
   plan-editor status                    List sessions and open edit counts
   plan-editor stop                      Shut the background server down
   plan-editor server [--verbose]        Run the server in the foreground
@@ -375,6 +424,8 @@ async function main(): Promise<void> {
     stop: stopCommand,
     setup: setupCommand,
     hook: hookCommand,
+    export: exportCommand,
+    undo: undoCommand,
     "notify-edit": notifyEditCommand,
   };
 

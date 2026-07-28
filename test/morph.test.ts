@@ -74,8 +74,8 @@ describe("morphDocument", () => {
   test("marks an annotation addressed when its anchored element changed", () => {
     const { document, restore } = setup(PAGE);
     const tracked: TrackedAnchor[] = [
-      { id: "ann-title", element: document.getElementById("title")! },
-      { id: "ann-beta", element: document.getElementById("b-body")! },
+      { id: "ann-title", elements: [document.getElementById("title")!] },
+      { id: "ann-beta", elements: [document.getElementById("b-body")!] },
     ];
 
     const result = morphDocument(document.documentElement, PAGE.replace("Original title", "Punchier title"), tracked);
@@ -87,7 +87,7 @@ describe("morphDocument", () => {
 
   test("an annotation on a container is addressed when anything inside it changes", () => {
     const { document, restore } = setup(PAGE);
-    const tracked: TrackedAnchor[] = [{ id: "ann-alpha", element: document.getElementById("alpha")! }];
+    const tracked: TrackedAnchor[] = [{ id: "ann-alpha", elements: [document.getElementById("alpha")!] }];
 
     const result = morphDocument(document.documentElement, PAGE.replace("Alpha body.", "Rewritten alpha."), tracked);
 
@@ -107,7 +107,7 @@ describe("morphDocument", () => {
 
   test("reports an annotation as orphaned when its element is removed", () => {
     const { document, restore } = setup(PAGE);
-    const tracked: TrackedAnchor[] = [{ id: "ann-beta", element: document.getElementById("b-body")! }];
+    const tracked: TrackedAnchor[] = [{ id: "ann-beta", elements: [document.getElementById("b-body")!] }];
 
     const withoutBeta = PAGE.replace('<section id="beta"><p id="b-body">Beta body.</p></section>', "");
     const result = morphDocument(document.documentElement, withoutBeta, tracked);
@@ -119,7 +119,7 @@ describe("morphDocument", () => {
 
   test("an identical document produces no changes at all", () => {
     const { document, restore } = setup(PAGE);
-    const tracked: TrackedAnchor[] = [{ id: "ann-title", element: document.getElementById("title")! }];
+    const tracked: TrackedAnchor[] = [{ id: "ann-title", elements: [document.getElementById("title")!] }];
 
     const result = morphDocument(document.documentElement, PAGE, tracked);
 
@@ -179,7 +179,7 @@ describe("morphDocument", () => {
 
   test("handles a heavily restructured document without throwing", () => {
     const { document, restore } = setup(PAGE);
-    const tracked: TrackedAnchor[] = [{ id: "ann-title", element: document.getElementById("title")! }];
+    const tracked: TrackedAnchor[] = [{ id: "ann-title", elements: [document.getElementById("title")!] }];
     const restructured = `<!doctype html><html><head><title>Plan</title></head><body>
 <main><header><h1 id="title">Completely reorganised</h1></header>
 <article id="alpha"><p id="a-body">Alpha body.</p></article></main>
@@ -188,6 +188,51 @@ describe("morphDocument", () => {
     const result = morphDocument(document.documentElement, restructured, tracked);
     assert.equal(document.getElementById("title")!.textContent, "Completely reorganised");
     assert.equal(result.addressed.length + result.orphaned.length, 1, "the anchor is resolved one way or the other");
+    restore();
+  });
+});
+
+describe("multi-element anchors", () => {
+  test("a chunk edit is addressed when ANY of its elements changed", () => {
+    const { document, restore } = setup(PAGE);
+    const tracked: TrackedAnchor[] = [
+      {
+        id: "chunk",
+        elements: [document.getElementById("a-body")!, document.getElementById("b-body")!],
+      },
+    ];
+
+    const result = morphDocument(document.documentElement, PAGE.replace("Beta body.", "Rewritten beta."), tracked);
+
+    assert.deepEqual(result.addressed, ["chunk"], "touching one of several covered elements counts as addressed");
+    assert.deepEqual(result.orphaned, []);
+    restore();
+  });
+
+  test("a chunk edit is orphaned only when ALL its elements are gone", () => {
+    const { document, restore } = setup(PAGE);
+    const tracked: TrackedAnchor[] = [
+      {
+        id: "chunk",
+        elements: [document.getElementById("a-body")!, document.getElementById("b-body")!],
+      },
+    ];
+
+    const oneGone = PAGE.replace('<section id="beta"><p id="b-body">Beta body.</p></section>', "");
+    const partial = morphDocument(document.documentElement, oneGone, tracked);
+    assert.deepEqual(partial.orphaned, [], "losing one of several anchors is not an orphan");
+
+    const both = setup(PAGE);
+    const trackedBoth: TrackedAnchor[] = [
+      {
+        id: "chunk",
+        elements: [both.document.getElementById("a-body")!, both.document.getElementById("b-body")!],
+      },
+    ];
+    const stripped = `<!doctype html><html><head><title>Plan</title></head><body><h1 id="title">Original title</h1></body></html>`;
+    const gone = morphDocument(both.document.documentElement, stripped, trackedBoth);
+    assert.deepEqual(gone.orphaned, ["chunk"]);
+    both.restore();
     restore();
   });
 });
