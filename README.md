@@ -133,6 +133,6 @@ open time and delivered only to the CLI that created the session.
 
 ```sh
 bun run check      # build + typecheck + test
-bun test           # 53 tests
+bun test           # 59 tests
 bun run build      # browser bundles only; Bun runs the server TS directly
 ```
