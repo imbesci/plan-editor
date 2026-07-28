@@ -24,6 +24,12 @@ The detached server is spawned with `process.execPath` (the Bun binary) pointing
 `src/cli.ts`, so the background process always runs on the same runtime that
 launched it.
 
+**The server identity folds in a code signature** (`codeSignature()` — the newest
+mtime across `src/` and `dist/`), not just the package version. Keying the restart
+check on `package.json` alone means a long-running detached server silently keeps
+executing stale code after every edit, and the symptom is your new feature
+appearing not to work at all. This cost real debugging time once already.
+
 Tests are written against `node:test` + `node:assert`, which Bun's runner executes
 natively. Do not convert them to `bun:test` — the current form runs under both.
 

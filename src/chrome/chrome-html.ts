@@ -31,9 +31,11 @@ export function renderChrome(session: Session): string {
   <main class="stage">
     <header class="bar">
       <span class="file" title="${escapeHtml(session.file)}">${escapeHtml(name)}</span>
-      <label class="toggle">
+      <label class="toggle" for="modeToggle" title="Click an element to attach an edit">
         <input type="checkbox" id="modeToggle">
-        <span>Annotate <kbd>⌘I</kbd></span>
+        <span class="track"><span class="thumb"></span></span>
+        <span class="toggle-text">Annotate</span>
+        <kbd>⌘I</kbd>
       </label>
       <span class="presence" id="presence" data-state="waiting">agent idle</span>
     </header>

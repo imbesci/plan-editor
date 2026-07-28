@@ -172,9 +172,39 @@ async function submit(): Promise<void> {
   }
 }
 
+/**
+ * Ending is a clean exit, not a state to sit in. It marks the session closed so
+ * the hooks stop surfacing it, then gets out of the way — the human goes back to
+ * their terminal and the conversation carries on as if nothing happened.
+ */
 endButton.addEventListener("click", async () => {
-  await api("/end", { method: "POST", body: "{}" });
+  endButton.disabled = true;
+  endButton.textContent = "Ending…";
+  try {
+    await api("/end", { method: "POST", body: "{}" });
+  } catch (error) {
+    console.error("failed to end session", error);
+  }
+  stream.close();
+  setMode(false);
+
+  // Only works for script-opened windows; browsers refuse otherwise, so we need
+  // the fallback below rather than assuming the tab is gone.
+  window.close();
+  setTimeout(showEndedScreen, 120);
 });
+
+function showEndedScreen(): void {
+  if (document.querySelector(".ended-screen")) return;
+  const screen = document.createElement("div");
+  screen.className = "ended-screen";
+  screen.innerHTML = `<div>
+    <h1>Session ended</h1>
+    <p>Nothing further is being sent to your agent. You can close this tab and pick the conversation back up in your terminal.</p>
+    <p class="hint">Reopen any time with <code>plan-editor ${escapeHtml(bootstrap.file)}</code></p>
+  </div>`;
+  document.body.appendChild(screen);
+}
 
 // --- messages from the artifact SDK ----------------------------------------
 

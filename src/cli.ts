@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { openSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,7 +10,35 @@ import { defaultPort, LOOPBACK, serverLogFile, stateDir } from "./paths.ts";
 import type { Annotation, PollResult } from "./protocol.ts";
 import { canonicalFile, SessionStore, sessionKey } from "./store/session-store.ts";
 
-const VERSION = process.env.PLAN_EDITOR_BUILD_VERSION ?? "0.1.0";
+const PACKAGE_VERSION = process.env.PLAN_EDITOR_BUILD_VERSION ?? "0.1.0";
+
+/**
+ * The detached server only restarts when the CLI's version differs from the
+ * running one. Keying that on package.json alone means every edit to src/ is
+ * silently ignored until someone bumps a version by hand — the failure is a
+ * server quietly running stale code, which looks like the new code not working.
+ * Folding the newest source/bundle mtime into the identity makes any change
+ * restart it.
+ */
+async function codeSignature(): Promise<string> {
+  const roots = [fileURLToPath(new URL("./", import.meta.url)), fileURLToPath(new URL("../dist/", import.meta.url))];
+  let newest = 0;
+  for (const root of roots) {
+    let entries: string[] = [];
+    try {
+      entries = await readdir(root, { recursive: true, encoding: "utf8" });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const info = await stat(path.join(root, entry)).catch(() => null);
+      if (info?.isFile()) newest = Math.max(newest, info.mtimeMs);
+    }
+  }
+  return `${PACKAGE_VERSION}+${Math.round(newest)}`;
+}
+
+let VERSION = PACKAGE_VERSION;
 
 class CliError extends Error {
   constructor(
@@ -36,6 +64,7 @@ async function health(): Promise<{ app?: string; version?: string } | null> {
 }
 
 async function ensureServer(): Promise<void> {
+  VERSION = await codeSignature();
   const existing = await health();
   if (existing?.app === "plan-editor" && existing.version === VERSION) return;
   if (existing?.app === "plan-editor") {
@@ -312,6 +341,7 @@ async function stopCommand(): Promise<unknown> {
 
 async function serverCommand(): Promise<never> {
   const { serve } = await import("./server.ts");
+  VERSION = await codeSignature();
   const verbose = process.argv.includes("--verbose") || process.env.PLAN_EDITOR_DEBUG === "1";
   await serve({
     version: VERSION,

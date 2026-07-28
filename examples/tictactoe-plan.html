@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hotseat — product plan</title>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --surface: #ffffff;
+    --fg: #1c1b19;
+    --muted: #6b6862;
+    --faint: #93908a;
+    --line: #e6e2db;
+    --accent: #b8442e;
+    --accent-soft: #fbeeea;
+    --x: #b8442e;
+    --o: #2f6f8f;
+    --ok: #3f7d54;
+    --warn: #a8730f;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131211;
+      --surface: #1b1a18;
+      --fg: #f0ede8;
+      --muted: #a6a29b;
+      --faint: #7d7973;
+      --line: #2e2c29;
+      --accent: #e8785e;
+      --accent-soft: #2a1c18;
+      --x: #e8785e;
+      --o: #6bb2d4;
+      --ok: #6bbd86;
+      --warn: #d8a03f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 24px 96px; }
+
+  /* --- header --- */
+  #masthead { padding: 72px 0 44px; border-bottom: 1px solid var(--line); }
+  .eyebrow {
+    font-size: 12px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--accent); font-weight: 600; margin: 0 0 14px;
+  }
+  #masthead h1 {
+    font: 600 46px/1.1 ui-serif, Georgia, "Times New Roman", serif;
+    margin: 0 0 16px; letter-spacing: -.02em;
+  }
+  .lede { font-size: 19px; color: var(--muted); margin: 0 0 28px; max-width: 60ch; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px 28px; font-size: 13px; color: var(--faint); }
+  .meta b { color: var(--muted); font-weight: 600; }
+
+  /* --- sections --- */
+  section { padding-top: 52px; }
+  h2 {
+    font: 600 13px/1 ui-sans-serif, sans-serif; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint);
+    margin: 0 0 20px; padding-bottom: 10px; border-bottom: 1px solid var(--line);
+  }
+  h3 { font-size: 17px; margin: 30px 0 10px; letter-spacing: -.01em; }
+  p { margin: 0 0 16px; max-width: 68ch; }
+  ul, ol { margin: 0 0 16px; padding-left: 22px; max-width: 68ch; }
+  li { margin-bottom: 7px; }
+  code {
+    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--accent-soft); color: var(--accent);
+    padding: 1px 5px; border-radius: 4px;
+  }
+
+  /* --- two column --- */
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 680px) { .cols { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 20px 22px;
+  }
+  .card h3 { margin-top: 0; font-size: 15px; }
+  .card ul { margin-bottom: 0; padding-left: 18px; font-size: 15px; }
+  .card.negative h3 { color: var(--muted); }
+
+  /* --- numbered loop --- */
+  .loop { list-style: none; padding: 0; counter-reset: step; }
+  .loop li {
+    counter-increment: step; position: relative;
+    padding: 12px 0 12px 46px; border-bottom: 1px solid var(--line);
+  }
+  .loop li:last-child { border-bottom: 0; }
+  .loop li::before {
+    content: counter(step); position: absolute; left: 0; top: 12px;
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent);
+    font-size: 12px; font-weight: 700;
+    display: grid; place-items: center;
+  }
+
+  /* --- state flow --- */
+  .flow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 8px 0 20px; }
+  .node {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 999px; padding: 8px 16px; font-size: 14px; font-weight: 600;
+  }
+  .node.terminal { border-color: var(--ok); color: var(--ok); }
+  .arrow { color: var(--faint); font-size: 18px; }
+
+  /* --- board mock --- */
+  .board {
+    display: grid; grid-template-columns: repeat(3, 76px); grid-template-rows: repeat(3, 76px);
+    gap: 6px; background: var(--line); padding: 6px; border-radius: var(--radius);
+    width: max-content; margin: 4px 0 8px;
+  }
+  .cell {
+    background: var(--surface); border-radius: 6px;
+    display: grid; place-items: center;
+    font: 700 34px/1 ui-serif, Georgia, serif;
+  }
+  .cell.x { color: var(--x); }
+  .cell.o { color: var(--o); }
+  .cell.win { background: var(--accent-soft); }
+  .caption { font-size: 13px; color: var(--faint); margin: 0 0 4px; }
+
+  /* --- winning lines --- */
+  .lines { display: flex; flex-wrap: wrap; gap: 14px; margin: 6px 0 18px; }
+  .mini {
+    display: grid; grid-template-columns: repeat(3, 15px); grid-template-rows: repeat(3, 15px);
+    gap: 3px; padding: 6px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 7px;
+  }
+  .mini i { background: var(--line); border-radius: 2px; }
+  .mini i.on { background: var(--accent); }
+
+  /* --- table --- */
+  .table-scroll { overflow-x: auto; margin-bottom: 18px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; min-width: 520px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; letter-spacing: .07em; text-transform: uppercase; color: var(--faint); font-weight: 600; }
+  td code { white-space: nowrap; }
+
+  /* --- milestones --- */
+  .phase {
+    display: grid; grid-template-columns: 96px 1fr; gap: 18px;
+    padding: 16px 0; border-bottom: 1px solid var(--line);
+  }
+  .phase:last-child { border-bottom: 0; }
+  .phase-tag {
+    font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--accent); padding-top: 2px;
+  }
+  .phase h3 { margin: 0 0 6px; font-size: 16px; }
+  .phase p { margin: 0; font-size: 15px; color: var(--muted); }
+  @media (max-width: 680px) { .phase { grid-template-columns: 1fr; gap: 4px; } }
+
+  /* --- callouts --- */
+  .question {
+    background: var(--surface); border: 1px solid var(--line);
+    border-left: 3px solid var(--warn);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 16px 20px; margin-bottom: 12px;
+  }
+  .question h3 { margin: 0 0 6px; font-size: 15.5px; }
+  .question p { margin: 0; font-size: 15px; color: var(--muted); }
+  .question .lean { display: block; margin-top: 8px; font-size: 14px; color: var(--faint); }
+  .question .lean b { color: var(--warn); font-weight: 600; }
+
+  .risk { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; font-size: 15px; }
+  .risk > div { padding: 12px 0; border-bottom: 1px solid var(--line); }
+  .risk .what { font-weight: 600; }
+  .risk .how { color: var(--muted); }
+  @media (max-width: 680px) {
+    .risk { grid-template-columns: 1fr; }
+    .risk .what { border-bottom: 0; padding-bottom: 0; }
+  }
+
+  footer { margin-top: 56px; padding-top: 24px; border-top: 1px solid var(--line); font-size: 13.5px; color: var(--faint); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header id="masthead">
+  <p class="eyebrow">Product plan · draft</p>
+  <h1>Hotseat</h1>
+  <p class="lede">Two people, one keyboard, one browser tab. Tic-tac-toe with no accounts, no network, and no waiting — you pass the laptop, not a turn token.</p>
+  <div class="meta">
+    <span><b>Status</b> Draft for review</span>
+    <span><b>Scope</b> ~1 week, one engineer</span>
+    <span><b>Surface</b> Single static page</span>
+  </div>
+</header>
+
+<section id="idea">
+  <h2>The idea</h2>
+  <p>Almost every tic-tac-toe implementation online solves the wrong problem: it builds an AI opponent, or it builds matchmaking. The actual thing people do with tic-tac-toe is play it with someone sitting next to them, on a napkin.</p>
+  <p>Hotseat is that napkin. One page, two players alternating on the same device. The entire product is a board, a turn indicator, and a reset button — and the work is almost entirely in making those three things feel good rather than in making them exist.</p>
+</section>
+
+<section id="scope">
+  <h2>Scope</h2>
+  <div class="cols">
+    <div class="card" id="goals">
+      <h3>Goals</h3>
+      <ul>
+        <li>A full game playable in under ten seconds</li>
+        <li>Whose turn it is, unmistakable at a glance</li>
+        <li>Wins announced with the winning line shown, not just stated</li>
+        <li>Fully keyboard playable</li>
+        <li>Works offline; single file, no build step</li>
+      </ul>
+    </div>
+    <div class="card negative" id="non-goals">
+      <h3>Non-goals</h3>
+      <ul>
+        <li>Any computer opponent</li>
+        <li>Networked or remote play</li>
+        <li>Accounts, persistence, or match history</li>
+        <li>Larger boards or variant rules</li>
+        <li>Animation beyond simple state transitions</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="core-loop">
+  <h2>Core loop</h2>
+  <ol class="loop">
+    <li>Page loads with an empty board. <strong>X moves first</strong> — always, no coin flip.</li>
+    <li>The active player clicks or keys into an empty square.</li>
+    <li>The mark is placed; the square becomes permanently inert.</li>
+    <li>Win and draw checks run against the new board.</li>
+    <li>If the game is still live, the turn indicator flips and focus stays on the board.</li>
+    <li>On a win, the three winning squares highlight and the board locks.</li>
+    <li>Reset returns to an empty board. The loser of the previous game opens the next one.</li>
+  </ol>
+</section>
+
+<section id="state">
+  <h2>Game state</h2>
+  <p>The whole game is four fields. Everything else on screen is derived from them, which means there is exactly one thing to get right and nothing to keep in sync.</p>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>Field</th><th>Type</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>squares</code></td>
+          <td><code>("X"|"O"|null)[9]</code></td>
+          <td>Flat, not nested. Indices 0–8 read left-to-right, top-to-bottom. Nesting buys nothing and complicates every check.</td>
+        </tr>
+        <tr>
+          <td><code>turn</code></td>
+          <td><code>"X" | "O"</code></td>
+          <td>Stored rather than derived from move count — it survives a future undo feature without rework.</td>
+        </tr>
+        <tr>
+          <td><code>result</code></td>
+          <td><code>null | {winner, line}</code> <br>| <code>"draw"</code></td>
+          <td>One field covering all three outcomes, so "is the game over" is a single null check.</td>
+        </tr>
+        <tr>
+          <td><code>opener</code></td>
+          <td><code>"X" | "O"</code></td>
+          <td>Who starts the next game. Alternates so the same player does not always get the first-move advantage.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="win-detection">
+  <h2>Win detection</h2>
+  <p>Eight lines, hardcoded as index triples. There is no clever generalisation worth writing here — the board will never be a different size, and a literal table is the easiest thing to read and the hardest thing to get wrong.</p>
+  <div class="lines" id="winning-lines" aria-label="The eight winning lines">
+    <div class="mini" title="Top row"><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="mini" title="Middle row"><i></i><i></i><i></i><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i><i></i></div>
+    <div class="mini" title="Bottom row"><i></i><i></i><i></i><i></i><i></i><i></i><i class="on"></i><i class="on"></i><i class="on"></i></div>
+    <div class="mini" title="Left column"><i class="on"></i><i></i><i></i><i class="on"></i><i></i><i></i><i class="on"></i><i></i><i></i></div>
+    <div class="mini" title="Middle column"><i></i><i class="on"></i><i></i><i></i><i class="on"></i><i></i><i></i><i class="on"></i><i></i></div>
+    <div class="mini" title="Right column"><i></i><i></i><i class="on"></i><i></i><i></i><i class="on"></i><i></i><i></i><i class="on"></i></div>
+    <div class="mini" title="Diagonal"><i class="on"></i><i></i><i></i><i></i><i class="on"></i><i></i><i></i><i></i><i class="on"></i></div>
+    <div class="mini" title="Anti-diagonal"><i></i><i></i><i class="on"></i><i></i><i class="on"></i><i></i><i class="on"></i><i></i><i></i></div>
+  </div>
+  <p>A draw is not its own check — it is simply nine filled squares with no winning line. Checking for it separately is how implementations end up declaring a draw on a winning final move.</p>
+</section>
+
+<section id="screens">
+  <h2>Screen states</h2>
+  <p>Four states, one of which is terminal in two flavours. Nothing here needs a router or a state library.</p>
+  <div class="flow" id="state-flow">
+    <span class="node">Empty</span>
+    <span class="arrow">→</span>
+    <span class="node">In play</span>
+    <span class="arrow">→</span>
+    <span class="node terminal">Win</span>
+    <span class="arrow">/</span>
+    <span class="node terminal">Draw</span>
+    <span class="arrow">↺</span>
+    <span class="node">Empty</span>
+  </div>
+
+  <h3>Board, mid-game</h3>
+  <p class="caption">X has taken the diagonal and won; the line is highlighted rather than merely announced.</p>
+  <div class="board" id="board-mock" role="img" aria-label="Board showing X winning on the diagonal">
+    <div class="cell x win">X</div>
+    <div class="cell o">O</div>
+    <div class="cell o">O</div>
+    <div class="cell"></div>
+    <div class="cell x win">X</div>
+    <div class="cell"></div>
+    <div class="cell o">O</div>
+    <div class="cell"></div>
+    <div class="cell x win">X</div>
+  </div>
+</section>
+
+<section id="accessibility">
+  <h2>Accessibility</h2>
+  <p>A 3×3 grid is one of the few places where keyboard support is genuinely cheap and the payoff is immediate — it also happens to make the game playable without a mouse, which matters when two people are sharing one laptop.</p>
+  <ul>
+    <li>The board is a <code>role="grid"</code>; arrow keys move between squares, wrapping at the edges.</li>
+    <li><kbd>Enter</kbd> or <kbd>Space</kbd> places a mark. Occupied squares are focusable but announce as taken.</li>
+    <li>Turn changes and results are announced through a polite live region, so a screen reader user is not left guessing.</li>
+    <li>Marks are distinguished by glyph and colour, never colour alone.</li>
+    <li>Focus stays on the board after a move — passing a laptop is bad enough without also losing your place.</li>
+  </ul>
+</section>
+
+<section id="milestones">
+  <h2>Milestones</h2>
+  <div class="phase">
+    <div class="phase-tag">Day 1</div>
+    <div>
+      <h3>Playable</h3>
+      <p>State model, click-to-place, win and draw detection, reset. Deliberately unstyled — the goal is a correct game, not a nice one.</p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="phase-tag">Day 2–3</div>
+    <div>
+      <h3>Legible</h3>
+      <p>Board and mark design, turn indicator, winning-line highlight, result messaging. This is where most of the value lands.</p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="phase-tag">Day 4</div>
+    <div>
+      <h3>Keyboard and screen reader</h3>
+      <p>Grid navigation, focus management, live-region announcements, contrast pass.</p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="phase-tag">Day 5</div>
+    <div>
+      <h3>Polish</h3>
+      <p>Alternating openers, transitions, reduced-motion handling, and a pass on how it behaves on a phone held between two people.</p>
+    </div>
+  </div>
+</section>
+
+<section id="open-questions">
+  <h2>Open questions</h2>
+  <p>These are the decisions worth arguing about before any code exists. Everything else is legible from the plan above.</p>
+
+  <div class="question" id="q-scoreboard">
+    <h3>Do we keep a running score across games?</h3>
+    <p>A best-of-five tally is the single most requested feature in every version of this that has ever existed, and it costs roughly one more state field. It also turns a ten-second toy into a session, which may or may not be what we want.</p>
+    <span class="lean"><b>Leaning:</b> yes, in-memory only, cleared on refresh.</span>
+  </div>
+
+  <div class="question" id="q-names">
+    <h3>Player names, or just X and O?</h3>
+    <p>Names make the turn indicator far warmer — "Sam's turn" beats "X's turn". They also add a naming step before the first game, which is exactly the friction this product exists to avoid.</p>
+    <span class="lean"><b>Leaning:</b> X and O for v1, with names as an obvious follow-up.</span>
+  </div>
+
+  <div class="question" id="q-undo">
+    <h3>Is there an undo?</h3>
+    <p>Two people sharing a device misclick constantly. But undo in a two-player game is a social negotiation, not a button — and it invites exactly the argument the button was meant to settle.</p>
+    <span class="lean"><b>Leaning:</b> no undo; make the squares large enough that misclicks are rare.</span>
+  </div>
+
+  <div class="question" id="q-opener">
+    <h3>Who opens the next game?</h3>
+    <p>Always-X is simplest but hands a measurable advantage to one seat. Alternating is fairer. Loser-opens is fairest but needs explaining, and the plan above quietly assumes it.</p>
+    <span class="lean"><b>Leaning:</b> alternate, and say so in the UI.</span>
+  </div>
+</section>
+
+<section id="risks">
+  <h2>Risks</h2>
+  <div class="risk">
+    <div class="what">Scope creep into an AI opponent</div>
+    <div class="how">It is the most tempting addition and it changes the product entirely. Listed as a non-goal specifically so the conversation is short.</div>
+    <div class="what">Over-animating</div>
+    <div class="how">A ten-second game cannot afford a one-second win animation. Cap transitions well under 200ms and honour reduced-motion.</div>
+    <div class="what">Draws feeling anticlimactic</div>
+    <div class="how">Most competent games end in a draw. If the draw state is a shrug, the product feels broken rather than correct.</div>
+    <div class="what">Phone layout as an afterthought</div>
+    <div class="how">Two people sharing a phone is a likely real use, and a 76px board does not survive it unexamined.</div>
+  </div>
+</section>
+
+<footer>
+  Draft — annotate anything above and it comes back to the agent that wrote it.
+</footer>
+
+</div>
+</body>
+</html>
