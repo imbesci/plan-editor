@@ -625,16 +625,16 @@ export async function serve(options: ServeOptions = {}) {
     broadcast(key, { type: "sync", annotations: session.annotations, chat: session.chat });
   }
 
-  // Static browser bundles.
-  app.get("/sdk.js", (_req, res) => {
-    res.type("application/javascript").sendFile(path.join(DIST, "sdk.js"));
-  });
-  app.get("/chrome.js", (_req, res) => {
-    res.type("application/javascript").sendFile(path.join(DIST, "chrome.js"));
-  });
-  app.get("/chrome.css", (_req, res) => {
-    res.type("text/css").sendFile(path.join(DIST, "chrome.css"));
-  });
+  // Static browser bundles. `no-cache` means "revalidate every time", not "never
+  // store" — without it these URLs are unversioned and the browser may serve a
+  // heuristically-cached copy, so a tab keeps running old SDK code after a
+  // rebuild and the fix appears not to have worked.
+  const bundle = (file: string, type: string) => (_req: Request, res: Response) => {
+    res.type(type).set("Cache-Control", "no-cache").sendFile(path.join(DIST, file));
+  };
+  app.get("/sdk.js", bundle("sdk.js", "application/javascript"));
+  app.get("/chrome.js", bundle("chrome.js", "application/javascript"));
+  app.get("/chrome.css", bundle("chrome.css", "text/css"));
 
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (error instanceof ValidationError) {

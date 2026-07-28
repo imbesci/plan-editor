@@ -241,10 +241,11 @@ export function buildContextInjection(entries: InjectionEntry[]): Injection | nu
       lines.push(`  • ${annotation.body}${anchor}`);
       deliver.push(annotation.id);
     }
-    // Already shown once. Repeating the full text every prompt burns context and
-    // reads as nagging, but the agent still needs to know they are outstanding.
-    if (repeated.length > 0) {
-      lines.push(`  • (${repeated.length} previously listed edit${repeated.length === 1 ? "" : "s"} still unapplied)`);
+    // Previously delivered edits keep their request text — only the anchor detail
+    // is dropped. Collapsing them to a bare count saved a few tokens and cost the
+    // agent the ability to act at all once the earlier turn left its context.
+    for (const annotation of repeated) {
+      lines.push(`  • ${annotation.body} (still open, listed before)`);
     }
   }
 
