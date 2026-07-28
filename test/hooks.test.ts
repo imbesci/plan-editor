@@ -164,12 +164,15 @@ describe("buildContextInjection", () => {
     assert.deepEqual(injection.deliver, ["e1"], "the edit is stamped so it is not repeated verbatim");
   });
 
-  test("compacts already-delivered edits instead of repeating them", () => {
+  test("an already-delivered edit keeps its request text but drops anchor detail", () => {
+    // Collapsing these to a bare count saved a few tokens and cost the agent the
+    // ability to act at all once the earlier turn's context was gone.
     const injection = buildContextInjection([
       { file: "/tmp/a.html", ownership: "authoring" as const, agentKey: "A", open: [edit({ deliveredTo: ["A"] })] },
     ])!;
-    assert.doesNotMatch(injection.text, /Change this to Action plan/, "full text must not repeat every prompt");
-    assert.match(injection.text, /1 previously listed edit still unapplied/);
+    assert.match(injection.text, /Change this to Action plan/, "the agent must always be able to act on an open edit");
+    assert.match(injection.text, /still open, listed before/);
+    assert.doesNotMatch(injection.text, /#heading/, "anchor detail is what gets dropped on a repeat");
     assert.deepEqual(injection.deliver, [], "nothing new to stamp");
   });
 
@@ -182,9 +185,9 @@ describe("buildContextInjection", () => {
         open: [edit({ id: "old", deliveredTo: ["A"] }), edit({ id: "new", body: "Add a date" })],
       },
     ])!;
-    assert.match(injection.text, /Add a date/);
-    assert.match(injection.text, /1 previously listed edit/);
-    assert.deepEqual(injection.deliver, ["new"]);
+    assert.match(injection.text, /Add a date \(on: /, "the fresh edit carries its anchor");
+    assert.match(injection.text, /Change this to Action plan \(still open, listed before\)/);
+    assert.deepEqual(injection.deliver, ["new"], "only the unseen edit is stamped");
   });
 
   test("groups by file across several sessions", () => {
@@ -327,6 +330,7 @@ describe("delivery is tracked per agent session", () => {
     const toOther = buildContextInjection([
       { file: "/tmp/a.html", ownership: "same-project", agentKey: "other-session", open: [seenByOther] },
     ])!;
-    assert.doesNotMatch(toOther.text, /Rename the heading/, "the agent that already saw it gets the short form");
+    assert.match(toOther.text, /Rename the heading \(still open, listed before\)/, "the agent that already saw it still gets the request, without the anchor");
+    assert.doesNotMatch(toOther.text, /#h\b/, "but not the anchor detail again");
   });
 });
