@@ -128,6 +128,92 @@ export async function runStopHook(rawInput: string): Promise<{ output: string; e
   return { output: JSON.stringify({ decision: "block", reason: decision.reason }), exitCode: 0 };
 }
 
+// ---------------------------------------------------------------------------
+// UserPromptSubmit — the reason this tool does not need a second agent.
+//
+// A blocking `poll` does reach the session that runs it, but it requires the
+// agent to volunteer a blocking call, and running it in a fresh terminal gives
+// you an agent with no context. Injecting on UserPromptSubmit puts the edits
+// into the session you are already talking to: submit in the browser, say
+// anything, and they are simply there.
+// ---------------------------------------------------------------------------
+
+export interface InjectionEntry {
+  file: string;
+  open: Array<{ id: string; body: string; text: string; selector: string; deliveredAt?: string }>;
+}
+
+export interface Injection {
+  text: string;
+  /** Ids to stamp as delivered, so their full text is not repeated every prompt. */
+  deliver: string[];
+}
+
+export function buildContextInjection(entries: InjectionEntry[]): Injection | null {
+  const withOpen = entries.filter((entry) => entry.open.length > 0);
+  if (withOpen.length === 0) return null;
+
+  const lines: string[] = [];
+  const deliver: string[] = [];
+
+  for (const entry of withOpen) {
+    const fresh = entry.open.filter((annotation) => !annotation.deliveredAt);
+    const repeated = entry.open.filter((annotation) => annotation.deliveredAt);
+
+    lines.push(`Open edits on ${entry.file}:`);
+    for (const annotation of fresh) {
+      const anchor = annotation.text
+        ? ` (on: "${annotation.text.slice(0, 80)}"${annotation.selector ? ` — ${annotation.selector}` : ""})`
+        : "";
+      lines.push(`  • ${annotation.body}${anchor}`);
+      deliver.push(annotation.id);
+    }
+    // Already shown once. Repeating the full text every prompt burns context and
+    // reads as nagging, but the agent still needs to know they are outstanding.
+    if (repeated.length > 0) {
+      lines.push(`  • (${repeated.length} previously listed edit${repeated.length === 1 ? "" : "s"} still unapplied)`);
+    }
+  }
+
+  lines.push(
+    "",
+    "Apply these by editing the file directly — the open browser patches itself in place, so never tell the user to reload.",
+    "Each edit is marked applied automatically once your change touches the element it was anchored to.",
+  );
+
+  return { text: lines.join("\n"), deliver };
+}
+
+export async function runContextHook(event: "UserPromptSubmit" | "SessionStart"): Promise<string> {
+  const store = new SessionStore(stateDir());
+  const sessions = (await store.list()).filter((session) => session.status === "open");
+
+  const entries: InjectionEntry[] = sessions.map((session) => ({
+    file: session.file,
+    open: session.annotations
+      .filter((annotation) => annotation.status === "submitted")
+      .map((annotation) => ({
+        id: annotation.id,
+        body: annotation.body,
+        text: annotation.text,
+        selector: annotation.selector,
+        deliveredAt: annotation.deliveredAt,
+      })),
+  }));
+
+  const injection = buildContextInjection(entries);
+  if (!injection) return "";
+
+  for (const session of sessions) {
+    const ids = injection.deliver.filter((id) => session.annotations.some((entry) => entry.id === id));
+    if (ids.length > 0) await store.markDelivered(session.key, ids);
+  }
+
+  return JSON.stringify({
+    hookSpecificOutput: { hookEventName: event, additionalContext: injection.text },
+  });
+}
+
 /** PostToolUse: tells the browser the agent is working before the write lands. */
 export function fileFromToolInput(rawInput: string): string | null {
   try {
@@ -152,6 +238,15 @@ export function mergeHookSettings(existing: Record<string, unknown>, command: st
         matcher: "Edit|Write|MultiEdit",
         hooks: [{ type: "command", command: `${command} hook post-tool-use`, timeout: 5 }],
       },
+    ],
+    // The one that removes the need for a second agent: pending edits land in
+    // whatever session the human is already talking to.
+    ["UserPromptSubmit", { hooks: [{ type: "command", command: `${command} hook user-prompt-submit`, timeout: 10 }] }],
+    // Re-injects after a compaction or resume, which is where the loop is
+    // otherwise silently lost.
+    [
+      "SessionStart",
+      { matcher: "compact|resume", hooks: [{ type: "command", command: `${command} hook session-start`, timeout: 10 }] },
     ],
     ["Stop", { hooks: [{ type: "command", command: `${command} hook stop`, timeout: 10 }] }],
   ];

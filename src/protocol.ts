@@ -23,6 +23,8 @@ export interface Annotation {
   status: AnnotationStatus;
   createdAt: string;
   submittedAt?: string;
+  /** When this edit was last injected into an agent's context. */
+  deliveredAt?: string;
   addressedAt?: string;
   /** Optional note the agent leaves when it marks something addressed. */
   agentNote?: string;

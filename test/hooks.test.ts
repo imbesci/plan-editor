@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { decideStop, fileFromToolInput, MAX_CONSECUTIVE_BLOCKS, mergeHookSettings } from "../src/hooks.ts";
+import {
+  buildContextInjection,
+  decideStop,
+  fileFromToolInput,
+  MAX_CONSECUTIVE_BLOCKS,
+  mergeHookSettings,
+} from "../src/hooks.ts";
 
 const session = { file: "/tmp/plan.html", key: "abc", openEdits: 2 };
 
@@ -107,22 +113,87 @@ describe("mergeHookSettings", () => {
     };
 
     assert.equal(merged.model, "opus", "unrelated settings must be untouched");
-    assert.equal(merged.hooks.SessionStart!.length, 1, "unrelated events must be untouched");
     assert.equal(merged.hooks.PostToolUse!.length, 2, "the user's own PostToolUse hook must survive");
     assert.match(JSON.stringify(merged.hooks.PostToolUse), /my-linter/);
+    // We install our own SessionStart entry, so this event grows — but the
+    // user's existing one must still be there next to ours.
+    assert.equal(merged.hooks.SessionStart!.length, 2);
+    assert.match(JSON.stringify(merged.hooks.SessionStart), /something-else/);
+    assert.match(JSON.stringify(merged.hooks.SessionStart), /plan-editor hook session-start/);
     assert.match(JSON.stringify(merged.hooks.Stop), /plan-editor hook stop/);
+    assert.match(JSON.stringify(merged.hooks.UserPromptSubmit), /plan-editor hook user-prompt-submit/);
   });
 
   test("is idempotent — reinstalling does not duplicate entries", () => {
     const once = mergeHookSettings({}, "plan-editor");
     const twice = mergeHookSettings(once, "plan-editor") as { hooks: Record<string, unknown[]> };
-    assert.equal(twice.hooks.PostToolUse!.length, 1);
-    assert.equal(twice.hooks.Stop!.length, 1);
+    for (const event of ["PostToolUse", "Stop", "UserPromptSubmit", "SessionStart"]) {
+      assert.equal(twice.hooks[event]!.length, 1, `${event} must not duplicate on reinstall`);
+    }
   });
 
   test("works from empty settings", () => {
     const merged = mergeHookSettings({}, "plan-editor") as { hooks: Record<string, unknown[]> };
     assert.ok(merged.hooks.Stop);
     assert.ok(merged.hooks.PostToolUse);
+  });
+});
+
+describe("buildContextInjection", () => {
+  const edit = (over: Partial<{ id: string; body: string; text: string; selector: string; deliveredAt: string }> = {}) => ({
+    id: "e1",
+    body: "Change this to Action plan",
+    text: "Launch plan",
+    selector: "#heading",
+    ...over,
+  });
+
+  test("returns null when nothing is outstanding", () => {
+    assert.equal(buildContextInjection([]), null);
+    assert.equal(buildContextInjection([{ file: "/tmp/a.html", open: [] }]), null);
+  });
+
+  test("includes the full request and its anchor the first time", () => {
+    const injection = buildContextInjection([{ file: "/tmp/a.html", open: [edit()] }])!;
+    assert.match(injection.text, /Change this to Action plan/);
+    assert.match(injection.text, /Launch plan/);
+    assert.match(injection.text, /#heading/);
+    assert.deepEqual(injection.deliver, ["e1"], "the edit is stamped so it is not repeated verbatim");
+  });
+
+  test("compacts already-delivered edits instead of repeating them", () => {
+    const injection = buildContextInjection([
+      { file: "/tmp/a.html", open: [edit({ deliveredAt: "2026-01-01T00:00:00Z" })] },
+    ])!;
+    assert.doesNotMatch(injection.text, /Change this to Action plan/, "full text must not repeat every prompt");
+    assert.match(injection.text, /1 previously listed edit still unapplied/);
+    assert.deepEqual(injection.deliver, [], "nothing new to stamp");
+  });
+
+  test("mixes fresh and repeated edits in one injection", () => {
+    const injection = buildContextInjection([
+      {
+        file: "/tmp/a.html",
+        open: [edit({ id: "old", deliveredAt: "2026-01-01T00:00:00Z" }), edit({ id: "new", body: "Add a date" })],
+      },
+    ])!;
+    assert.match(injection.text, /Add a date/);
+    assert.match(injection.text, /1 previously listed edit/);
+    assert.deepEqual(injection.deliver, ["new"]);
+  });
+
+  test("groups by file across several sessions", () => {
+    const injection = buildContextInjection([
+      { file: "/tmp/a.html", open: [edit({ id: "a" })] },
+      { file: "/tmp/b.html", open: [edit({ id: "b", body: "Tighten the intro" })] },
+    ])!;
+    assert.match(injection.text, /\/tmp\/a\.html/);
+    assert.match(injection.text, /\/tmp\/b\.html/);
+    assert.deepEqual(injection.deliver.sort(), ["a", "b"]);
+  });
+
+  test("always tells the agent not to ask for a reload", () => {
+    const injection = buildContextInjection([{ file: "/tmp/a.html", open: [edit()] }])!;
+    assert.match(injection.text, /never tell the user to reload/);
   });
 });

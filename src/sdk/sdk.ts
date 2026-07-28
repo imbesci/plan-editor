@@ -123,6 +123,29 @@ document.addEventListener(
 
 // --- morph engine -----------------------------------------------------------
 
+/**
+ * Best-effort re-anchor for an annotation created in a previous page session.
+ * Selector first (exact when the agent kept ids stable), then a text match so a
+ * restructured document still finds its target.
+ */
+function resolveAnchor(selector: string, text: string): Element | null {
+  if (selector) {
+    try {
+      const found = document.querySelector(selector);
+      if (found) return found;
+    } catch {
+      // Malformed stored selector; fall through to text matching.
+    }
+  }
+  const needle = text.trim();
+  if (!needle) return null;
+  for (const candidate of document.body.querySelectorAll("*")) {
+    if (candidate.hasAttribute(UI_ATTRIBUTE)) continue;
+    if ((candidate.textContent ?? "").replace(/\s+/g, " ").trim() === needle) return candidate;
+  }
+  return null;
+}
+
 /** Applies new artifact HTML in place and flashes what actually changed. */
 function applyMorph(html: string): { addressed: string[]; orphaned: string[] } {
   const result = morphDocument(document.documentElement, html, pending.values());
@@ -165,6 +188,20 @@ window.addEventListener("message", (event: MessageEvent) => {
       const entry = pending.get(String(data.clientId));
       entry?.element.classList.remove(PENDING_CLASS);
       pending.delete(String(data.clientId));
+      break;
+    }
+
+    // Re-anchors an annotation that was submitted in an earlier page session.
+    // Without this the anchor map is empty after any reload, so a morph can
+    // never mark those annotations addressed and they stay "waiting for agent"
+    // forever even though the agent applied the edit.
+    case "pe:track": {
+      const id = String(data.id);
+      if ([...pending.values()].some((entry) => entry.id === id)) break;
+      const element = resolveAnchor(String(data.selector ?? ""), String(data.text ?? ""));
+      if (!element) break;
+      pending.set(`s:${id}`, { id, element });
+      element.classList.add(PENDING_CLASS);
       break;
     }
 

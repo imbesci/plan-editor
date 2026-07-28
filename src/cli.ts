@@ -212,8 +212,15 @@ async function notifyEditCommand(args: string[]): Promise<unknown> {
 }
 
 async function hookCommand(args: string[]): Promise<unknown> {
-  const { fileFromToolInput, runStopHook } = await import("./hooks.ts");
+  const { fileFromToolInput, runContextHook, runStopHook } = await import("./hooks.ts");
   const raw = await readStdin();
+
+  if (args[0] === "user-prompt-submit" || args[0] === "session-start") {
+    const event = args[0] === "session-start" ? "SessionStart" : "UserPromptSubmit";
+    const output = await runContextHook(event);
+    if (output) process.stdout.write(output);
+    process.exit(0);
+  }
 
   if (args[0] === "stop") {
     const { output } = await runStopHook(raw);
@@ -259,7 +266,12 @@ async function setupCommand(args: string[]): Promise<unknown> {
   await writeFile(settingsPath, `${JSON.stringify(merged, null, 2)}\n`);
   return {
     hooks: { status: "installed", settings: settingsPath },
-    installed: ["PostToolUse (agent activity)", "Stop (guards against abandoning open edits)"],
+    installed: [
+      "UserPromptSubmit (pending edits enter your current session)",
+      "SessionStart:compact|resume (re-injects after compaction)",
+      "PostToolUse (agent activity indicator)",
+      "Stop (guards against abandoning open edits)",
+    ],
     help: [
       "Restart your agent session for the hooks to take effect.",
       "Set PLAN_EDITOR_NO_STOP_HOOK=1 to disable the Stop guard without uninstalling.",

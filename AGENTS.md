@@ -92,6 +92,27 @@ This is the whole reason the tool can show which feedback landed.
 - Symlink-confinement tests need the target to be genuinely outside the *artifact's
   own directory*. A sibling of the artifact is legitimately in scope.
 
+## Getting edits into the agent's context
+
+Three mechanisms, in order of how well they work:
+
+1. **UserPromptSubmit hook** — the primary path. Injects open edits into the
+   session the human is already in. Requires no agent cooperation at all.
+   `deliveredAt` stamps each edit so its full text is injected once and then
+   compacted to a count; without that it re-injects every prompt and reads as
+   nagging while burning context.
+2. **Stop hook** — the backstop, for when the agent tries to finish with edits
+   outstanding.
+3. **`plan-editor poll`** — the fallback. It does reach whatever session runs it,
+   but it needs the agent to volunteer a blocking call.
+
+Context injection contracts differ per event and failing them is silent:
+`UserPromptSubmit` and `SessionStart` accept plain stdout *or*
+`{"hookSpecificOutput":{"hookEventName":…,"additionalContext":…}}`; `PostToolUse`
+and `Stop` accept **only** the JSON form. Stop blocks with
+`{"decision":"block","reason":…}`. JSON is only parsed on exit code 0. We always
+emit the JSON form so the same code path works everywhere.
+
 ## Things that are deliberately absent
 
 No multiplayer, no CRDT, no identity model. The artifact is agent-owned and humans

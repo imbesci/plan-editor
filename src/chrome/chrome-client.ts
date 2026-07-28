@@ -2,7 +2,7 @@
 // `allow-same-origin`, so it has an opaque origin and cannot usefully call the
 // API — which is also why the session token never leaves this file.
 
-import type { Annotation, ChatMessage, ServerEvent } from "../protocol.ts";
+import type { AgentPresence, Annotation, ChatMessage, ServerEvent } from "../protocol.ts";
 
 interface Bootstrap {
   key: string;
@@ -24,8 +24,25 @@ const presence = document.getElementById("presence")!;
 
 let annotations: Annotation[] = [];
 let chat: ChatMessage[] = [];
+let presenceState: AgentPresence = "waiting";
 /** The element the user just clicked, awaiting a body. */
 let armed: { clientId: string; selector: string; text: string } | null = null;
+/** Annotation ids already handed to the SDK, so re-syncs do not re-send. */
+const trackedIds = new Set<string>();
+
+/**
+ * Hands every still-open annotation to the SDK so it can re-anchor them. The
+ * SDK's anchor map is per page load, so without this an annotation submitted
+ * before a reload can never be marked addressed.
+ */
+function syncTracking(): void {
+  for (const annotation of annotations) {
+    if (annotation.status !== "submitted" || annotation.tag !== "element") continue;
+    if (trackedIds.has(annotation.id)) continue;
+    trackedIds.add(annotation.id);
+    toFrame({ type: "pe:track", id: annotation.id, selector: annotation.selector, text: annotation.text });
+  }
+}
 
 frame.src = `/artifact/${key}/index.html?t=${encodeURIComponent(token)}`;
 
@@ -55,11 +72,26 @@ function render(): void {
     ? [{ id: armed.clientId, body: input.value || "…", selector: armed.selector, text: armed.text, tag: "element", status: "draft", createdAt: "" } as Annotation]
     : [];
   const rows = [...annotations, ...draft];
+  const open = annotations.filter((entry) => entry.status === "submitted").length;
+
+  // Without this, a submitted edit just sits on "waiting for agent" with no
+  // indication that nothing is listening or what to do about it.
+  const banner =
+    open > 0 && presenceState === "waiting"
+      ? `<div class="alert"><strong>${open} edit${open === 1 ? "" : "s"} waiting to be picked up.</strong>
+           <span>With hooks installed, just send any message in the Claude session you're already in — these arrive automatically. No new agent needed.</span>
+           <code>plan-editor setup hooks</code>
+           <span class="alt">Without hooks, an agent has to poll for them:</span>
+           <code>plan-editor poll ${escapeHtml(bootstrap.file)}</code></div>`
+      : "";
+
   if (rows.length === 0) {
-    list.innerHTML = `<p class="empty">Turn on Annotate, click an element, and describe the change. It gets applied in place — no reload.</p>`;
+    list.innerHTML = `${banner}<p class="empty">Turn on Annotate, click an element, and describe the change. It gets applied in place — no reload.</p>`;
     return;
   }
-  list.innerHTML = rows
+  list.innerHTML =
+    banner +
+    rows
     .map((entry) => {
       const anchor = entry.text ? escapeHtml(entry.text.slice(0, 90)) : escapeHtml(entry.selector || "whole page");
       return `<article class="card" data-status="${entry.status}" data-id="${escapeHtml(entry.id)}">
@@ -154,6 +186,9 @@ window.addEventListener("message", (event: MessageEvent) => {
   switch (data.type) {
     case "pe:ready":
       setMode(modeToggle.checked);
+      // The frame just (re)loaded with an empty anchor map — re-anchor everything.
+      trackedIds.clear();
+      syncTracking();
       break;
 
     case "pe:toggleMode":
@@ -200,12 +235,15 @@ stream.addEventListener("message", (event) => {
     case "sync":
       annotations = payload.annotations;
       chat = payload.chat;
+      syncTracking();
       render();
       break;
     case "presence":
+      presenceState = payload.state;
       presence.dataset.state = payload.state;
       presence.textContent =
-        payload.state === "listening" ? "agent listening" : payload.state === "working" ? "agent working…" : "agent idle";
+        payload.state === "listening" ? "agent listening" : payload.state === "working" ? "agent working…" : "no agent";
+      render();
       break;
     case "agent-activity":
       presence.dataset.state = "working";

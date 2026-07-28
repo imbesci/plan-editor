@@ -182,6 +182,17 @@ export class SessionStore {
     });
   }
 
+  /** Stamps edits as injected so they are not re-sent verbatim every prompt. */
+  async markDelivered(key: string, ids: string[]): Promise<void> {
+    const wanted = new Set(ids);
+    await this.mutate(key, (session) => {
+      const now = new Date().toISOString();
+      for (const annotation of session.annotations) {
+        if (wanted.has(annotation.id)) annotation.deliveredAt = now;
+      }
+    });
+  }
+
   async setAnnotationStatus(
     key: string,
     id: string,

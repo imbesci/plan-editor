@@ -82,3 +82,16 @@ button {
 button.ghost { background: transparent; color: var(--muted); border-color: var(--line); flex: 0 0 auto; }
 button:disabled { opacity: .5; cursor: default; }
 .target-hint { font-size: 12px; color: var(--accent); min-height: 1.2em; }
+
+.alert {
+  border: 1px solid var(--pending);
+  background: color-mix(in srgb, var(--pending) 10%, transparent);
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 4px;
+  display: flex; flex-direction: column; gap: 6px; font-size: 13px;
+}
+.alert code {
+  font: 11px ui-monospace, monospace; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 8px; overflow-x: auto; white-space: nowrap; display: block;
+}
+.alert .alt { color: var(--muted); font-size: 12px; margin-top: 2px; }

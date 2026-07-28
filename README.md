@@ -64,16 +64,28 @@ membership check instead of a fuzzy match.
 
 ## Claude Code hooks
 
-`plan-editor setup hooks` merges two hooks into `~/.claude/settings.json` without
-disturbing anything already there:
+**This is what makes the tool usable without a second agent.** Run
+`plan-editor setup hooks` once; it merges four hooks into `~/.claude/settings.json`
+without disturbing anything already there.
 
+- **UserPromptSubmit** — pending edits are injected into the session you are
+  *already talking to*. Submit an edit in the browser, say anything to your agent,
+  and it is simply there. No blocking poll, no fresh terminal, no agent starting
+  from zero context. Full text is injected once, then compacted to a one-line
+  reminder so it does not repeat every prompt, and it goes silent entirely once the
+  edit is applied.
+- **SessionStart** (`compact|resume`) — re-injects after a compaction or resume,
+  which is exactly where this kind of loop is otherwise silently lost.
 - **PostToolUse** (`Edit|Write|MultiEdit`) — the moment the agent touches the
-  artifact, the browser marks the pending element as being worked on. This happens
-  *before* the write lands, so the UI reacts immediately rather than after a round
-  trip.
+  artifact the browser marks the pending element as being worked on, *before* the
+  write lands, so the UI reacts immediately rather than after a round trip.
 - **Stop** — if you have submitted edits the agent has not applied, it is blocked
-  from finishing and redirected back to `poll`. This is what turns the review loop
-  from a prompt-engineering hope into an invariant.
+  from finishing. This turns the review loop from a prompt-engineering hope into an
+  invariant.
+
+Without hooks you fall back to `plan-editor poll <file>`, which works but requires
+an agent to volunteer a blocking call — and running it in a new terminal gives you
+an agent with no context.
 
 The Stop hook is bounded three ways, because a runaway one is worse than the bug it
 fixes: it never stacks on an already-active stop hook, it gives up after
