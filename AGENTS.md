@@ -148,6 +148,19 @@ Two things this got wrong once and must not again:
 The Stop hook only ever blocks the **authoring** session. Holding an unrelated
 session hostage because another project has open edits is intolerable.
 
+## Long-polls must be sliced
+
+`watch` and `poll` issue a sequence of short requests (`POLL_SLICE_MS`) rather
+than one long one. A single 15-minute request looks correct and is not: Bun's
+fetch applies its own timeout well before that, which surfaced as an unhandled
+`TimeoutError` that killed the command mid-wait — in front of the user, with a
+DOMException stack. Short slices mean no client, proxy, or runtime default has an
+opinion, and a dropped connection costs one slice instead of the whole wait.
+
+Server-side waiting is unchanged: each slice still parks on the EventEmitter, so
+an edit submitted mid-slice wakes it immediately rather than waiting out the
+slice. There is a regression test for exactly that.
+
 ## Latency: the agent must be *waiting*, not waiting to be poked
 
 Measured on this machine: a submitted edit reaches an already-waiting agent in

@@ -427,3 +427,47 @@ describe("versions, undo, and export", () => {
     assert.equal((await fetch(`${origin}/api/${session.key}/export`)).status, 403);
   });
 });
+
+describe("long-poll slicing", () => {
+  // Its own artifact, so the shared session's leftover open edits from earlier
+  // tests do not make every poll return immediately.
+  let sliceFile: string;
+  let sliceSession: { key: string; token: string };
+
+  before(async () => {
+    sliceFile = path.join(dir, "slice.html");
+    await writeFile(sliceFile, ARTIFACT_HTML);
+    const created = await fetch(`${origin}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: sliceFile }),
+    });
+    sliceSession = (await created.json()) as typeof sliceSession;
+  });
+
+  test("a slice that expires returns waiting rather than erroring", async () => {
+    // watch/poll issue many short requests instead of one long one, because a
+    // single multi-minute request trips Bun's own fetch timeout and surfaced as
+    // an unhandled TimeoutError that killed the command mid-wait.
+    const response = await fetch(
+      `${origin}/api/poll?file=${encodeURIComponent(sliceFile)}&t=${sliceSession.token}&timeoutMs=250`,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(((await response.json()) as { status: string }).status, "waiting");
+  });
+
+  test("an edit submitted mid-slice is returned by that slice", async () => {
+    const pending = fetch(
+      `${origin}/api/poll?file=${encodeURIComponent(sliceFile)}&t=${sliceSession.token}&timeoutMs=4000`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await fetch(`${origin}/api/${sliceSession.key}/annotations?t=${sliceSession.token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ annotations: [{ body: "mid-slice arrival", tag: "element" }] }),
+    });
+    const result = (await (await pending).json()) as { status: string; annotations: Array<{ body: string }> };
+    assert.equal(result.status, "feedback", "the waiting slice must wake, not time out");
+    assert.ok(result.annotations.some((entry) => entry.body === "mid-slice arrival"));
+  });
+});

@@ -200,7 +200,7 @@
 <section id="idea">
   <h2>The idea</h2>
   <p>Tic-tac-toe apps give you a computer to beat or a lobby to wait in. The game is neither — it is something you play with whoever is sitting next to you.</p>
-  <p>Hotseat is that. One page, two players, one device — a board, a turn indicator, a reset button.</p>
+  <p>Hotseat is that. One page, two players, one device — a board, a turn indicator, a reset button. That is genuinely the whole product: nothing to persist, no opponent to model, nothing to synchronise. Which puts the entire difficulty in how those three things feel — how obvious the turn is when you glance down mid-conversation, how fast the board clears when someone says "again", how little the interface asks of two people who are mostly looking at each other.</p>
 </section>
 
 <section id="scope">
@@ -211,6 +211,7 @@
       <ul>
         <li>A full game playable in under ten seconds</li>
         <li>Whose turn it is, unmistakable at a glance</li>
+        <li>A running tally across games, so one round becomes a session</li>
         <li>Wins announced with the winning line shown, not just stated</li>
         <li>Fully keyboard playable</li>
         <li>Works offline; single file, no build step</li>
@@ -221,7 +222,7 @@
       <ul>
         <li>Any computer opponent</li>
         <li>Networked or remote play</li>
-        <li>Accounts, persistence, or match history</li>
+        <li>Accounts, or a score that survives a refresh</li>
         <li>Larger boards or variant rules</li>
         <li>Animation beyond simple state transitions</li>
       </ul>
@@ -238,7 +239,8 @@
     <li>Win and draw checks run against the new board.</li>
     <li>If the game is still live, the turn indicator flips and focus stays on the board.</li>
     <li>On a win, the three winning squares highlight and the board locks.</li>
-    <li>Reset returns to an empty board. The loser of the previous game opens the next one.</li>
+    <li>A win increments that player's tally; a draw increments neither.</li>
+    <li>Reset returns to an empty board. <strong>The winner opens the next game</strong>, so a run has to be broken rather than handed back.</li>
   </ol>
 </section>
 
@@ -267,9 +269,14 @@
           <td>One field covering all three outcomes, so "is the game over" is a single null check.</td>
         </tr>
         <tr>
+          <td><code>score</code></td>
+          <td><code>{X: number, O: number}</code></td>
+          <td>In memory only, cleared on refresh. Persisting it would mean deciding what a "session" is and when it ends — questions this product does not want to have.</td>
+        </tr>
+        <tr>
           <td><code>opener</code></td>
           <td><code>"X" | "O"</code></td>
-          <td>Who starts the next game. Alternates so the same player does not always get the first-move advantage.</td>
+          <td>Who starts the next game — the previous winner, or X on the first game of a session. Rewarding a win with the first move is what turns a tally into a streak worth breaking.</td>
         </tr>
       </tbody>
     </table>
@@ -354,7 +361,7 @@
     <div class="phase-tag">Day 3</div>
     <div>
       <h3>Accessible and polished</h3>
-      <p>Grid navigation, focus management, live-region announcements, contrast, alternating openers, and how it behaves on a phone held between two people.</p>
+      <p>Grid navigation, focus management, live-region announcements, contrast, winner-opens handling, and how it behaves on a phone held between two people.</p>
     </div>
   </div>
   <div class="phase">
@@ -370,12 +377,6 @@
   <h2>Open questions</h2>
   <p>These are the decisions worth arguing about before any code exists. Everything else is legible from the plan above.</p>
 
-  <div class="question" id="q-scoreboard">
-    <h3>Do we keep a running score across games?</h3>
-    <p>A best-of-five tally is the single most requested feature in every version of this that has ever existed, and it costs roughly one more state field. It also turns a ten-second toy into a session, which may or may not be what we want.</p>
-    <span class="lean"><b>Leaning:</b> yes, in-memory only, cleared on refresh.</span>
-  </div>
-
   <div class="question" id="q-names">
     <h3>Player names, or just X and O?</h3>
     <p>Names make the turn indicator far warmer — "Sam's turn" beats "X's turn". They also add a naming step before the first game, which is exactly the friction this product exists to avoid.</p>
@@ -388,11 +389,6 @@
     <span class="lean"><b>Leaning:</b> no undo; make the squares large enough that misclicks are rare.</span>
   </div>
 
-  <div class="question" id="q-opener">
-    <h3>Who opens the next game?</h3>
-    <p>Always-X is simplest but hands a measurable advantage to one seat. Alternating is fairer. Loser-opens is fairest but needs explaining, and the plan above quietly assumes it.</p>
-    <span class="lean"><b>Leaning:</b> alternate, and say so in the UI.</span>
-  </div>
 </section>
 
 <section id="risks">

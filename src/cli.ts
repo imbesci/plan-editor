@@ -156,6 +156,37 @@ async function openCommand(args: string[]): Promise<unknown> {
   };
 }
 
+/**
+ * Long-polls in bounded slices until an edit arrives or the deadline passes.
+ *
+ * A single 15-minute HTTP request looks fine and is not: Bun's fetch applies its
+ * own timeout well before that, which surfaced as an unhandled TimeoutError that
+ * killed the command mid-wait. Chunking keeps every request short enough that no
+ * client, proxy, or runtime default has an opinion about it, and a dropped
+ * connection just costs one slice instead of the whole wait.
+ */
+const POLL_SLICE_MS = 45_000;
+
+async function longPoll(canonical: string, token: string, deadline: number): Promise<PollResult> {
+  while (Date.now() < deadline) {
+    const slice = Math.max(1_000, Math.min(POLL_SLICE_MS, deadline - Date.now()));
+    const url =
+      `${baseUrl()}/api/poll?file=${encodeURIComponent(canonical)}&t=${encodeURIComponent(token)}` +
+      `&timeoutMs=${slice}`;
+    let result: PollResult | null = null;
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(slice + 15_000) });
+      if (response.ok) result = (await response.json()) as PollResult;
+    } catch {
+      // Transient: the server restarted, or a slice timed out. Try the next one.
+      await delay(500);
+      continue;
+    }
+    if (result && result.status !== "waiting") return result;
+  }
+  return { status: "waiting" };
+}
+
 async function pollCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
   if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor poll <file.html>`"]);
@@ -174,18 +205,19 @@ async function pollCommand(args: string[]): Promise<unknown> {
   }
 
   const timeoutIndex = args.indexOf("--timeout-ms");
-  const timeout = timeoutIndex !== -1 ? `&timeoutMs=${encodeURIComponent(String(args[timeoutIndex + 1]))}` : "";
+  const explicit = timeoutIndex !== -1 ? Number(args[timeoutIndex + 1]) : null;
 
-  if (!timeout) {
+  if (explicit === null) {
     process.stderr.write(
       `[plan-editor] Waiting for edits on ${canonical}. This stays silent until the human submits — leave it running. ` +
         `If it is interrupted, re-run the same command; submitted edits are never lost.\n`,
     );
   }
 
-  const url = `${baseUrl()}/api/poll?file=${encodeURIComponent(canonical)}&t=${encodeURIComponent(token)}${timeout}`;
-  const response = await fetch(url);
-  const result = (await response.json()) as PollResult;
+  const result =
+    explicit !== null
+      ? await longPoll(canonical, token, Date.now() + Math.max(0, explicit))
+      : await longPoll(canonical, token, Date.now() + 24 * 3600_000);
   return formatPollResult(canonical, result);
 }
 
@@ -262,11 +294,7 @@ async function watchCommand(args: string[]): Promise<unknown> {
       `It is picked up the instant you press Submit — no need to message me. Press Esc to talk here instead.\n`,
   );
 
-  const url =
-    `${baseUrl()}/api/poll?file=${encodeURIComponent(canonical)}&t=${encodeURIComponent(token)}` +
-    `&timeoutMs=${encodeURIComponent(String(maxMs))}`;
-  const response = await fetch(url);
-  const result = (await response.json()) as PollResult;
+  const result = await longPoll(canonical, token, Date.now() + maxMs);
 
   if (result.status === "waiting") {
     return {
