@@ -445,6 +445,25 @@ export async function serve(options: ServeOptions = {}) {
     }
   });
 
+  // Agent-declared completion. Browser confirmation is the nicer signal, but it
+  // cannot be the ONLY one: a closed, stale or broken tab means no morph report
+  // ever arrives, the edit is stuck at "submitted" forever, and a watching agent
+  // receives its own just-applied edit on every cycle.
+  app.post("/api/:key/annotations/:id/applied", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const note = typeof (req.body as Record<string, unknown>)?.note === "string"
+        ? String((req.body as Record<string, unknown>).note)
+        : undefined;
+      const updated = await store.setAnnotationStatus(session.key, String(req.params.id), "addressed", note);
+      await syncBrowsers(session.key);
+      res.json({ status: updated ? "addressed" : "not-found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/:key/annotations/:id/accept", requireSameOrigin, async (req, res, next) => {
     try {
       const session = await loadAuthorized(req, res);

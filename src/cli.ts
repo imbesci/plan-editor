@@ -224,6 +224,8 @@ export function formatPollResult(file: string, result: PollResult): unknown {
     next_step:
       `Apply each edit by editing ${file} directly. The open browser patches itself in place — never ask the user to reload. ` +
       `Give top-level sections stable \`id\` attributes so edits can be matched precisely. ` +
+      `The open browser marks each edit applied automatically once your change touches its anchor. If the same edit comes back ` +
+      `on the next cycle, the browser could not confirm it — run \`plan-editor applied ${file} --id <id>\` so it stops repeating. ` +
       `Then run \`plan-editor watch ${file}\` so the next edit reaches you in milliseconds instead of waiting for the human to message you.` +
       (result.sessionEnded ? " Note: the human ended the session with this batch, so do not poll again." : ""),
   };
@@ -269,6 +271,35 @@ async function watchCommand(args: string[]): Promise<unknown> {
     };
   }
   return formatPollResult(canonical, result);
+}
+
+/**
+ * Declares an edit applied. The browser normally detects this itself by watching
+ * which element the agent's change touched, but that path is unavailable when the
+ * tab is closed, stale, or was blanked — and then the edit never leaves
+ * "submitted" and `watch` hands the agent its own work forever.
+ */
+async function appliedCommand(args: string[]): Promise<unknown> {
+  const file = args.find((arg) => !arg.startsWith("--"));
+  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor applied <file.html> --id <id>`"]);
+  const ids = args.flatMap((arg, index) => (arg === "--id" && args[index + 1] ? [String(args[index + 1])] : []));
+  if (ids.length === 0) throw new CliError("At least one --id is required");
+  const noteIndex = args.indexOf("--note");
+  const note = noteIndex !== -1 ? args[noteIndex + 1] : undefined;
+
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const { key, token } = await tokenFor(canonical);
+  const results: string[] = [];
+  for (const id of ids) {
+    const response = await fetch(`${baseUrl()}/api/${key}/annotations/${id}/applied?t=${encodeURIComponent(token)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(note ? { note } : {}),
+    });
+    results.push(`${id}: ${response.ok ? ((await response.json()) as { status: string }).status : response.status}`);
+  }
+  return { marked: results };
 }
 
 async function endCommand(args: string[]): Promise<unknown> {
@@ -493,6 +524,7 @@ const HELP = `plan-editor — click an element, say what to change, watch it cha
 Usage:
   plan-editor <file.html> [--no-open]   Open the artifact for review
   plan-editor watch <file.html>         Park until the human submits an edit (the responsive path)
+  plan-editor applied <file> --id <id>  Declare an edit applied when the browser cannot confirm
   plan-editor poll <file.html>          Wait for edits (long-polls; never kill it)
       [--reply "..."] [--timeout-ms n]
   plan-editor end <file.html>           End the session
@@ -515,6 +547,7 @@ async function main(): Promise<void> {
     setup: setupCommand,
     hook: hookCommand,
     watch: watchCommand,
+    applied: appliedCommand,
     export: exportCommand,
     undo: undoCommand,
     "notify-edit": notifyEditCommand,

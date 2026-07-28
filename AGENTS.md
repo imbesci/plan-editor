@@ -169,6 +169,18 @@ ended for another reason.
 Do not "fix" latency by shortening timers or polling more often. Nothing in the
 pipeline is polling.
 
+**Browser confirmation cannot be the only completion signal.** An edit leaves
+`submitted` when the browser reports that the agent's change touched its anchor —
+which never happens if the tab is closed, stale, or was blanked by an earlier
+bug. The edit then sticks forever and a watching agent is handed its own
+just-applied work on every cycle, which is exactly the loop it looks like.
+`plan-editor applied <file> --id <id>` is the escape hatch: if the same edit
+returns after you applied it, declare it and move on.
+
+Opening a session spawns a browser tab. Re-running `plan-editor <file>` during
+development spawns *another* — several stale tabs then compete, all morphing and
+reporting. Use `--no-open` when restarting the server mid-session.
+
 ## Getting edits into the agent's context
 
 Three mechanisms, in order of how well they work:
