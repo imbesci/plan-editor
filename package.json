@@ -1,0 +1,42 @@
+{
+  "name": "plan-editor",
+  "version": "0.1.0",
+  "description": "Click an element, say what you want, watch it change in place. No reload.",
+  "type": "module",
+  "bin": {
+    "plan-editor": "bin/plan-editor.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "check": "bun run build && bun run typecheck && bun test",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "start": "bun run bin/plan-editor.js"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "express": "^5.2.1",
+    "idiomorph": "^0.7.4",
+    "open": "^10.2.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/express": "^5.0.0",
+    "@types/jsdom": "^28.0.3",
+    "@types/node": "^24.0.0",
+    "jsdom": "^30.0.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "bun": ">=1.2"
+  },
+  "license": "MIT",
+  "private": true,
+  "module": "src/cli.ts"
+}
