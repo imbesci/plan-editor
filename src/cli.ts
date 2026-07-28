@@ -183,6 +183,22 @@ async function pollCommand(args: string[]): Promise<unknown> {
   return formatPollResult(canonical, result);
 }
 
+/** Absolute path of a command on PATH, or null. */
+async function which(name: string): Promise<string | null> {
+  const { access } = await import("node:fs/promises");
+  for (const dir of (process.env.PATH ?? "").split(":")) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      // keep looking
+    }
+  }
+  return null;
+}
+
 export function formatPollResult(file: string, result: PollResult): unknown {
   if (result.status === "waiting") {
     return {
@@ -304,10 +320,15 @@ async function setupCommand(args: string[]): Promise<unknown> {
   } catch {
     existing = {};
   }
-  const merged = mergeHookSettings(existing, "plan-editor");
+  // Resolve to an absolute invocation. A bare `plan-editor` only works if the
+  // package is globally linked, and a hook that cannot find its command fails
+  // silently — the exact failure mode this tool exists to avoid.
+  const onPath = await which("plan-editor");
+  const command = onPath ?? `${process.execPath} ${fileURLToPath(new URL("./cli.ts", import.meta.url))}`;
+  const merged = mergeHookSettings(existing, command);
   await writeFile(settingsPath, `${JSON.stringify(merged, null, 2)}\n`);
   return {
-    hooks: { status: "installed", settings: settingsPath },
+    hooks: { status: "installed", settings: settingsPath, command },
     installed: [
       "UserPromptSubmit (pending edits enter your current session)",
       "SessionStart:compact|resume (re-injects after compaction)",
@@ -368,15 +389,41 @@ async function undoCommand(args: string[]): Promise<unknown> {
   return { ...((await response.json()) as object), file: canonical };
 }
 
+/**
+ * Heartbeat so the browser can show that an agent is connected. Hook-delivered
+ * agents never open a poll, so without this the UI reports "no agent" even while
+ * every edit is reaching one.
+ */
+async function notifyContactCommand(): Promise<unknown> {
+  const store = new SessionStore(stateDir());
+  for (const session of await store.list()) {
+    if (session.status !== "open") continue;
+    // Never start a server from a hook — if it is not running there is no
+    // browser to inform anyway.
+    await fetch(`${baseUrl()}/api/${session.key}/agent-contact?t=${encodeURIComponent(session.token)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(500),
+    }).catch(() => {});
+  }
+  return { status: "ok" };
+}
+
 async function statusCommand(): Promise<unknown> {
   const store = new SessionStore(stateDir());
   const sessions = await store.list();
+  const running = (await health())?.app === "plan-editor";
   return {
+    server: running ? `running on ${baseUrl()}` : "not running",
     sessions: sessions.map((session) => ({
       file: session.file,
       status: session.status,
+      bound_agent: session.authoredBy ? `${session.authoredBy.slice(0, 8)}… (${session.authoredIn})` : "none",
+      url: `${baseUrl()}/s/${session.key}?t=${session.token}`,
       open_edits: session.annotations.filter((entry) => entry.status === "submitted").length,
       addressed: session.annotations.filter((entry) => entry.status === "addressed").length,
+      resolved: session.annotations.filter((entry) => entry.status === "resolved").length,
     })),
   };
 }
@@ -427,6 +474,7 @@ async function main(): Promise<void> {
     export: exportCommand,
     undo: undoCommand,
     "notify-edit": notifyEditCommand,
+    "notify-contact": notifyContactCommand,
   };
 
   try {

@@ -10,6 +10,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { canonicalDir } from "./hooks.ts";
 import { injectSdk } from "./html-transform.ts";
 import { allowedHostnames, bindHost, defaultPort, hostnameFromHeader, stateDir } from "./paths.ts";
+import type { AgentIdentityView } from "./protocol.ts";
 import {
   parseIncomingAnnotations,
   parseMorphReport,
@@ -61,6 +62,12 @@ export async function serve(options: ServeOptions = {}) {
   const sseClients = new Map<string, Set<Response>>();
   const activePolls = new Set<string>();
   const workingSessions = new Set<string>();
+  /** Last time a hook reported an agent turn for this session. */
+  const lastContact = new Map<string, number>();
+  // A hook-connected agent never opens a poll, so presence measured only by
+  // activePolls reports "no agent" forever even when one is bound and receiving
+  // every edit. Contact within this window counts as connected.
+  const CONTACT_WINDOW_MS = 10 * 60_000;
   let idleTimer: NodeJS.Timeout | null = null;
 
   // --- guards ---------------------------------------------------------------
@@ -123,9 +130,21 @@ export async function serve(options: ServeOptions = {}) {
   // --- presence & lifecycle -------------------------------------------------
 
   function presenceOf(key: string): AgentPresence {
-    if (activePolls.has(key)) return "listening";
     if (workingSessions.has(key)) return "working";
+    if (activePolls.has(key)) return "listening";
+    const seen = lastContact.get(key);
+    if (seen && Date.now() - seen < CONTACT_WINDOW_MS) return "listening";
     return "waiting";
+  }
+
+  async function agentView(key: string): Promise<AgentIdentityView> {
+    const session = await store.read(key);
+    const seen = lastContact.get(key);
+    return {
+      session: session?.authoredBy ? session.authoredBy.slice(0, 8) : null,
+      lastContact: seen ? new Date(seen).toISOString() : null,
+      viaHooks: Boolean(seen) && !activePolls.has(key),
+    };
   }
 
   function broadcast(key: string, event: unknown): void {
@@ -138,7 +157,7 @@ export async function serve(options: ServeOptions = {}) {
   }
 
   function emitPresence(key: string): void {
-    broadcast(key, { type: "presence", state: presenceOf(key) });
+    void agentView(key).then((agent) => broadcast(key, { type: "presence", state: presenceOf(key), agent }));
   }
 
   function refreshIdle(): void {
@@ -329,10 +348,24 @@ export async function serve(options: ServeOptions = {}) {
   // Called by the PostToolUse hook (via `plan-editor notify-edit`) the moment
   // the agent touches the artifact — before the write lands — so the pending
   // element starts pulsing immediately instead of after the round trip.
+  // Heartbeat from any hook: proof an agent turn is happening for this session.
+  app.post("/api/:key/agent-contact", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      lastContact.set(session.key, Date.now());
+      emitPresence(session.key);
+      res.json({ status: "ok" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/:key/agent-activity", async (req, res, next) => {
     try {
       const session = await loadAuthorized(req, res);
       if (!session) return;
+      lastContact.set(session.key, Date.now());
       workingSessions.add(session.key);
       broadcast(session.key, { type: "agent-activity", active: true });
       emitPresence(session.key);
@@ -488,7 +521,9 @@ export async function serve(options: ServeOptions = {}) {
       refreshIdle();
 
       res.write(`data: ${JSON.stringify({ type: "sync", annotations: session.annotations, chat: session.chat })}\n\n`);
-      res.write(`data: ${JSON.stringify({ type: "presence", state: presenceOf(session.key) })}\n\n`);
+      res.write(
+        `data: ${JSON.stringify({ type: "presence", state: presenceOf(session.key), agent: await agentView(session.key) })}\n\n`,
+      );
       res.write(`data: ${JSON.stringify({ type: "versions", list: await versions.list(session.key) })}\n\n`);
 
       const heartbeat = setInterval(() => {

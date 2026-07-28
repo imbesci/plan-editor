@@ -98,6 +98,19 @@ This is the whole reason the tool can show which feedback landed.
 - Symlink-confinement tests need the target to be genuinely outside the *artifact's
   own directory*. A sibling of the artifact is legitimately in scope.
 
+## Presence must account for hook-connected agents
+
+`presenceOf` originally measured only `activePolls`. Once hooks became the primary
+delivery path that was wrong in the most confusing possible way: an agent could be
+bound and receiving every edit while the browser said "no agent". Hooks now ping
+`POST /api/:key/agent-contact` (via `plan-editor notify-contact`, installed as a
+second UserPromptSubmit entry so it fires even on turns with nothing to inject),
+and contact inside `CONTACT_WINDOW_MS` counts as connected.
+
+`setup hooks` resolves an **absolute** command — bare `plan-editor` only works if
+the package is globally linked, and a hook whose command is not found fails
+silently, which is exactly the failure this tool exists to eliminate.
+
 ## Routing edits back to the authoring agent
 
 An inline edit is only worth much to the agent that *produced* the plan — that

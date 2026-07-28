@@ -322,7 +322,17 @@ export function mergeHookSettings(existing: Record<string, unknown>, command: st
     ],
     // The one that removes the need for a second agent: pending edits land in
     // whatever session the human is already talking to.
-    ["UserPromptSubmit", { hooks: [{ type: "command", command: `${command} hook user-prompt-submit`, timeout: 10 }] }],
+    [
+      "UserPromptSubmit",
+      {
+        hooks: [
+          { type: "command", command: `${command} hook user-prompt-submit`, timeout: 10 },
+          // Separate entry so the browser learns an agent is alive even on turns
+          // with no outstanding edits to inject.
+          { type: "command", command: `${command} notify-contact`, timeout: 5 },
+        ],
+      },
+    ],
     // Re-injects after a compaction or resume, which is where the loop is
     // otherwise silently lost.
     [

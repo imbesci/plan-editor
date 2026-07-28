@@ -88,7 +88,7 @@ export type ServerEvent =
   | { type: "agent-reply"; text: string }
   | { type: "sync"; annotations: Annotation[]; chat: ChatMessage[] }
   | { type: "versions"; list: VersionMeta[] }
-  | { type: "presence"; state: AgentPresence };
+  | { type: "presence"; state: AgentPresence; agent: AgentIdentityView };
 
 export interface VersionMeta {
   seq: number;
@@ -98,6 +98,16 @@ export interface VersionMeta {
 }
 
 export type AgentPresence = "waiting" | "listening" | "working";
+
+/** Who is on the other end, for the browser to show. */
+export interface AgentIdentityView {
+  /** Short form of the bound Claude session id, or null when unbound. */
+  session: string | null;
+  /** ISO timestamp of the last hook or poll contact. */
+  lastContact: string | null;
+  /** True when hooks are delivering rather than a blocking poll. */
+  viaHooks: boolean;
+}
 
 /** Agent-facing poll result. */
 export type PollResult =

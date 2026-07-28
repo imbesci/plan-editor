@@ -3,7 +3,7 @@
 // API — which is also why the session token never leaves this file.
 
 import { diffDocuments, diffWords, type SectionChange } from "../sdk/diff.ts";
-import type { AgentPresence, Annotation, ChatMessage, ServerEvent, VersionMeta } from "../protocol.ts";
+import type { AgentIdentityView, AgentPresence, Annotation, ChatMessage, ServerEvent, VersionMeta } from "../protocol.ts";
 
 interface Bootstrap {
   key: string;
@@ -39,6 +39,7 @@ let annotations: Annotation[] = [];
 let chat: ChatMessage[] = [];
 let versions: VersionMeta[] = [];
 let presenceState: AgentPresence = "waiting";
+let agentView: AgentIdentityView = { session: null, lastContact: null, viaHooks: false };
 /** Staged edits, not yet sent. Several can be queued before one submit. */
 let drafts: Draft[] = [];
 /** The draft currently being typed into, if any. */
@@ -99,7 +100,11 @@ function render(): void {
   const banner =
     open > 0 && presenceState === "waiting"
       ? `<div class="alert"><strong>${open} edit${open === 1 ? "" : "s"} waiting to be picked up.</strong>
-           <span>With hooks installed, just send any message in the Claude session you're already in — these arrive automatically.</span>
+           <span>${
+             agentView.session
+               ? "An agent is bound to this artifact but has not checked in. Send it any message, or install hooks so edits arrive automatically."
+               : "No agent is bound. Install hooks, then edits reach the Claude session you're already in."
+           }</span>
            <code>plan-editor setup hooks</code></div>`
       : "";
 
@@ -506,13 +511,26 @@ stream.addEventListener("message", (event) => {
       versions = payload.list;
       render();
       break;
-    case "presence":
+    case "presence": {
       presenceState = payload.state;
+      agentView = payload.agent;
       presence.dataset.state = payload.state;
+      const who = agentView.session ? ` · ${agentView.session}` : "";
       presence.textContent =
-        payload.state === "listening" ? "agent listening" : payload.state === "working" ? "agent working…" : "no agent";
+        payload.state === "working"
+          ? `agent working…${who}`
+          : payload.state === "listening"
+            ? `${agentView.viaHooks ? "agent connected" : "agent listening"}${who}`
+            : agentView.session
+              ? `agent idle · ${agentView.session}`
+              : "no agent";
+      presence.title = agentView.session
+        ? `Bound to Claude session ${agentView.session}…` +
+          (agentView.lastContact ? `\nLast seen ${new Date(agentView.lastContact).toLocaleTimeString()}` : "\nNot seen yet — install hooks or run a poll")
+        : "No agent session is bound to this artifact";
       render();
       break;
+    }
     case "agent-reply":
       chat.push({ role: "agent", text: payload.text, at: new Date().toISOString() });
       render();
