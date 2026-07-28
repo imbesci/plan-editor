@@ -17,6 +17,12 @@ export interface TrackedAnchor {
   elements: Element[];
 }
 
+export interface TextChange {
+  element: Element;
+  before: string;
+  after: string;
+}
+
 export interface MorphResult {
   /** Tracked anchors whose own markup changed — the agent addressed them. */
   addressed: string[];
@@ -24,6 +30,12 @@ export interface MorphResult {
   orphaned: string[];
   /** Deepest changed elements, for highlighting. */
   changed: Element[];
+  /**
+   * Before/after text for each changed element, captured during the walk — the
+   * old text is gone by the time the morph returns. Lets the caller highlight
+   * the words that actually changed instead of flooding a whole paragraph.
+   */
+  textChanges: TextChange[];
 }
 
 function isUiNode(node: Node): boolean {
@@ -61,6 +73,7 @@ function isSdkScript(node: Node): boolean {
  */
 export function morphDocument(root: Element, html: string, tracked: Iterable<TrackedAnchor>): MorphResult {
   const changed = new Set<Element>();
+  const textBefore = new Map<Element, { before: string; after: string }>();
   const ownerDocument = root.ownerDocument;
 
   // Morph <head> and <body> separately rather than replacing <html> wholesale.
@@ -92,7 +105,15 @@ export function morphDocument(root: Element, html: string, tracked: Iterable<Tra
         // Identical subtree: skip entirely. Saves work and keeps it out of the
         // changed set, which is what makes the highlight precise.
         if (oldElement.outerHTML === newElement.outerHTML) return false;
-        if (!isStructuralRoot(oldElement)) changed.add(oldElement);
+        if (!isStructuralRoot(oldElement)) {
+          changed.add(oldElement);
+          // Captured here because the old text no longer exists once the walk
+          // has moved past this node.
+          textBefore.set(oldElement, {
+            before: (oldElement.textContent ?? "").replace(/\s+/g, " ").trim(),
+            after: (newElement.textContent ?? "").replace(/\s+/g, " ").trim(),
+          });
+        }
         return true;
       },
       beforeNodeRemoved: (node: Node) => !isUiNode(node),
@@ -122,5 +143,13 @@ export function morphDocument(root: Element, html: string, tracked: Iterable<Tra
     if (attached.some((element) => changed.has(element))) addressed.push(anchor.id);
   }
 
-  return { addressed, orphaned, changed: deepest };
+  const textChanges: TextChange[] = [];
+  for (const element of deepest) {
+    const texts = textBefore.get(element);
+    if (texts && texts.before !== texts.after) {
+      textChanges.push({ element, before: texts.before, after: texts.after });
+    }
+  }
+
+  return { addressed, orphaned, changed: deepest, textChanges };
 }

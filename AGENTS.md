@@ -204,6 +204,21 @@ emit the JSON form so the same code path works everywhere.
 
 ## Versions, diff, and the edit lifecycle
 
+**What version history is, concretely:** not a linked list and not a delta chain.
+`<state>/versions/<key>/index.json` holds a flat, append-only array of
+`{seq, at, bytes, origin}` — no next/prev pointers — beside one whole-file
+snapshot per version, `<seq>.html`. Ordering is the array; `seq` is monotonic.
+Roughly 20KB per version, so a capped 40-entry history costs under a megabyte.
+
+Snapshots are **immutable**, which is what makes the browser cache in
+`chrome-client.ts` correct. Scrubbing originally refetched both documents on
+every click — including the current one, every single time — and then only
+rendered a text diff, so moving between versions felt like loading rather than
+moving. Clicking a version now morphs the artifact to it (`pe:preview`), the
+cache means each snapshot is fetched once, and closing the overlay restores the
+live document. Never leave a preview on screen: it shows a version the file no
+longer contains.
+
 `VersionStore` snapshots the whole artifact per observed change (capped at
 `MAX_VERSIONS`, oldest dropped). Whole files rather than deltas: artifacts are
 small, and it makes restore a single write. **Undo is implemented by writing an
@@ -217,6 +232,14 @@ or undo becomes a no-op the user has to press twice.
 paragraph rewrites a 400-character line — and reporting ancestors too would flag
 `body` for every edit. Changes with no id to attribute them to are counted, never
 guessed at. It runs in the browser because a real DOM is already there.
+
+**Highlight only the words that changed.** `morphDocument` captures before/after
+text during the walk (the old text is gone by the time it returns) and returns
+`textChanges`. The SDK diffs those word-wise and highlights the added words via
+the CSS Custom Highlight API — no DOM mutation, because wrapping words in spans
+would corrupt the content the next morph has to diff and would leak into exports.
+Flashing the whole element is the fallback, used only where the API is missing or
+where an element changed without its text moving.
 
 Lifecycle invariants:
 

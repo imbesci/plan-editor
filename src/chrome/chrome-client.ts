@@ -190,6 +190,10 @@ document.addEventListener(
       void submit();
     }
     if (event.key === "Escape") closeOverlay();
+    if (!overlay.hidden && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      event.preventDefault();
+      void stepVersion(event.key === "ArrowRight" ? 1 : -1);
+    }
   },
   true,
 );
@@ -318,6 +322,11 @@ historyButton.addEventListener("click", () => void openHistory());
 function closeOverlay(): void {
   overlay.hidden = true;
   overlay.innerHTML = "";
+  // Leaving a preview on screen would show a version the file no longer holds.
+  if (previewing !== null) {
+    previewing = null;
+    void applyPatch();
+  }
 }
 
 overlay.addEventListener("click", (event) => {
@@ -329,6 +338,7 @@ async function openHistory(): Promise<void> {
   overlay.hidden = false;
   overlay.innerHTML = `<div class="sheet">
     <header><h2>History</h2><button class="link" data-close>Close</button></header>
+    <p class="scrub-hint">Click a version to see it in place. <kbd>←</kbd> <kbd>→</kbd> to scrub.</p>
     <div class="versions">${rows
       .map(
         (version, index) => `<button class="version" data-seq="${version.seq}">
@@ -344,13 +354,60 @@ async function openHistory(): Promise<void> {
 
   overlay.querySelector("[data-close]")?.addEventListener("click", closeOverlay);
   for (const button of overlay.querySelectorAll<HTMLButtonElement>(".version")) {
-    button.addEventListener("click", () => void showDiff(Number(button.dataset.seq)));
+    button.addEventListener("click", () => {
+      const seq = Number(button.dataset.seq);
+      selectVersion(seq);
+      void previewVersion(seq);
+      void showDiff(seq);
+    });
+  }
+  // Warm the two most likely reads so the first click is instant.
+  const latest = versions[versions.length - 1];
+  if (latest) void fetchVersion(latest.seq);
+  const previous = versions[versions.length - 2];
+  if (previous) void fetchVersion(previous.seq);
+}
+
+/**
+ * Snapshots are immutable, so one fetch per version is enough. Re-fetching both
+ * documents on every click — including the current one, every time — is what
+ * made scrubbing feel like loading rather than moving.
+ */
+const versionCache = new Map<number, string>();
+
+async function fetchVersion(seq: number): Promise<string> {
+  const cached = versionCache.get(seq);
+  if (cached !== undefined) return cached;
+  const response = await fetch(`/api/${key}/versions/${seq}?t=${encodeURIComponent(token)}`);
+  const html = response.ok ? await response.text() : "";
+  if (html) versionCache.set(seq, html);
+  return html;
+}
+
+/** Which version the artifact frame is currently showing, if previewing. */
+let previewing: number | null = null;
+
+function selectVersion(seq: number): void {
+  for (const button of overlay.querySelectorAll<HTMLButtonElement>(".version")) {
+    button.classList.toggle("active", Number(button.dataset.seq) === seq);
   }
 }
 
-async function fetchVersion(seq: number): Promise<string> {
-  const response = await fetch(`/api/${key}/versions/${seq}?t=${encodeURIComponent(token)}`);
-  return response.ok ? response.text() : "";
+/** Morphs the artifact frame to a snapshot so scrubbing shows the document. */
+async function previewVersion(seq: number): Promise<void> {
+  const html = await fetchVersion(seq);
+  if (!html) return;
+  previewing = seq === (versions[versions.length - 1]?.seq ?? -1) ? null : seq;
+  toFrame({ type: "pe:preview", html });
+}
+
+async function stepVersion(delta: number): Promise<void> {
+  const current = previewing ?? versions[versions.length - 1]?.seq;
+  const index = versions.findIndex((entry) => entry.seq === current);
+  const next = versions[Math.min(versions.length - 1, Math.max(0, index + delta))];
+  if (!next || next.seq === current) return;
+  selectVersion(next.seq);
+  await Promise.all([previewVersion(next.seq), showDiff(next.seq)]);
 }
 
 async function showDiff(seq: number): Promise<void> {

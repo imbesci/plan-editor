@@ -11,7 +11,8 @@
 // Selectors are a hint for the agent and nothing else — they do not survive the
 // agent rewriting the file, which is the entire problem this tool exists to fix.
 
-import { morphDocument, UI_ATTRIBUTE, type TrackedAnchor } from "./morph.ts";
+import { diffWords } from "./diff.ts";
+import { morphDocument, UI_ATTRIBUTE, type TextChange, type TrackedAnchor } from "./morph.ts";
 
 const pending = new Map<string, TrackedAnchor>();
 /** The group currently being built, so a modifier-click can extend it. */
@@ -201,14 +202,84 @@ function resolveAnchor(selector: string, text: string): Element | null {
   return null;
 }
 
-/** Applies new artifact HTML in place and flashes what actually changed. */
+const HIGHLIGHT_NAME = "pe-changed-words";
+let highlightTimer: number | undefined;
+
+/**
+ * Highlights only the words that actually changed, using the CSS Custom
+ * Highlight API so nothing in the artifact's DOM is touched — wrapping words in
+ * spans would mutate content the next morph has to diff, and would show up in
+ * exports.
+ *
+ * Falls back to flashing the whole element where the API is unavailable.
+ */
+function highlightChanges(changes: TextChange[], fallback: Element[]): void {
+  const highlights = (CSS as unknown as { highlights?: Map<string, unknown> }).highlights;
+  const HighlightCtor = (window as unknown as { Highlight?: new (...ranges: Range[]) => unknown }).Highlight;
+
+  if (!highlights || !HighlightCtor) {
+    for (const element of fallback) {
+      element.classList.add(HIGHLIGHT_CLASS);
+      setTimeout(() => element.classList.remove(HIGHLIGHT_CLASS), 1600);
+    }
+    return;
+  }
+
+  const ranges: Range[] = [];
+  for (const change of changes) {
+    const added = diffWords(change.before, change.after)
+      .filter((op) => op.type === "add")
+      .map((op) => op.text.trim())
+      .filter(Boolean);
+    if (added.length === 0) continue;
+    ranges.push(...rangesForWords(change.element, added));
+  }
+
+  if (ranges.length === 0) {
+    // The element changed but its text did not (an attribute, a reordering).
+    // Flash the block rather than claiming nothing happened.
+    for (const element of fallback) {
+      element.classList.add(HIGHLIGHT_CLASS);
+      setTimeout(() => element.classList.remove(HIGHLIGHT_CLASS), 1600);
+    }
+    return;
+  }
+
+  highlights.set(HIGHLIGHT_NAME, new HighlightCtor(...ranges));
+  clearTimeout(highlightTimer);
+  highlightTimer = setTimeout(() => highlights.delete(HIGHLIGHT_NAME), 2400) as unknown as number;
+}
+
+/** Ranges covering each added word inside `element`, walking its text nodes. */
+function rangesForWords(element: Element, words: string[]): Range[] {
+  const ranges: Range[] = [];
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  const needles = words.slice(0, 200);
+
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = node.textContent ?? "";
+    for (const word of needles) {
+      let from = 0;
+      for (;;) {
+        const at = text.indexOf(word, from);
+        if (at === -1) break;
+        const range = document.createRange();
+        range.setStart(node, at);
+        range.setEnd(node, at + word.length);
+        ranges.push(range);
+        from = at + word.length;
+        if (ranges.length > 400) return ranges;
+      }
+    }
+  }
+  return ranges;
+}
+
+/** Applies new artifact HTML in place and highlights what actually changed. */
 function applyMorph(html: string): { addressed: string[]; orphaned: string[] } {
   const result = morphDocument(document.documentElement, html, pending.values());
 
-  for (const element of result.changed) {
-    element.classList.add(HIGHLIGHT_CLASS);
-    setTimeout(() => element.classList.remove(HIGHLIGHT_CLASS), 1600);
-  }
+  highlightChanges(result.textChanges, result.changed);
 
   const settled = new Set([...result.addressed, ...result.orphaned]);
   for (const [clientId, entry] of pending) {
@@ -268,6 +339,17 @@ window.addEventListener("message", (event: MessageEvent) => {
       break;
     }
 
+    // Version scrubbing: morph to an arbitrary snapshot for preview, without
+    // touching annotation state or reporting anything back.
+    case "pe:preview": {
+      try {
+        morphDocument(document.documentElement, String(data.html), []);
+      } catch (error) {
+        post({ type: "pe:morphFailed", message: String(error) });
+      }
+      break;
+    }
+
     case "pe:morph": {
       try {
         const result = applyMorph(String(data.html));
@@ -323,6 +405,10 @@ style.textContent = `
 .pe-annotate .pe-hover { outline: 2px solid #6366f1 !important; outline-offset: 2px; background: rgba(99,102,241,.06) !important; }
 .${PENDING_CLASS} { outline: 2px dashed #f59e0b !important; outline-offset: 2px; animation: pe-pulse 1.6s ease-in-out infinite; }
 .${HIGHLIGHT_CLASS} { animation: pe-flash 1.6s ease-out; }
+::highlight(${HIGHLIGHT_NAME}) {
+  background-color: rgba(34,197,94,.42);
+  color: inherit;
+}
 @keyframes pe-pulse { 0%,100% { outline-color: #f59e0b; } 50% { outline-color: rgba(245,158,11,.25); } }
 @keyframes pe-flash {
   0% { background-color: rgba(34,197,94,.35); }

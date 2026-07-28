@@ -218,3 +218,8 @@ button:disabled { opacity: .5; cursor: default; }
   flex: 0 0 auto; margin-bottom: 14px; font-size: 12px; padding: 6px 12px;
   background: var(--accent); border-color: var(--accent); border-radius: 7px; color: #fff;
 }
+
+.scrub-hint { margin: 10px 18px 0; font-size: 12px; color: var(--muted); }
+.scrub-hint kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.version.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.version.active .seq { color: var(--accent); }

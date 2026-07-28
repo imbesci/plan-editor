@@ -236,3 +236,37 @@ describe("multi-element anchors", () => {
     restore();
   });
 });
+
+describe("text changes for word-level highlighting", () => {
+  test("reports before and after text for a changed element", () => {
+    const { document, restore } = setup(PAGE);
+
+    const result = morphDocument(document.documentElement, PAGE.replace("Alpha body.", "Rewritten alpha body."), []);
+
+    assert.equal(result.textChanges.length, 1, "only the element whose text moved should be reported");
+    assert.equal(result.textChanges[0]?.element.id, "a-body");
+    assert.equal(result.textChanges[0]?.before, "Alpha body.");
+    assert.equal(result.textChanges[0]?.after, "Rewritten alpha body.");
+    restore();
+  });
+
+  test("an identical document reports no text changes", () => {
+    const { document, restore } = setup(PAGE);
+    assert.deepEqual(morphDocument(document.documentElement, PAGE, []).textChanges, []);
+    restore();
+  });
+
+  test("an element that changed without its text moving is not a text change", () => {
+    // Flooding a paragraph in green because an attribute moved is exactly the
+    // over-highlighting this exists to avoid — but the caller still needs to
+    // know something changed, so it stays in `changed`.
+    const { document, restore } = setup(PAGE);
+    const withClass = PAGE.replace('<p id="a-body">', '<p id="a-body" class="lead">');
+
+    const result = morphDocument(document.documentElement, withClass, []);
+
+    assert.ok(result.changed.some((element) => element.id === "a-body"), "still reported as changed");
+    assert.equal(result.textChanges.length, 0, "but not as a text change");
+    restore();
+  });
+});
