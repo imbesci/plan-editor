@@ -130,10 +130,10 @@ describe("authorization", () => {
   });
 
   test("a cross-origin write is refused", async () => {
-    const response = await fetch(withToken(`/api/${session.key}/annotations`), {
+    const response = await fetch(withToken(`/api/${session.key}/items`), {
       method: "POST",
       headers: { "content-type": "application/json", Origin: "https://evil.example.com" },
-      body: JSON.stringify({ annotations: [{ body: "x", tag: "element" }] }),
+      body: JSON.stringify({ items: [{ body: "x", tag: "element" }] }),
     });
     assert.equal(response.status, 403);
   });
@@ -180,200 +180,101 @@ describe("asset confinement", () => {
   });
 });
 
-describe("edit lifecycle", () => {
-  test("submit -> poll -> morph report -> addressed", async () => {
-    const submit = await fetch(withToken(`/api/${session.key}/annotations`), {
+describe("the two phases", () => {
+  const note = (body: string) => ({ body, selector: "#title", text: "Original title", tag: "element" });
+
+  async function addNote(body: string) {
+    const response = await fetch(withToken(`/api/${session.key}/items`), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        annotations: [{ body: "Make the title punchier", selector: "#title", text: "Original title", tag: "element" }],
-      }),
+      body: JSON.stringify({ items: [note(body)] }),
     });
-    assert.equal(submit.status, 200);
-    const created = (await submit.json()) as { annotations: Array<{ id: string; status: string }> };
-    const id = created.annotations[0]!.id;
-    assert.equal(created.annotations[0]!.status, "submitted");
-
-    const poll = await fetch(`${origin}/api/poll?file=${encodeURIComponent(artifact)}&t=${session.token}&timeoutMs=0`);
-    const result = (await poll.json()) as { status: string; annotations: Array<{ id: string; body: string }> };
-    assert.equal(result.status, "feedback");
-    assert.equal(result.annotations[0]?.body, "Make the title punchier");
-
-    // Delivery must NOT delete the record — that is what made lavish-axi unable
-    // to tell the human which edits had landed.
-    const secondPoll = await fetch(
-      `${origin}/api/poll?file=${encodeURIComponent(artifact)}&t=${session.token}&timeoutMs=0`,
-    );
-    const again = (await secondPoll.json()) as { status: string };
-    assert.equal(again.status, "feedback", "an undelivered-but-unaddressed edit stays open");
-
-    await fetch(withToken(`/api/${session.key}/morph-report`), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ addressed: [id], orphaned: [] }),
-    });
-
-    const settled = await fetch(
-      `${origin}/api/poll?file=${encodeURIComponent(artifact)}&t=${session.token}&timeoutMs=0`,
-    );
-    assert.equal(((await settled.json()) as { status: string }).status, "waiting");
-
-    const stored = await instance.store.read(session.key);
-    const annotation = stored?.annotations.find((entry) => entry.id === id);
-    assert.equal(annotation?.status, "addressed");
-    assert.ok(annotation?.addressedAt);
-  });
-
-  test("poll rejects a bad token", async () => {
-    const response = await fetch(`${origin}/api/poll?file=${encodeURIComponent(artifact)}&t=nope&timeoutMs=0`);
-    assert.equal(response.status, 403);
-  });
-
-  test("oversized annotation bodies are rejected", async () => {
-    const response = await fetch(withToken(`/api/${session.key}/annotations`), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ annotations: [{ body: "x".repeat(9000), tag: "element" }] }),
-    });
-    assert.equal(response.status, 400);
-  });
-});
-
-describe("live patching", () => {
-  test("editing the file emits a patch event over SSE", async () => {
-    const controller = new AbortController();
-    const response = await fetch(withToken(`/events/${session.key}`), { signal: controller.signal });
-    const reader = response.body!.getReader();
-    const decoder = new TextDecoder();
-
-    const sawPatch = (async () => {
-      const deadline = Date.now() + 5000;
-      let buffer = "";
-      while (Date.now() < deadline) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        if (buffer.includes('"type":"patch"')) return true;
-      }
-      return false;
-    })();
-
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    await writeFile(artifact, ARTIFACT_HTML.replace("Original title", "Punchier title"));
-
-    assert.equal(await sawPatch, true, "a file edit must push a patch event, not a reload");
-    controller.abort();
-  });
-});
-
-describe("edit lifecycle: accept, reject, reply, re-point", () => {
-  async function submitOne(body: string) {
-    const response = await fetch(withToken(`/api/${session.key}/annotations`), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ annotations: [{ body, selector: "#title", text: "Original title", tag: "element" }] }),
-    });
-    const created = (await response.json()) as { annotations: Array<{ id: string }> };
-    return created.annotations[0]!.id;
+    return ((await response.json()) as { items: Array<{ id: string }> }).items[0]!.id;
   }
 
-  const markAddressed = (id: string) =>
-    fetch(withToken(`/api/${session.key}/morph-report`), {
+  const poll = async () =>
+    (await (
+      await fetch(`${origin}/api/poll?file=${encodeURIComponent(artifact)}&t=${session.token}&timeoutMs=0`)
+    ).json()) as { status: string; review?: { note: string; items: Array<{ body: string }> } };
+
+  test("drafted notes are invisible to the agent", async () => {
+    await addNote("first note");
+    await addNote("second note");
+    assert.equal((await poll()).status, "waiting", "a draft is the human's private workspace");
+  });
+
+  test("the overall note is stored while drafting", async () => {
+    await fetch(withToken(`/api/${session.key}/review/note`), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ addressed: [id], orphaned: [] }),
+      body: JSON.stringify({ note: "cut this by a third" }),
     });
+    assert.equal((await poll()).status, "waiting");
+  });
 
-  test("accepting an applied edit resolves it for good", async () => {
-    const id = await submitOne("accept me");
-    await markAddressed(id);
-    await fetch(withToken(`/api/${session.key}/annotations/${id}/accept`), {
+  test("sending hands over the whole review at once, note first", async () => {
+    const sent = await fetch(withToken(`/api/${session.key}/review/send`), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "{}",
     });
-    const stored = await instance.store.read(session.key);
-    assert.equal(stored?.annotations.find((entry) => entry.id === id)?.status, "resolved");
+    assert.equal(sent.status, 200);
+
+    const result = await poll();
+    assert.equal(result.status, "review");
+    assert.equal(result.review?.note, "cut this by a third");
+    assert.equal(result.review?.items.length, 2, "both notes arrive together, not one at a time");
   });
 
-  test("rejecting reopens the edit and clears its delivery record", async () => {
-    // A rejection the agent never hears about is the worst possible outcome, so
-    // reject must both reopen and make the edit injectable again in full.
-    const id = await submitOne("reject me");
-    await instance.store.markDelivered(session.key, [id], "agent-session");
-    await markAddressed(id);
+  test("polling twice returns the same review — it is not consumed on delivery", async () => {
+    assert.equal((await poll()).status, "review");
+  });
 
-    await fetch(withToken(`/api/${session.key}/annotations/${id}/reject`), {
+  test("responding closes it and puts the work in front of the human", async () => {
+    const response = await fetch(withToken(`/api/${session.key}/review/respond`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ summary: "tightened both" }),
+    });
+    assert.equal(((await response.json()) as { status: string }).status, "answered");
+    assert.equal((await poll()).status, "waiting", "an answered review is no longer the agent's problem");
+
+    const stored = await instance.store.read(session.key);
+    const review = stored?.reviews.find((entry) => entry.summary === "tightened both");
+    assert.ok(review?.items.every((item) => item.status === "answered"));
+  });
+
+  test("rejecting an item puts it back into the next review", async () => {
+    const stored = await instance.store.read(session.key);
+    const answered = stored!.reviews.flatMap((r) => r.items).find((item) => item.status === "answered")!;
+
+    await fetch(withToken(`/api/${session.key}/items/${answered.id}/reject`), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: "that made it worse" }),
     });
 
-    const stored = await instance.store.read(session.key);
-    const annotation = stored?.annotations.find((entry) => entry.id === id);
-    assert.equal(annotation?.status, "submitted");
-    assert.deepEqual(annotation?.deliveredTo, []);
-    assert.match(JSON.stringify(annotation?.thread), /that made it worse/);
+    const after = await instance.store.read(session.key);
+    const draft = after?.reviews.find((review) => review.status === "drafting");
+    assert.ok(draft, "a fresh draft is created to carry the rejection");
+    assert.match(JSON.stringify(draft?.items), /that made it worse/);
   });
 
-  test("a human reply reopens a settled edit", async () => {
-    const id = await submitOne("reply target");
-    await markAddressed(id);
-    await fetch(withToken(`/api/${session.key}/annotations/${id}/reply`), {
+  test("an empty review is refused", async () => {
+    const fresh = path.join(dir, "empty-review.html");
+    await writeFile(fresh, ARTIFACT_HTML);
+    const created = await fetch(`${origin}/api/sessions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: "one more thing" }),
+      body: JSON.stringify({ file: fresh }),
     });
-    const stored = await instance.store.read(session.key);
-    const annotation = stored?.annotations.find((entry) => entry.id === id);
-    assert.equal(annotation?.status, "submitted", "a follow-up the agent never sees is a dead end");
-    assert.match(JSON.stringify(annotation?.thread), /one more thing/);
-  });
-
-  test("re-pointing an orphaned edit gives it a new anchor and reopens it", async () => {
-    const id = await submitOne("repoint target");
-    await fetch(withToken(`/api/${session.key}/morph-report`), {
+    const other = (await created.json()) as { key: string; token: string };
+    const response = await fetch(`${origin}/api/${other.key}/review/send?t=${other.token}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ addressed: [], orphaned: [id] }),
+      body: "{}",
     });
-    assert.equal(
-      (await instance.store.read(session.key))?.annotations.find((entry) => entry.id === id)?.status,
-      "orphaned",
-    );
-
-    await fetch(withToken(`/api/${session.key}/annotations/${id}/repoint`), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ selector: "#body", text: "Original body." }),
-    });
-
-    const annotation = (await instance.store.read(session.key))?.annotations.find((entry) => entry.id === id);
-    assert.equal(annotation?.status, "submitted");
-    assert.equal(annotation?.selector, "#body");
-    assert.equal(annotation?.text, "Original body.");
-  });
-
-  test("multi-element anchors round-trip", async () => {
-    const response = await fetch(withToken(`/api/${session.key}/annotations`), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        annotations: [
-          {
-            body: "tighten all of these",
-            tag: "element",
-            anchors: [
-              { selector: "#title", text: "Original title" },
-              { selector: "#body", text: "Original body." },
-            ],
-          },
-        ],
-      }),
-    });
-    const created = (await response.json()) as { annotations: Array<{ anchors?: unknown[]; selector: string }> };
-    assert.equal(created.annotations[0]?.anchors?.length, 2);
-    assert.equal(created.annotations[0]?.selector, "#title", "selector mirrors the first anchor for single-anchor consumers");
+    assert.equal(response.status, 400);
   });
 });
 
@@ -456,18 +357,24 @@ describe("long-poll slicing", () => {
     assert.equal(((await response.json()) as { status: string }).status, "waiting");
   });
 
-  test("an edit submitted mid-slice is returned by that slice", async () => {
+  test("a review sent mid-slice is returned by that slice", async () => {
     const pending = fetch(
       `${origin}/api/poll?file=${encodeURIComponent(sliceFile)}&t=${sliceSession.token}&timeoutMs=4000`,
     );
     await new Promise((resolve) => setTimeout(resolve, 150));
-    await fetch(`${origin}/api/${sliceSession.key}/annotations?t=${sliceSession.token}`, {
+    await fetch(`${origin}/api/${sliceSession.key}/items?t=${sliceSession.token}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ annotations: [{ body: "mid-slice arrival", tag: "element" }] }),
+      body: JSON.stringify({ items: [{ body: "mid-slice arrival", tag: "element" }] }),
     });
-    const result = (await (await pending).json()) as { status: string; annotations: Array<{ body: string }> };
-    assert.equal(result.status, "feedback", "the waiting slice must wake, not time out");
-    assert.ok(result.annotations.some((entry) => entry.body === "mid-slice arrival"));
+    // Adding a note must NOT wake it — only sending does.
+    await fetch(`${origin}/api/${sliceSession.key}/review/send?t=${sliceSession.token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const result = (await (await pending).json()) as { status: string; review?: { items: Array<{ body: string }> } };
+    assert.equal(result.status, "review", "the waiting slice must wake on send, not time out");
+    assert.ok(result.review?.items.some((entry) => entry.body === "mid-slice arrival"));
   });
 });

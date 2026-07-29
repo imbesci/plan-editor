@@ -25,7 +25,9 @@ async function freshStore(): Promise<SessionStore> {
   return store;
 }
 
-describe("SessionStore", () => {
+const note = (body: string, selector = "#a") => ({ body, selector, text: "anchor text", tag: "element" as const });
+
+describe("SessionStore — sessions", () => {
   test("opening the same file twice keeps one session, one token", async () => {
     const store = await freshStore();
     const canonical = await canonicalFile(artifact);
@@ -36,40 +38,6 @@ describe("SessionStore", () => {
     assert.equal((await store.list()).length, 1);
   });
 
-  test("concurrent submits do not lose annotations", async () => {
-    // The bug this store exists to prevent: with `await read` ... `await write`
-    // and no queue, two concurrent handlers read the same snapshot and the
-    // second write discards the first's annotation.
-    const store = await freshStore();
-    const canonical = await canonicalFile(artifact);
-    const session = await store.open(canonical);
-
-    const submissions = Array.from({ length: 25 }, (_, index) =>
-      store.addAnnotations(session.key, [
-        { body: `edit ${index}`, selector: `#s${index}`, text: "", tag: "element" as const },
-      ]),
-    );
-    await Promise.all(submissions);
-
-    const stored = await store.read(session.key);
-    assert.equal(stored?.annotations.length, 25, "every concurrent submit must survive");
-    const bodies = new Set(stored?.annotations.map((entry) => entry.body));
-    assert.equal(bodies.size, 25, "no annotation may be overwritten by a stale snapshot");
-  });
-
-  test("a concurrent end and submit both land", async () => {
-    const store = await freshStore();
-    const canonical = await canonicalFile(artifact);
-    const session = await store.open(canonical);
-    await Promise.all([
-      store.addAnnotations(session.key, [{ body: "late edit", selector: "", text: "", tag: "element" }]),
-      store.end(session.key, "user"),
-    ]);
-    const stored = await store.read(session.key);
-    assert.equal(stored?.status, "ended");
-    assert.equal(stored?.annotations.length, 1, "an in-flight submit must not be dropped by the end");
-  });
-
   test("sessions are independent files, so one project cannot clobber another", async () => {
     const store = await freshStore();
     const other = path.join(dir, "other.html");
@@ -77,61 +45,204 @@ describe("SessionStore", () => {
     const a = await store.open(await canonicalFile(artifact));
     const b = await store.open(await canonicalFile(other));
 
-    await Promise.all([
-      store.addAnnotations(a.key, [{ body: "a", selector: "", text: "", tag: "element" }]),
-      store.addAnnotations(b.key, [{ body: "b", selector: "", text: "", tag: "element" }]),
-    ]);
+    await Promise.all([store.addItems(a.key, [note("a")]), store.addItems(b.key, [note("b")])]);
 
-    assert.equal((await store.read(a.key))?.annotations.length, 1);
-    assert.equal((await store.read(b.key))?.annotations.length, 1);
+    assert.equal((await store.read(a.key))?.reviews[0]?.items.length, 1);
+    assert.equal((await store.read(b.key))?.reviews[0]?.items.length, 1);
   });
 
-  test("morph report marks addressed and orphaned annotations", async () => {
+  test("concurrent note additions do not lose any", async () => {
+    // `await read` … `await write` without a queue means two handlers read the
+    // same snapshot and the second write silently discards the first.
     const store = await freshStore();
     const session = await store.open(await canonicalFile(artifact));
-    const created = await store.addAnnotations(session.key, [
-      { body: "one", selector: "#a", text: "", tag: "element" },
-      { body: "two", selector: "#b", text: "", tag: "element" },
-      { body: "three", selector: "#c", text: "", tag: "element" },
-    ]);
-    assert.ok(created);
-    const [one, two, three] = created;
 
-    await store.applyMorphReport(session.key, { addressed: [one!.id], orphaned: [two!.id] });
+    await Promise.all(Array.from({ length: 25 }, (_, index) => store.addItems(session.key, [note(`note ${index}`)])));
+
+    const items = (await store.read(session.key))?.reviews[0]?.items ?? [];
+    assert.equal(items.length, 25, "every concurrent addition must survive");
+    assert.equal(new Set(items.map((item) => item.body)).size, 25, "none may be overwritten by a stale snapshot");
+  });
+
+  test("sessionKey is stable and path-derived", () => {
+    assert.equal(sessionKey("/tmp/a.html"), sessionKey("/tmp/a.html"));
+    assert.notEqual(sessionKey("/tmp/a.html"), sessionKey("/tmp/b.html"));
+  });
+});
+
+describe("the markup phase is private", () => {
+  test("notes accumulate in a draft the agent cannot see", async () => {
+    const store = await freshStore();
+    const session = await store.open(await canonicalFile(artifact));
+
+    await store.addItems(session.key, [note("first"), note("second")]);
+    await store.setDraftNote(session.key, "cut this by a third");
+
+    assert.equal(await store.pendingReview(session.key), null, "a draft must never reach the agent");
+    const draft = (await store.read(session.key))?.reviews[0];
+    assert.equal(draft?.status, "drafting");
+    assert.equal(draft?.items.length, 2);
+    assert.equal(draft?.note, "cut this by a third");
+  });
+
+  test("a draft survives a reload — it is server state, not browser state", async () => {
+    const store = await freshStore();
+    const session = await store.open(await canonicalFile(artifact));
+    await store.addItems(session.key, [note("keep me")]);
+
+    const reread = new SessionStore(store.dir.replace(/\/sessions$/, ""));
+    assert.equal((await reread.read(session.key))?.reviews[0]?.items[0]?.body, "keep me");
+  });
+
+  test("notes can be removed while drafting", async () => {
+    const store = await freshStore();
+    const session = await store.open(await canonicalFile(artifact));
+    const created = await store.addItems(session.key, [note("mistake"), note("keeper")]);
+    await store.removeItem(session.key, created![0]!.id);
+
+    const items = (await store.read(session.key))?.reviews[0]?.items ?? [];
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.body, "keeper");
+  });
+
+  test("sending is the one moment anything crosses to the agent", async () => {
+    const store = await freshStore();
+    const session = await store.open(await canonicalFile(artifact));
+    await store.addItems(session.key, [note("do this")]);
+    await store.setDraftNote(session.key, "overall guidance");
+
+    const sent = await store.sendReview(session.key);
+    assert.equal(sent?.status, "sent");
+    assert.equal(sent?.note, "overall guidance", "the overall note travels with the review");
+    assert.equal(sent?.items[0]?.status, "sent");
+
+    const pending = await store.pendingReview(session.key);
+    assert.equal(pending?.id, sent?.id);
+  });
+
+  test("an empty review cannot be sent", async () => {
+    const store = await freshStore();
+    const session = await store.open(await canonicalFile(artifact));
+    assert.equal(await store.sendReview(session.key), null);
+  });
+
+  test("a review with only an overall note can be sent", async () => {
+    // "The tone is too hedged throughout" is a complete review on its own.
+    const store = await freshStore();
+    const session = await store.open(await canonicalFile(artifact));
+    await store.setDraftNote(session.key, "the tone is too hedged throughout");
+    assert.equal((await store.sendReview(session.key))?.status, "sent");
+  });
+
+  test("new notes after sending start a fresh draft", async () => {
+    const store = await freshStore();
+    const session = await store.open(await canonicalFile(artifact));
+    await store.addItems(session.key, [note("round one")]);
+    await store.sendReview(session.key);
+    await store.addItems(session.key, [note("round two")]);
 
     const stored = await store.read(session.key);
-    const byId = new Map(stored?.annotations.map((entry) => [entry.id, entry.status]));
-    assert.equal(byId.get(one!.id), "addressed");
-    assert.equal(byId.get(two!.id), "orphaned");
-    assert.equal(byId.get(three!.id), "submitted", "untouched annotations stay open");
+    assert.equal(stored?.reviews.length, 2);
+    assert.equal(stored?.reviews[0]?.status, "sent");
+    assert.equal(stored?.reviews[1]?.status, "drafting");
   });
+});
 
-  test("openAnnotations returns only submitted ones", async () => {
+describe("the agent's response", () => {
+  async function sentSession() {
     const store = await freshStore();
     const session = await store.open(await canonicalFile(artifact));
-    const created = await store.addAnnotations(session.key, [
-      { body: "open", selector: "", text: "", tag: "element" },
-      { body: "done", selector: "", text: "", tag: "element" },
-    ]);
-    await store.setAnnotationStatus(session.key, created![1]!.id, "addressed");
-    const open = await store.openAnnotations(session.key);
-    assert.equal(open.length, 1);
-    assert.equal(open[0]?.body, "open");
+    const created = await store.addItems(session.key, [note("one"), note("two")]);
+    await store.sendReview(session.key);
+    return { store, key: session.key, ids: created!.map((item) => item.id) };
+  }
+
+  test("the morph marks touched items answered", async () => {
+    const { store, key, ids } = await sentSession();
+    await store.applyMorphReport(key, { addressed: [ids[0]!], orphaned: [] });
+
+    const items = (await store.read(key))?.reviews[0]?.items ?? [];
+    assert.equal(items[0]?.status, "answered");
+    assert.equal(items[0]?.outcome, "applied");
+    assert.equal(items[1]?.status, "sent", "an untouched item is still with the agent");
   });
 
-  test("state survives a torn write attempt (atomic rename)", async () => {
+  test("responding answers everything the agent did not speak to", async () => {
+    // Silence would otherwise leave items stuck with no way for the human to act.
+    const { store, key } = await sentSession();
+    const review = await store.respondToReview(key, "tightened both, dropped a heading");
+
+    assert.equal(review?.status, "answered");
+    assert.equal(review?.summary, "tightened both, dropped a heading");
+    assert.ok(review?.items.every((item) => item.status === "answered"));
+  });
+
+  test("an agent can flag one item rather than guessing", async () => {
+    const { store, key, ids } = await sentSession();
+    await store.answerItem(key, ids[0]!, "needs-call", "two of your notes contradict here");
+
+    const item = (await store.read(key))?.reviews[0]?.items[0];
+    assert.equal(item?.outcome, "needs-call");
+    assert.equal(item?.agentNote, "two of your notes contradict here");
+  });
+
+  test("responding does not overwrite an outcome the agent already set", async () => {
+    const { store, key, ids } = await sentSession();
+    await store.answerItem(key, ids[0]!, "skipped", "conflicts with the overall note");
+    await store.respondToReview(key, "done");
+
+    assert.equal((await store.read(key))?.reviews[0]?.items[0]?.outcome, "skipped");
+  });
+});
+
+describe("the human's verdict", () => {
+  async function answeredSession() {
     const store = await freshStore();
     const session = await store.open(await canonicalFile(artifact));
-    await store.addAnnotations(session.key, [{ body: "keep me", selector: "", text: "", tag: "element" }]);
-    // Reading immediately after a write must always yield parseable JSON; a
-    // truncate-in-place write could expose a partial document here.
-    for (let i = 0; i < 20; i += 1) {
-      void store.addChat(session.key, "agent", `tick ${i}`);
-    }
-    const stored = await store.read(session.key);
-    assert.ok(stored, "session file must always parse");
+    const created = await store.addItems(session.key, [note("one"), note("two")]);
+    await store.sendReview(session.key);
+    await store.respondToReview(session.key, "done");
+    return { store, key: session.key, ids: created!.map((item) => item.id) };
+  }
+
+  test("accepting settles an item", async () => {
+    const { store, key, ids } = await answeredSession();
+    await store.setItemVerdict(key, ids[0]!, "accepted");
+    assert.equal((await store.read(key))?.reviews[0]?.items[0]?.status, "accepted");
   });
 
+  test("a review closes once every item has a verdict", async () => {
+    const { store, key, ids } = await answeredSession();
+    await store.setItemVerdict(key, ids[0]!, "accepted");
+    assert.notEqual((await store.read(key))?.reviews[0]?.status, "closed");
+    await store.setItemVerdict(key, ids[1]!, "accepted");
+    assert.equal((await store.read(key))?.reviews[0]?.status, "closed");
+  });
+
+  test("rejecting carries the reason into the next review", async () => {
+    // A rejection the agent never hears about is the worst possible outcome.
+    const { store, key, ids } = await answeredSession();
+    await store.setItemVerdict(key, ids[0]!, "rejected", "that made it worse");
+    const moved = await store.requeueRejected(key);
+
+    assert.equal(moved, 1);
+    const draft = (await store.read(key))?.reviews.find((review) => review.status === "drafting");
+    assert.equal(draft?.items.length, 1);
+    assert.match(draft!.items[0]!.body, /previously rejected: that made it worse/);
+  });
+
+  test("requeueing twice does not duplicate the item", async () => {
+    const { store, key, ids } = await answeredSession();
+    await store.setItemVerdict(key, ids[0]!, "rejected", "no");
+    await store.requeueRejected(key);
+    await store.requeueRejected(key);
+
+    const draft = (await store.read(key))?.reviews.find((review) => review.status === "drafting");
+    assert.equal(draft?.items.length, 1);
+  });
+});
+
+describe("housekeeping", () => {
   test("prune drops old ended sessions only", async () => {
     const store = await freshStore();
     const openSession = await store.open(await canonicalFile(artifact));
@@ -146,8 +257,16 @@ describe("SessionStore", () => {
     assert.equal(await store.read(endedSession.key), null);
   });
 
-  test("sessionKey is stable and path-derived", () => {
-    assert.equal(sessionKey("/tmp/a.html"), sessionKey("/tmp/a.html"));
-    assert.notEqual(sessionKey("/tmp/a.html"), sessionKey("/tmp/b.html"));
+  test("a record written before reviews existed still loads", async () => {
+    const store = await freshStore();
+    const session = await store.open(await canonicalFile(artifact));
+    const file = path.join(store.dir, `${session.key}.json`);
+    await writeFile(
+      file,
+      JSON.stringify({ ...session, reviews: undefined, annotations: [{ id: "old", body: "legacy" }] }),
+    );
+
+    const loaded = await store.read(session.key);
+    assert.deepEqual(loaded?.reviews, [], "legacy annotations are dropped rather than crashing the read");
   });
 });

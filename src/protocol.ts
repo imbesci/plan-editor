@@ -3,12 +3,15 @@
 // the types so a malformed POST is rejected at the edge instead of corrupting a
 // session record.
 
-export type AnnotationStatus =
-  | "draft" // exists in the browser only; never reaches the server
-  | "submitted" // waiting for the agent
-  | "addressed" // the agent's edit touched the anchored element
-  | "resolved" // human accepted the change
-  | "orphaned"; // the anchored element vanished across an edit
+// ---------------------------------------------------------------------------
+// A review is the unit of exchange, not an individual note.
+//
+// The live model sent every note the moment it was written, so the agent acted
+// on each one blind to what came next — three separate instructions about one
+// paragraph landed as three rewrites that cancelled out. Marking up in full and
+// sending once gives the agent the *shape* of the intent, and freezes the
+// document while the human is reading it.
+// ---------------------------------------------------------------------------
 
 export interface Anchor {
   selector: string;
@@ -21,37 +24,66 @@ export interface ThreadMessage {
   at: string;
 }
 
-export interface Annotation {
+export type ReviewStatus =
+  | "drafting" // being marked up; the agent knows nothing about it
+  | "sent" // handed to the agent as one batch
+  | "answered" // the agent has dealt with every item
+  | "closed"; // the human has accepted or rejected each item
+
+export type ItemStatus =
+  | "draft"
+  | "sent"
+  | "answered" // the agent responded — awaiting the human's accept/reject
+  | "accepted"
+  | "rejected"
+  | "orphaned"; // the anchor vanished
+
+/** How the agent answered one item. */
+export type ItemOutcome =
+  | "applied" // done as asked
+  | "caveat" // done, but with a caveat the human should read
+  | "needs-call" // ambiguous; the agent wants a decision rather than guessing
+  | "skipped"; // deliberately not done, with a reason
+
+export interface ReviewItem {
   id: string;
-  /** What the human wants. Either a literal edit or an open-ended prompt. */
+  /** What the human wants changed. */
   body: string;
-  /** Structural hint for the agent. Never treated as durable identity. */
+  /** Structural hint for the agent. Never durable identity. */
   selector: string;
-  /** Snippet of the anchored content, for agent context and for re-anchoring. */
+  /** Snippet of the anchored content, for context and re-anchoring. */
   text: string;
-  /**
-   * Every element this edit covers, when it spans more than one. `selector` and
-   * `text` mirror the first entry so single-anchor consumers need no changes.
-   */
+  /** Every element this item covers; several when chunk-selected. */
   anchors?: Anchor[];
-  /** How the anchor was made: a clicked element, a text selection, or chat. */
-  tag: "element" | "text" | "message";
-  status: AnnotationStatus;
-  createdAt: string;
-  submittedAt?: string;
-  /**
-   * Agent sessions this edit's full text has already been injected into.
-   * Per-session rather than a single stamp: otherwise one agent seeing it first
-   * downgrades every other agent — including the authoring one — to a bare count.
-   */
-  deliveredTo?: string[];
-  addressedAt?: string;
-  /** Optional note the agent leaves when it marks something addressed. */
+  tag: "element" | "text" | "page";
+  status: ItemStatus;
+  outcome?: ItemOutcome;
+  /** The agent's note about how it handled this item. */
   agentNote?: string;
-  /** Back-and-forth on this specific edit, including rejection reasons. */
   thread?: ThreadMessage[];
-  /** Artifact version this edit was made against. */
-  versionSeq?: number;
+  createdAt: string;
+  answeredAt?: string;
+  /** Carried into a later review after rejection; prevents duplicating it. */
+  requeued?: boolean;
+}
+
+export interface Review {
+  id: string;
+  /**
+   * The review-level note: "cut this by a third", "the tone is too hedged".
+   * This is the context that makes the individual items interpretable, which is
+   * why it is a first-class field rather than another pinned comment.
+   */
+  note: string;
+  status: ReviewStatus;
+  items: ReviewItem[];
+  /** The agent's overall response to the review. */
+  summary?: string;
+  createdAt: string;
+  sentAt?: string;
+  answeredAt?: string;
+  /** Agent sessions this review's text has already been injected into. */
+  deliveredTo?: string[];
 }
 
 export interface ChatMessage {
@@ -62,6 +94,8 @@ export interface ChatMessage {
 
 export interface Session {
   key: string;
+  /** Newest last. At most one is ever `drafting`. */
+  reviews: Review[];
   /** Capability token. Required on every session-scoped route. */
   token: string;
   /** Canonical (realpath-resolved) artifact path. */
@@ -75,7 +109,6 @@ export interface Session {
   authoredBy?: string;
   /** cwd at open time; the fallback route when there is no session id. */
   authoredIn?: string;
-  annotations: Annotation[];
   chat: ChatMessage[];
   createdAt: string;
   updatedAt: string;
@@ -86,7 +119,7 @@ export type ServerEvent =
   | { type: "patch"; reason: "file-changed" }
   | { type: "agent-activity"; active: boolean }
   | { type: "agent-reply"; text: string }
-  | { type: "sync"; annotations: Annotation[]; chat: ChatMessage[] }
+  | { type: "sync"; reviews: Review[]; chat: ChatMessage[] }
   | { type: "versions"; list: VersionMeta[] }
   | { type: "presence"; state: AgentPresence; agent: AgentIdentityView };
 
@@ -109,16 +142,11 @@ export interface AgentIdentityView {
   viaHooks: boolean;
 }
 
-/** Agent-facing poll result. */
+/** Agent-facing poll result. A whole review, never a loose note. */
 export type PollResult =
   | { status: "waiting" }
   | { status: "ended"; endedBy: "user" | "agent" }
-  | {
-      status: "feedback";
-      annotations: Annotation[];
-      sessionEnded?: boolean;
-      endedBy?: "user" | "agent";
-    };
+  | { status: "review"; review: Review; sessionEnded?: boolean; endedBy?: "user" | "agent" };
 
 // ---------------------------------------------------------------------------
 // Validators. Hand-written and total: every field is coerced or rejected, never
@@ -142,15 +170,30 @@ function str(value: unknown, max: number, field: string): string {
   return value;
 }
 
-/** Parses one client-submitted annotation. Server owns id/status/timestamps. */
-export function parseIncomingAnnotation(input: unknown): Omit<Annotation, "id" | "status" | "createdAt"> {
+export function parseReviewNote(input: unknown): string {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  return str(raw.note ?? "", MAX_BODY, "note");
+}
+
+export function parseItemOutcome(value: unknown): ItemOutcome {
+  return value === "caveat" || value === "needs-call" || value === "skipped" ? value : "applied";
+}
+
+/** Parses one client-submitted review item. Server owns id/status/timestamps. */
+export function parseIncomingItem(input: unknown): {
+  body: string;
+  selector: string;
+  text: string;
+  anchors?: Anchor[];
+  tag: ReviewItem["tag"];
+} {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
-    throw new ValidationError("annotation must be an object");
+    throw new ValidationError("item must be an object");
   }
   const raw = input as Record<string, unknown>;
   const body = str(raw.body ?? "", MAX_BODY, "body").trim();
   if (!body) throw new ValidationError("body must not be empty");
-  const tag = raw.tag === "message" ? "message" : raw.tag === "text" ? "text" : "element";
+  const tag = raw.tag === "page" ? "page" : raw.tag === "text" ? "text" : "element";
   const anchors = Array.isArray(raw.anchors)
     ? raw.anchors.slice(0, 40).map((entry) => {
         const anchor = (entry ?? {}) as Record<string, unknown>;
@@ -169,10 +212,10 @@ export function parseIncomingAnnotation(input: unknown): Omit<Annotation, "id" |
   };
 }
 
-export function parseIncomingAnnotations(input: unknown): Array<Omit<Annotation, "id" | "status" | "createdAt">> {
-  if (!Array.isArray(input)) throw new ValidationError("annotations must be an array");
-  if (input.length > 100) throw new ValidationError("too many annotations in one request");
-  return input.map(parseIncomingAnnotation);
+export function parseIncomingItems(input: unknown): ReturnType<typeof parseIncomingItem>[] {
+  if (!Array.isArray(input)) throw new ValidationError("items must be an array");
+  if (input.length > 100) throw new ValidationError("too many items in one request");
+  return input.map(parseIncomingItem);
 }
 
 /** Parses the browser's post-morph report of which annotations were touched. */
@@ -183,10 +226,6 @@ export function parseMorphReport(input: unknown): { addressed: string[]; orphane
     return value.filter((entry): entry is string => typeof entry === "string" && entry.length <= 64).slice(0, 500);
   };
   return { addressed: ids(raw.addressed), orphaned: ids(raw.orphaned) };
-}
-
-export function isOpenAnnotation(annotation: Annotation): boolean {
-  return annotation.status === "submitted";
 }
 
 /** Parses a re-anchor request for an orphaned edit. */

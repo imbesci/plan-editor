@@ -213,17 +213,10 @@ let highlightTimer: number | undefined;
  *
  * Falls back to flashing the whole element where the API is unavailable.
  */
-function highlightChanges(changes: TextChange[], fallback: Element[]): void {
+function highlightChanges(changes: TextChange[]): void {
   const highlights = (CSS as unknown as { highlights?: Map<string, unknown> }).highlights;
   const HighlightCtor = (window as unknown as { Highlight?: new (...ranges: Range[]) => unknown }).Highlight;
-
-  if (!highlights || !HighlightCtor) {
-    for (const element of fallback) {
-      element.classList.add(HIGHLIGHT_CLASS);
-      setTimeout(() => element.classList.remove(HIGHLIGHT_CLASS), 1600);
-    }
-    return;
-  }
+  if (!highlights || !HighlightCtor) return;
 
   const ranges: Range[] = [];
   for (const change of changes) {
@@ -235,15 +228,9 @@ function highlightChanges(changes: TextChange[], fallback: Element[]): void {
     ranges.push(...rangesForWords(change.element, added));
   }
 
-  if (ranges.length === 0) {
-    // The element changed but its text did not (an attribute, a reordering).
-    // Flash the block rather than claiming nothing happened.
-    for (const element of fallback) {
-      element.classList.add(HIGHLIGHT_CLASS);
-      setTimeout(() => element.classList.remove(HIGHLIGHT_CLASS), 1600);
-    }
-    return;
-  }
+  // No words changed means nothing worth pointing at. Flashing the enclosing
+  // block instead is how a one-word edit came to paint a whole section green.
+  if (ranges.length === 0) return;
 
   highlights.set(HIGHLIGHT_NAME, new HighlightCtor(...ranges));
   clearTimeout(highlightTimer);
@@ -279,7 +266,7 @@ function rangesForWords(element: Element, words: string[]): Range[] {
 function applyMorph(html: string): { addressed: string[]; orphaned: string[] } {
   const result = morphDocument(document.documentElement, html, pending.values());
 
-  highlightChanges(result.textChanges, result.changed);
+  highlightChanges(result.textChanges);
 
   const settled = new Set([...result.addressed, ...result.orphaned]);
   for (const [clientId, entry] of pending) {

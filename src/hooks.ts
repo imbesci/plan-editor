@@ -82,14 +82,14 @@ export function decideStop(input: {
   if (blockable.length === 0) return { block: false };
 
   const summary = blockable
-    .map((session) => `${session.file} (${session.openEdits} unaddressed edit${session.openEdits === 1 ? "" : "s"})`)
+    .map((session) => `${session.file}`)
     .join(", ");
   return {
     block: true,
     reason:
-      `The human has submitted edits you have not applied yet: ${summary}. ` +
-      `Apply them by editing the file, then run \`plan-editor poll <file> --reply "<what you changed>"\`. ` +
-      `If you believe the edits are already handled, run \`plan-editor status\` to confirm before finishing.`,
+      `The human sent you a review you have not responded to: ${summary}. ` +
+      `Apply it, then run \`plan-editor respond <file> --summary "<what you changed and why>"\` — that is what puts your ` +
+      `work in front of them. If you believe it is already handled, run \`plan-editor status\` to confirm before finishing.`,
   };
 }
 
@@ -111,7 +111,7 @@ export async function runStopHook(rawInput: string): Promise<{ output: string; e
       key: session.key,
       file: session.file,
       ownership: ownershipOf(session, agent),
-      openEdits: session.annotations.filter((entry) => entry.status === "submitted").length,
+      openEdits: session.reviews.filter((review) => review.status === "sent").length,
     }));
 
   const guard = await readGuard();
@@ -206,53 +206,63 @@ export function ownershipOf(
 export interface InjectionEntry {
   file: string;
   ownership: Ownership;
-  open: Array<{ id: string; body: string; text: string; selector: string; deliveredTo?: string[] }>;
+  /** The pending review, if the human has sent one. */
+  review: {
+    id: string;
+    note: string;
+    items: Array<{ id: string; body: string; text: string; selector: string }>;
+    deliveredTo?: string[];
+  } | null;
   /** Identifies the agent asking, so delivery is tracked per session. */
   agentKey: string;
 }
 
 export interface Injection {
   text: string;
-  /** Ids to stamp as delivered, so their full text is not repeated every prompt. */
+  /** Review ids to stamp as delivered, so the full text is not repeated. */
   deliver: string[];
 }
 
+/**
+ * Describes a *review*, leading with its overall note.
+ *
+ * The note is what makes the individual items interpretable — "cut this by a
+ * third" changes the meaning of every item under it — so it goes first and is
+ * never dropped, even on a repeat injection.
+ */
 export function buildContextInjection(entries: InjectionEntry[]): Injection | null {
-  const withOpen = entries.filter((entry) => entry.open.length > 0 && entry.ownership !== "foreign");
-  if (withOpen.length === 0) return null;
+  const pending = entries.filter((entry) => entry.review && entry.ownership !== "foreign");
+  if (pending.length === 0) return null;
 
   const lines: string[] = [];
   const deliver: string[] = [];
 
-  for (const entry of withOpen) {
-    const seen = (annotation: { deliveredTo?: string[] }) => (annotation.deliveredTo ?? []).includes(entry.agentKey);
-    const fresh = entry.open.filter((annotation) => !seen(annotation));
-    const repeated = entry.open.filter(seen);
-
+  for (const entry of pending) {
+    const review = entry.review!;
+    const seen = (review.deliveredTo ?? []).includes(entry.agentKey);
     lines.push(
       entry.ownership === "same-project"
-        ? `Open edits on ${entry.file} (opened by a different agent session — read the file before applying, you may not have the context behind it):`
-        : `Open edits on ${entry.file}:`,
+        ? `A review is waiting on ${entry.file} (sent from a different agent session — read the file first, you may not have the context behind it):`
+        : `A review is waiting on ${entry.file}:`,
     );
-    for (const annotation of fresh) {
-      const anchor = annotation.text
-        ? ` (on: "${annotation.text.slice(0, 80)}"${annotation.selector ? ` — ${annotation.selector}` : ""})`
-        : "";
-      lines.push(`  • ${annotation.body}${anchor}`);
-      deliver.push(annotation.id);
-    }
-    // Previously delivered edits keep their request text — only the anchor detail
-    // is dropped. Collapsing them to a bare count saved a few tokens and cost the
-    // agent the ability to act at all once the earlier turn left its context.
-    for (const annotation of repeated) {
-      lines.push(`  • ${annotation.body} (still open, listed before)`);
+    if (review.note) lines.push(`  Overall: ${review.note}`);
+
+    if (seen) {
+      lines.push(`  (${review.items.length} item${review.items.length === 1 ? "" : "s"}, listed before and still open)`);
+    } else {
+      for (const item of review.items) {
+        const anchor = item.text ? ` (on: "${item.text.slice(0, 80)}")` : " (whole page)";
+        lines.push(`  • ${item.body}${anchor}`);
+      }
+      deliver.push(review.id);
     }
   }
 
   lines.push(
     "",
-    "Apply these by editing the file directly — the open browser patches itself in place, so never tell the user to reload.",
-    "Each edit is marked applied automatically once your change touches the element it was anchored to.",
+    "Read the overall note and every item before changing anything — they were written as one pass and can pull against each other.",
+    "Apply them by editing the file directly; the open browser patches itself in place, so never tell the user to reload.",
+    "When you are done, run `plan-editor respond <file> --summary \"<what you changed and why>\"` to put your work in front of them.",
   );
 
   return { text: lines.join("\n"), deliver };
@@ -267,28 +277,36 @@ export async function runContextHook(
   const sessions = (await store.list()).filter((session) => session.status === "open");
 
   const agentKey = agent.sessionId ?? `cwd:${agent.cwd ?? "unknown"}`;
-  const entries: InjectionEntry[] = sessions.map((session) => ({
-    file: session.file,
-    ownership: ownershipOf(session, agent),
-    agentKey,
-    open: session.annotations
-      .filter((annotation) => annotation.status === "submitted")
-      .map((annotation) => ({
-        id: annotation.id,
-        body: annotation.body,
-        text: annotation.text,
-        selector: annotation.selector,
-        deliveredTo: annotation.deliveredTo,
-      })),
-  }));
+  const entries: InjectionEntry[] = sessions.map((session) => {
+    const review = session.reviews.find((entry) => entry.status === "sent");
+    return {
+      file: session.file,
+      ownership: ownershipOf(session, agent),
+      agentKey,
+      review: review
+        ? {
+            id: review.id,
+            note: review.note,
+            deliveredTo: review.deliveredTo,
+            items: review.items.map((item) => ({
+              id: item.id,
+              body: item.body,
+              text: item.text,
+              selector: item.selector,
+            })),
+          }
+        : null,
+    };
+  });
 
   const injection = buildContextInjection(entries);
   if (!injection) return "";
 
   for (const session of sessions) {
     if (ownershipOf(session, agent) === "foreign") continue;
-    const ids = injection.deliver.filter((id) => session.annotations.some((entry) => entry.id === id));
-    if (ids.length > 0) await store.markDelivered(session.key, ids, agentKey);
+    for (const id of injection.deliver) {
+      if (session.reviews.some((review) => review.id === id)) await store.markDelivered(session.key, id, agentKey);
+    }
   }
 
   return JSON.stringify({

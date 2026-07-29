@@ -62,14 +62,9 @@ export function renderChrome(session: Session): string {
 
   <aside class="panel" id="panel">
     <div class="panel-head">
-      <h2>Edits</h2>
-      <div class="filters" id="filters">
-        <button class="chip active" data-filter="open" type="button">Open <b id="countOpen">0</b></button>
-        <button class="chip" data-filter="review" type="button">Review <b id="countReview">0</b></button>
-        <button class="chip" data-filter="done" type="button">Done <b id="countDone">0</b></button>
-        <button class="chip" data-filter="all" type="button">All</button>
-      </div>
-      <input id="search" class="search" type="search" placeholder="Filter edits…  ⌘F" autocomplete="off">
+      <h2 id="phaseTitle">Your review</h2>
+      <p class="phase-hint" id="phaseHint">Mark up the whole document, then send it as one review.</p>
+      <input id="search" class="search" type="search" placeholder="Filter notes…  ⌘F" autocomplete="off">
     </div>
 
     <div class="list" id="list"></div>
@@ -79,12 +74,19 @@ export function renderChrome(session: Session): string {
       <div class="chat" id="chatLog"></div>
     </details>
 
-    <div class="composer">
+    <div class="composer" id="composer">
       <div class="target-hint" id="targetHint"></div>
-      <textarea id="input" rows="3" placeholder="Click an element (⇧-click for several), then say what to change…"></textarea>
+      <textarea id="input" rows="2" placeholder="Click an element (⇧-click for several), then say what to change…"></textarea>
+      <button id="addNote" class="add" type="button">Add note</button>
+
+      <label class="overall">
+        <span>Overall note <em>— the context that frames every item</em></span>
+        <textarea id="overall" rows="2" placeholder="e.g. cut this by a third; the tone is too hedged throughout"></textarea>
+      </label>
+
       <div class="actions">
         <button id="end" class="ghost" type="button" title="Close this session and go back to your terminal">End</button>
-        <button id="submit" type="button">Submit</button>
+        <button id="send" type="button">Send review</button>
       </div>
     </div>
   </aside>

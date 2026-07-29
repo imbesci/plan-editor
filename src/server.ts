@@ -12,13 +12,14 @@ import { injectSdk } from "./html-transform.ts";
 import { allowedHostnames, bindHost, defaultPort, hostnameFromHeader, stateDir } from "./paths.ts";
 import type { AgentIdentityView } from "./protocol.ts";
 import {
-  parseIncomingAnnotations,
+  parseIncomingItems,
+  parseItemOutcome,
   parseMorphReport,
   parseRepoint,
+  parseReviewNote,
   parseThreadText,
   ValidationError,
   type AgentPresence,
-  type Annotation,
   type PollResult,
   type Session,
 } from "./protocol.ts";
@@ -273,8 +274,8 @@ export async function serve(options: ServeOptions = {}) {
             file: entry.file,
             name: entry.file.split("/").pop() ?? entry.file,
             url: `/s/${entry.key}?t=${entry.token}`,
-            open: entry.annotations.filter((a) => a.status === "submitted").length,
-            addressed: entry.annotations.filter((a) => a.status === "addressed").length,
+            open: entry.reviews.flatMap((r) => r.items).filter((i) => i.status === "draft").length,
+            addressed: entry.reviews.flatMap((r) => r.items).filter((i) => i.status === "answered").length,
             viewers: sseClients.get(entry.key)?.size ?? 0,
           })),
       });
@@ -342,37 +343,161 @@ export async function serve(options: ServeOptions = {}) {
     }
   });
 
-  app.post("/api/:key/annotations", requireSameOrigin, async (req, res, next) => {
+  // --- markup phase: nothing here reaches the agent ------------------------
+
+  app.post("/api/:key/items", requireSameOrigin, async (req, res, next) => {
     try {
       const session = await loadAuthorized(req, res);
       if (!session) return;
-      const incoming = parseIncomingAnnotations((req.body as Record<string, unknown>)?.annotations);
-      const created = await store.addAnnotations(session.key, incoming);
-      if (!created) {
-        res.status(404).json({ error: "session not found" });
-        return;
-      }
-      // Deliberately NOT workingSessions.add: the human submitting an edit says
-      // nothing about the agent. Marking it here left presence stuck on "agent
-      // working…" from the moment you pressed Submit until something else
-      // cleared it. Only real agent activity (the PostToolUse hook) sets that.
-      events.emit("feedback", session.key);
-      emitPresence(session.key);
+      const incoming = parseIncomingItems((req.body as Record<string, unknown>)?.items);
+      const created = await store.addItems(session.key, incoming);
       await syncBrowsers(session.key);
-      res.json({ status: "queued", annotations: created });
+      res.json({ status: "drafted", items: created ?? [] });
     } catch (error) {
       next(error);
     }
   });
 
+  app.delete("/api/:key/items/:id", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.removeItem(session.key, String(req.params.id));
+      await syncBrowsers(session.key);
+      res.json({ status: "removed" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/review/note", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.setDraftNote(session.key, parseReviewNote(req.body));
+      await syncBrowsers(session.key);
+      res.json({ status: "ok" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /** The one moment anything crosses to the agent. */
+  app.post("/api/:key/review/send", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const review = await store.sendReview(session.key);
+      if (!review) {
+        res.status(400).json({ error: "nothing to send" });
+        return;
+      }
+      events.emit("feedback", session.key);
+      emitPresence(session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: "sent", review });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- agent responses ------------------------------------------------------
+
+  app.post("/api/:key/review/respond", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const summary = String((req.body as Record<string, unknown>)?.summary ?? "");
+      const review = await store.respondToReview(session.key, summary);
+      workingSessions.delete(session.key);
+      if (summary) await store.addChat(session.key, "agent", summary);
+      broadcast(session.key, { type: "agent-reply", text: summary });
+      emitPresence(session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: review ? "answered" : "no-pending-review" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/items/:id/answer", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const item = await store.answerItem(
+        session.key,
+        String(req.params.id),
+        parseItemOutcome(body.outcome),
+        typeof body.note === "string" ? body.note : undefined,
+      );
+      await syncBrowsers(session.key);
+      res.json({ status: item ? "answered" : "not-found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /** The browser's report of which items the agent's edit actually touched. */
   app.post("/api/:key/morph-report", requireSameOrigin, async (req, res, next) => {
     try {
       const session = await loadAuthorized(req, res);
       if (!session) return;
-      const report = parseMorphReport(req.body);
-      const changed = await store.applyMorphReport(session.key, report);
+      const changed = await store.applyMorphReport(session.key, parseMorphReport(req.body));
       await syncBrowsers(session.key);
       res.json({ status: "ok", changed: changed?.length ?? 0 });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- human verdicts on the agent's work -----------------------------------
+
+  app.post("/api/:key/items/:id/accept", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.setItemVerdict(session.key, String(req.params.id), "accepted");
+      await syncBrowsers(session.key);
+      res.json({ status: "accepted" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/items/:id/reject", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.setItemVerdict(session.key, String(req.params.id), "rejected", parseThreadText(req.body));
+      // Rejections belong in the next review, not in limbo.
+      await store.requeueRejected(session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: "requeued" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/items/:id/reply", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.replyToItem(session.key, String(req.params.id), "human", parseThreadText(req.body));
+      await syncBrowsers(session.key);
+      res.json({ status: "ok" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/items/:id/repoint", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.repointItem(session.key, String(req.params.id), parseRepoint(req.body));
+      await syncBrowsers(session.key);
+      res.json({ status: "repointed" });
     } catch (error) {
       next(error);
     }
@@ -488,78 +613,6 @@ export async function serve(options: ServeOptions = {}) {
     }
   });
 
-  // Agent-declared completion. Browser confirmation is the nicer signal, but it
-  // cannot be the ONLY one: a closed, stale or broken tab means no morph report
-  // ever arrives, the edit is stuck at "submitted" forever, and a watching agent
-  // receives its own just-applied edit on every cycle.
-  app.post("/api/:key/annotations/:id/applied", async (req, res, next) => {
-    try {
-      const session = await loadAuthorized(req, res);
-      if (!session) return;
-      const note = typeof (req.body as Record<string, unknown>)?.note === "string"
-        ? String((req.body as Record<string, unknown>).note)
-        : undefined;
-      const updated = await store.setAnnotationStatus(session.key, String(req.params.id), "addressed", note);
-      await syncBrowsers(session.key);
-      res.json({ status: updated ? "addressed" : "not-found" });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/:key/annotations/:id/accept", requireSameOrigin, async (req, res, next) => {
-    try {
-      const session = await loadAuthorized(req, res);
-      if (!session) return;
-      const updated = await store.acceptAnnotation(session.key, String(req.params.id));
-      await syncBrowsers(session.key);
-      res.json({ status: updated ? "resolved" : "unchanged" });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/:key/annotations/:id/reject", requireSameOrigin, async (req, res, next) => {
-    try {
-      const session = await loadAuthorized(req, res);
-      if (!session) return;
-      const reason = parseThreadText(req.body);
-      await store.rejectAnnotation(session.key, String(req.params.id), reason);
-      // Reopened, so the agent must hear about it again.
-      events.emit("feedback", session.key);
-      await syncBrowsers(session.key);
-      res.json({ status: "reopened" });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/:key/annotations/:id/reply", requireSameOrigin, async (req, res, next) => {
-    try {
-      const session = await loadAuthorized(req, res);
-      if (!session) return;
-      await store.replyToAnnotation(session.key, String(req.params.id), "human", parseThreadText(req.body));
-      events.emit("feedback", session.key);
-      await syncBrowsers(session.key);
-      res.json({ status: "ok" });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/:key/annotations/:id/repoint", requireSameOrigin, async (req, res, next) => {
-    try {
-      const session = await loadAuthorized(req, res);
-      if (!session) return;
-      await store.repointAnnotation(session.key, String(req.params.id), parseRepoint(req.body));
-      events.emit("feedback", session.key);
-      await syncBrowsers(session.key);
-      res.json({ status: "repointed" });
-    } catch (error) {
-      next(error);
-    }
-  });
-
   app.get("/api/:key/export", async (req, res, next) => {
     try {
       const session = await loadAuthorized(req, res);
@@ -585,7 +638,7 @@ export async function serve(options: ServeOptions = {}) {
       sseClients.set(session.key, clients);
       refreshIdle();
 
-      res.write(`data: ${JSON.stringify({ type: "sync", annotations: session.annotations, chat: session.chat })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: "sync", reviews: session.reviews, chat: session.chat })}\n\n`);
       res.write(
         `data: ${JSON.stringify({ type: "presence", state: presenceOf(session.key), agent: await agentView(session.key) })}\n\n`,
       );
@@ -668,15 +721,15 @@ export async function serve(options: ServeOptions = {}) {
   async function takeFeedback(key: string): Promise<PollResult> {
     const session = await store.read(key);
     if (!session) return { status: "waiting" };
-    const open = session.annotations.filter((entry) => entry.status === "submitted");
-    if (open.length === 0) {
+    // Only a *sent* review crosses to the agent. A draft is the human's private
+    // workspace, however many notes are in it.
+    const review = session.reviews.find((entry) => entry.status === "sent");
+    if (!review) {
       return session.status === "ended" ? { status: "ended", endedBy: session.endedBy ?? "agent" } : { status: "waiting" };
     }
-    // Annotations are NOT deleted on delivery. They stay as durable records and
-    // transition to `addressed` when the agent's edit actually touches them.
     return {
-      status: "feedback",
-      annotations: open,
+      status: "review",
+      review,
       ...(session.status === "ended" ? { sessionEnded: true, endedBy: session.endedBy ?? "user" } : {}),
     };
   }
@@ -684,7 +737,7 @@ export async function serve(options: ServeOptions = {}) {
   async function syncBrowsers(key: string): Promise<void> {
     const session = await store.read(key);
     if (!session) return;
-    broadcast(key, { type: "sync", annotations: session.annotations, chat: session.chat });
+    broadcast(key, { type: "sync", reviews: session.reviews, chat: session.chat });
   }
 
   // Static browser bundles. `no-cache` means "revalidate every time", not "never
@@ -757,4 +810,3 @@ export async function resolveAsset(root: string, assetPath: string): Promise<str
   }
 }
 
-export type { Annotation };

@@ -335,3 +335,54 @@ button:disabled { opacity: .5; cursor: default; }
   background: var(--bg); color: var(--muted); font-size: 14px;
 }
 .frame-overlay[hidden] { display: none; }
+
+/* --- two-phase panel --- */
+.phase-hint { font-size: 12px; color: var(--muted); margin: 0 4px 8px; line-height: 1.4; }
+.panel-head h2 { padding: 0 4px 2px; }
+
+.overall {
+  display: block; margin-top: 4px;
+  border-top: 1px dashed var(--line); padding-top: 10px;
+}
+.overall > span {
+  display: block; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted); margin-bottom: 5px;
+}
+.overall em { text-transform: none; letter-spacing: 0; font-style: normal; color: var(--faint, var(--muted)); }
+.overall textarea { font-size: 13px; }
+
+.add {
+  flex: 0 0 auto; align-self: flex-start; font-size: 12px; padding: 5px 11px;
+  background: transparent; color: var(--accent); border-color: var(--line);
+}
+.add:hover:not(:disabled) { border-color: var(--accent); }
+
+/* The document is frozen while you mark up; the panel should say so quietly. */
+body[data-phase="sent"] .composer { opacity: .55; pointer-events: none; }
+body[data-phase="sent"] #send { background: var(--pending); border-color: var(--pending); color: #1a1205; }
+
+.overall-note, .summary {
+  border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0; padding: 10px 12px; margin-bottom: 10px;
+  font-size: 13.5px; background: var(--bg);
+}
+.summary { border-left-color: var(--done); }
+.overall-note b, .summary b {
+  display: block; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: .07em; color: var(--muted); margin-bottom: 4px;
+}
+
+.card[data-status="draft"] { border-left-color: var(--accent); }
+.card[data-status="sent"] { border-left-color: var(--pending); }
+.card[data-status="answered"] { border-left-color: var(--done); }
+.card[data-status="accepted"] { border-left-color: var(--done); opacity: .6; }
+.card[data-status="rejected"] { border-left-color: var(--muted); opacity: .6; }
+.card[data-outcome="needs-call"] { border-left-color: var(--pending); }
+.card[data-outcome="skipped"] { border-left-color: var(--muted); }
+
+.outcome {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  padding: 1px 7px; border-radius: 999px; background: var(--done); color: #04220f;
+}
+.outcome.caveat, .outcome[class~="needs-call"] { background: var(--pending); color: #1a1205; }
+.outcome.skipped { background: var(--line); color: var(--muted); }

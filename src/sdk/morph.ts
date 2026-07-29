@@ -57,6 +57,29 @@ function isStructuralRoot(element: Element): boolean {
   return name === "HTML" || name === "HEAD" || name === "BODY";
 }
 
+/**
+ * Our own classes (`pe-pending` on a tracked anchor, `pe-hover`, `pe-changed`)
+ * live on the artifact's real elements, so the live DOM always differs from the
+ * file in ways the agent had nothing to do with. Comparing without them is what
+ * stops the tool highlighting its own bookkeeping — which flooded whole sections
+ * green on every patch.
+ */
+function markupWithoutOurClasses(element: Element): string {
+  if (!/\bpe-[a-z]/.test(element.className || "") && !/\bpe-[a-z]/.test(element.innerHTML)) {
+    return element.outerHTML;
+  }
+  const clone = element.cloneNode(true) as Element;
+  for (const node of [clone, ...clone.querySelectorAll("[class]")]) {
+    const kept = (node.getAttribute("class") ?? "")
+      .split(/\s+/)
+      .filter((name) => name && !name.startsWith("pe-"))
+      .join(" ");
+    if (kept) node.setAttribute("class", kept);
+    else node.removeAttribute("class");
+  }
+  return clone.outerHTML;
+}
+
 function isSdkScript(node: Node): boolean {
   const element = node as Element;
   return element.nodeName === "SCRIPT" && (element.getAttribute?.("src") ?? "").endsWith("/sdk.js");
@@ -104,7 +127,7 @@ export function morphDocument(root: Element, html: string, tracked: Iterable<Tra
         if (oldElement.outerHTML === undefined || newElement.outerHTML === undefined) return true;
         // Identical subtree: skip entirely. Saves work and keeps it out of the
         // changed set, which is what makes the highlight precise.
-        if (oldElement.outerHTML === newElement.outerHTML) return false;
+        if (markupWithoutOurClasses(oldElement) === markupWithoutOurClasses(newElement)) return false;
         if (!isStructuralRoot(oldElement)) {
           changed.add(oldElement);
           // Captured here because the old text no longer exists once the walk

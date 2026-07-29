@@ -10,7 +10,15 @@ import crypto from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 
-import type { Annotation, ChatMessage, Session, ThreadMessage } from "../protocol.ts";
+import type {
+  Anchor,
+  ChatMessage,
+  ItemOutcome,
+  Review,
+  ReviewItem,
+  Session,
+  ThreadMessage,
+} from "../protocol.ts";
 import { queued, writeFileAtomically } from "./atomic.ts";
 
 export function sessionKey(canonicalPath: string): string {
@@ -52,7 +60,11 @@ export class SessionStore {
   async read(key: string): Promise<Session | null> {
     try {
       const raw = await readFile(this.file(key), "utf8");
-      return JSON.parse(raw) as Session;
+      const session = JSON.parse(raw) as Session & { annotations?: unknown[] };
+      // Records written before reviews existed carried a flat annotation list.
+      if (!Array.isArray(session.reviews)) session.reviews = [];
+      if ("annotations" in session) delete session.annotations;
+      return session;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
@@ -120,7 +132,7 @@ export class SessionStore {
         status: "open",
         ...(origin.authoredBy ? { authoredBy: origin.authoredBy } : {}),
         ...(origin.authoredIn ? { authoredIn: origin.authoredIn } : {}),
-        annotations: [],
+        reviews: [],
         chat: [],
         createdAt: now,
         updatedAt: now,
@@ -130,155 +142,235 @@ export class SessionStore {
     });
   }
 
-  async addAnnotations(
+  /** The review currently being marked up, created on demand. */
+  private draftOf(session: Session): Review {
+    const existing = session.reviews.find((review) => review.status === "drafting");
+    if (existing) return existing;
+    const review: Review = {
+      id: newId(),
+      note: "",
+      status: "drafting",
+      items: [],
+      createdAt: new Date().toISOString(),
+    };
+    session.reviews.push(review);
+    return review;
+  }
+
+  /**
+   * Adds a note to the draft review. Nothing reaches the agent until the human
+   * sends it — that separation is the whole point of the batch model.
+   */
+  async addItems(
     key: string,
-    incoming: Array<Omit<Annotation, "id" | "status" | "createdAt">>,
-  ): Promise<Annotation[] | null> {
+    incoming: Array<{ body: string; selector: string; text: string; anchors?: Anchor[]; tag: ReviewItem["tag"] }>,
+  ): Promise<ReviewItem[] | null> {
     return this.mutate(key, (session) => {
+      const draft = this.draftOf(session);
       const now = new Date().toISOString();
-      const created = incoming.map<Annotation>((entry) => ({
+      const created = incoming.map<ReviewItem>((entry) => ({
         ...entry,
         id: newId(),
-        status: "submitted",
+        status: "draft",
         createdAt: now,
-        submittedAt: now,
       }));
-      session.annotations.push(...created);
-      for (const annotation of created) {
-        if (annotation.tag === "message") {
-          session.chat.push({ role: "user", text: annotation.body, at: now });
-        }
-      }
+      draft.items.push(...created);
       return created;
     });
   }
 
-  /** Returns the annotations the agent has not seen resolved yet. */
-  async openAnnotations(key: string): Promise<Annotation[]> {
+  async removeItem(key: string, itemId: string): Promise<boolean | null> {
+    return this.mutate(key, (session) => {
+      const draft = session.reviews.find((review) => review.status === "drafting");
+      if (!draft) return false;
+      const before = draft.items.length;
+      draft.items = draft.items.filter((item) => item.id !== itemId);
+      return draft.items.length !== before;
+    });
+  }
+
+  async setDraftNote(key: string, note: string): Promise<Review | null> {
+    return this.mutate(key, (session) => {
+      const draft = this.draftOf(session);
+      draft.note = note;
+      return draft;
+    });
+  }
+
+  /** Hands the draft to the agent as one batch. */
+  async sendReview(key: string): Promise<Review | null> {
+    return this.mutate(key, (session) => {
+      const draft = session.reviews.find((review) => review.status === "drafting");
+      if (!draft || (draft.items.length === 0 && !draft.note.trim())) return null;
+      const now = new Date().toISOString();
+      draft.status = "sent";
+      draft.sentAt = now;
+      for (const item of draft.items) item.status = "sent";
+      return draft;
+    });
+  }
+
+  /** The review the agent should be working on, if any. */
+  async pendingReview(key: string): Promise<Review | null> {
     const session = await this.read(key);
-    if (!session) return [];
-    return session.annotations.filter((annotation) => annotation.status === "submitted");
+    return session?.reviews.find((review) => review.status === "sent") ?? null;
+  }
+
+  async markDelivered(key: string, reviewId: string, agentKey: string): Promise<void> {
+    await this.mutate(key, (session) => {
+      const review = session.reviews.find((entry) => entry.id === reviewId);
+      if (!review) return;
+      const seen = new Set(review.deliveredTo ?? []);
+      seen.add(agentKey);
+      review.deliveredTo = [...seen].slice(-20);
+    });
   }
 
   /**
-   * Applies the browser's post-morph report. `addressed` means the agent's edit
-   * actually touched the anchored element; `orphaned` means the element is gone.
+   * Records how the agent handled one item. `answered` means the agent is done
+   * with it either way — the human then accepts or rejects.
    */
+  async answerItem(key: string, itemId: string, outcome: ItemOutcome, agentNote?: string): Promise<ReviewItem | null> {
+    return this.mutate(key, (session) => {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        item.status = "answered";
+        item.outcome = outcome;
+        item.answeredAt = new Date().toISOString();
+        if (agentNote !== undefined) item.agentNote = agentNote;
+        return item;
+      }
+      return null;
+    });
+  }
+
+  /** Closes out a review with the agent's overall response. */
+  async respondToReview(key: string, summary: string): Promise<Review | null> {
+    return this.mutate(key, (session) => {
+      const review = session.reviews.find((entry) => entry.status === "sent");
+      if (!review) return null;
+      const now = new Date().toISOString();
+      review.summary = summary;
+      review.status = "answered";
+      review.answeredAt = now;
+      // Anything the agent did not speak to is still answered — silence here
+      // would leave items stuck with no way for the human to act on them.
+      for (const item of review.items) {
+        if (item.status === "sent") {
+          item.status = "answered";
+          item.outcome = item.outcome ?? "applied";
+          item.answeredAt = now;
+        }
+      }
+      return review;
+    });
+  }
+
   async applyMorphReport(
     key: string,
     report: { addressed: string[]; orphaned: string[] },
-  ): Promise<Annotation[] | null> {
+  ): Promise<ReviewItem[] | null> {
     return this.mutate(key, (session) => {
       const addressed = new Set(report.addressed);
       const orphaned = new Set(report.orphaned);
       const now = new Date().toISOString();
-      const changed: Annotation[] = [];
-      for (const annotation of session.annotations) {
-        if (annotation.status !== "submitted") continue;
-        if (addressed.has(annotation.id)) {
-          annotation.status = "addressed";
-          annotation.addressedAt = now;
-          changed.push(annotation);
-        } else if (orphaned.has(annotation.id)) {
-          annotation.status = "orphaned";
-          changed.push(annotation);
+      const changed: ReviewItem[] = [];
+      for (const review of session.reviews) {
+        for (const item of review.items) {
+          if (item.status !== "sent") continue;
+          if (addressed.has(item.id)) {
+            item.status = "answered";
+            item.outcome = item.outcome ?? "applied";
+            item.answeredAt = now;
+            changed.push(item);
+          } else if (orphaned.has(item.id)) {
+            item.status = "orphaned";
+            changed.push(item);
+          }
         }
       }
       return changed;
     });
   }
 
-  /** Records that these edits' full text reached a particular agent session. */
-  async markDelivered(key: string, ids: string[], agentKey: string): Promise<void> {
-    const wanted = new Set(ids);
-    await this.mutate(key, (session) => {
-      for (const annotation of session.annotations) {
-        if (!wanted.has(annotation.id)) continue;
-        const seen = new Set(annotation.deliveredTo ?? []);
-        seen.add(agentKey);
-        annotation.deliveredTo = [...seen].slice(-20);
+  async setItemVerdict(key: string, itemId: string, verdict: "accepted" | "rejected", reason?: string): Promise<ReviewItem | null> {
+    return this.mutate(key, (session) => {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        item.status = verdict;
+        if (reason) {
+          item.thread = [...(item.thread ?? []), { role: "human", text: reason, at: new Date().toISOString() }];
+        }
+        if (review.items.every((entry) => entry.status === "accepted" || entry.status === "rejected")) {
+          review.status = "closed";
+        }
+        return item;
       }
+      return null;
     });
   }
 
   /**
-   * Human accepts the agent's change. Terminal — the edit is done with.
+   * Moves rejected items into a fresh draft so they go back to the agent with
+   * the next review. A rejection the agent never hears about is the worst
+   * possible outcome.
    */
-  async acceptAnnotation(key: string, id: string): Promise<Annotation | null> {
+  async requeueRejected(key: string): Promise<number | null> {
     return this.mutate(key, (session) => {
-      const annotation = session.annotations.find((entry) => entry.id === id);
-      if (!annotation || annotation.status !== "addressed") return null;
-      annotation.status = "resolved";
-      return annotation;
-    });
-  }
-
-  /**
-   * Human rejects the agent's change. This reopens the edit rather than closing
-   * it, and clears the delivery record so the agent gets the full text again —
-   * a rejection the agent never hears about is the worst possible outcome.
-   */
-  async rejectAnnotation(key: string, id: string, reason: string): Promise<Annotation | null> {
-    return this.mutate(key, (session) => {
-      const annotation = session.annotations.find((entry) => entry.id === id);
-      if (!annotation) return null;
-      annotation.status = "submitted";
-      annotation.deliveredTo = [];
-      delete annotation.addressedAt;
-      annotation.thread = [
-        ...(annotation.thread ?? []),
-        { role: "human", text: `Rejected: ${reason}`, at: new Date().toISOString() },
-      ];
-      return annotation;
-    });
-  }
-
-  async replyToAnnotation(
-    key: string,
-    id: string,
-    role: ThreadMessage["role"],
-    text: string,
-  ): Promise<Annotation | null> {
-    return this.mutate(key, (session) => {
-      const annotation = session.annotations.find((entry) => entry.id === id);
-      if (!annotation) return null;
-      annotation.thread = [...(annotation.thread ?? []), { role, text, at: new Date().toISOString() }];
-      // A human reply on a settled edit reopens it; otherwise the agent never
-      // sees the follow-up.
-      if (role === "human" && annotation.status !== "submitted") {
-        annotation.status = "submitted";
-        annotation.deliveredTo = [];
+      const draft = this.draftOf(session);
+      let moved = 0;
+      for (const review of session.reviews) {
+        if (review === draft) continue;
+        for (const item of review.items) {
+          if (item.status !== "rejected" || item.requeued) continue;
+          const last = item.thread?.[item.thread.length - 1]?.text;
+          draft.items.push({
+            id: newId(),
+            body: last ? `${item.body} — previously rejected: ${last}` : item.body,
+            selector: item.selector,
+            text: item.text,
+            ...(item.anchors ? { anchors: item.anchors } : {}),
+            tag: item.tag,
+            status: "draft",
+            createdAt: new Date().toISOString(),
+          });
+          // Stays `rejected` — recording it as accepted would show the human the
+          // opposite of the verdict they gave. `requeued` is what stops it being
+          // carried forward twice.
+          item.requeued = true;
+          moved += 1;
+        }
       }
-      return annotation;
+      return moved;
     });
   }
 
-  /** Re-anchors an orphaned edit onto a new element the human picked. */
-  async repointAnnotation(key: string, id: string, anchor: { selector: string; text: string }): Promise<Annotation | null> {
+  async repointItem(key: string, itemId: string, anchor: { selector: string; text: string }): Promise<ReviewItem | null> {
     return this.mutate(key, (session) => {
-      const annotation = session.annotations.find((entry) => entry.id === id);
-      if (!annotation) return null;
-      annotation.selector = anchor.selector;
-      annotation.text = anchor.text;
-      annotation.status = "submitted";
-      annotation.deliveredTo = [];
-      return annotation;
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        item.selector = anchor.selector;
+        item.text = anchor.text;
+        delete item.anchors;
+        item.status = review.status === "drafting" ? "draft" : "sent";
+        return item;
+      }
+      return null;
     });
   }
 
-  async setAnnotationStatus(
-    key: string,
-    id: string,
-    status: Annotation["status"],
-    agentNote?: string,
-  ): Promise<Annotation | null> {
+  async replyToItem(key: string, itemId: string, role: ThreadMessage["role"], text: string): Promise<ReviewItem | null> {
     return this.mutate(key, (session) => {
-      const annotation = session.annotations.find((entry) => entry.id === id);
-      if (!annotation) return null;
-      annotation.status = status;
-      if (agentNote !== undefined) annotation.agentNote = agentNote;
-      if (status === "addressed") annotation.addressedAt = new Date().toISOString();
-      return annotation;
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        item.thread = [...(item.thread ?? []), { role, text, at: new Date().toISOString() }];
+        return item;
+      }
+      return null;
     });
   }
 

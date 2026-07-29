@@ -215,6 +215,39 @@ and `Stop` accept **only** the JSON form. Stop blocks with
 `{"decision":"block","reason":…}`. JSON is only parsed on exit code 0. We always
 emit the JSON form so the same code path works everywhere.
 
+## The review is the unit, not the note
+
+`Session.reviews` is an append-only list; at most one is ever `drafting`.
+
+- **Markup is private.** Notes accumulate in the draft and `takeFeedback` only
+  ever returns a review whose status is `sent`. Nothing reaches the agent until
+  the human sends, and that is the entire point — the live model sent each note
+  the moment it was written, so the agent acted on each one blind to what came
+  next. Three notes about one paragraph landed as three rewrites that cancelled
+  out.
+- **The draft lives on the server**, not in the browser, so markup survives a
+  reload. `Review.note` is saved as you type.
+- **`Review.note` leads every injection and every poll payload.** "Cut this by a
+  third" changes what every item under it means, so it is never dropped, not even
+  on a repeat injection where the items are compacted away.
+- **Agents respond, they do not just edit.** `plan-editor respond --summary` is
+  what moves a review to `answered` and puts it in front of the human.
+  `respondToReview` answers any item the agent did not speak to — silence would
+  leave items stuck with no way for the human to act on them.
+- **A rejected item keeps its `rejected` status and gains `requeued`.** Marking
+  it accepted to stop it being carried forward twice showed the human the
+  opposite of the verdict they gave.
+
+## Highlighting
+
+- **Only changed words are highlighted, and there is no whole-element fallback.**
+  Flashing the enclosing block when no words changed is how a one-word edit came
+  to paint a whole section green.
+- **`pe-` prefixed classes are stripped before comparing markup.** The SDK marks
+  tracked anchors with `pe-pending`, so the live DOM permanently differs from the
+  file in ways the agent had nothing to do with; counting those meant the tool
+  highlighted its own bookkeeping on every patch.
+
 ## Versions, diff, and the edit lifecycle
 
 **What version history is, concretely:** not a linked list and not a delta chain.

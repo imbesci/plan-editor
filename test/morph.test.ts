@@ -270,3 +270,41 @@ describe("text changes for word-level highlighting", () => {
     restore();
   });
 });
+
+describe("the tool must not highlight its own bookkeeping", () => {
+  test("a pe- class added by the SDK is not a change", () => {
+    // The SDK marks tracked anchors with `pe-pending`, so the live DOM always
+    // differs from the file on disk in ways the agent had nothing to do with.
+    // Counting those flooded whole sections green on every patch.
+    const { document, restore } = setup(PAGE);
+    document.getElementById("a-body")!.classList.add("pe-pending");
+
+    const result = morphDocument(document.documentElement, PAGE, []);
+
+    assert.deepEqual(result.changed, [], "our own marker classes must not register as edits");
+    assert.deepEqual(result.textChanges, []);
+    restore();
+  });
+
+  test("a real edit is still detected on an element carrying a pe- class", () => {
+    const { document, restore } = setup(PAGE);
+    document.getElementById("a-body")!.classList.add("pe-pending");
+
+    const result = morphDocument(document.documentElement, PAGE.replace("Alpha body.", "Rewritten alpha."), []);
+
+    assert.deepEqual(result.changed.map((element) => element.id), ["a-body"]);
+    assert.equal(result.textChanges[0]?.after, "Rewritten alpha.");
+    restore();
+  });
+
+  test("an author class is still compared", () => {
+    // Only our own `pe-` prefix is ignored — a real class change is a real edit.
+    const { document, restore } = setup(PAGE);
+    const withClass = PAGE.replace('<p id="a-body">', '<p id="a-body" class="lead">');
+
+    const result = morphDocument(document.documentElement, withClass, []);
+
+    assert.ok(result.changed.some((element) => element.id === "a-body"));
+    restore();
+  });
+});

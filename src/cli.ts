@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import open from "open";
 
 import { defaultPort, LOOPBACK, serverLogFile, stateDir } from "./paths.ts";
-import type { Annotation, PollResult } from "./protocol.ts";
+import type { PollResult, Review } from "./protocol.ts";
 import { canonicalFile, SessionStore, sessionKey } from "./store/session-store.ts";
 
 const PACKAGE_VERSION = process.env.PLAN_EDITOR_BUILD_VERSION ?? "0.1.0";
@@ -150,9 +150,9 @@ async function openCommand(args: string[]): Promise<unknown> {
   return {
     session: { file: canonical, url: session.url, reused_existing_tab: alreadyOpen },
     next_step:
-      `The artifact is open. Now run \`plan-editor poll ${canonical}\`. It long-polls until the human submits an edit ` +
-      `and stays silent while waiting — that is normal, never kill it. When edits arrive, apply them by editing ${canonical} ` +
-      `normally; plan-editor patches the open browser in place, so do not tell the user to reload.`,
+      `The artifact is open. The human now marks it up at their own pace — you will hear nothing until they send the whole ` +
+      `review as one batch, which is deliberate. Run \`plan-editor watch ${canonical}\` and wait; it stays silent until then, ` +
+      `which is normal. Do not edit the file in the meantime: the document staying still is what lets them read and annotate it.`,
   };
 }
 
@@ -241,7 +241,7 @@ export function formatPollResult(file: string, result: PollResult): unknown {
   if (result.status === "waiting") {
     return {
       status: "waiting",
-      next_step: `No edits arrived before the timeout. Run \`plan-editor poll ${file}\` without --timeout-ms to wait indefinitely.`,
+      next_step: `No review arrived before the timeout. Run \`plan-editor watch ${file}\` to keep waiting.`,
     };
   }
   if (result.status === "ended") {
@@ -251,21 +251,38 @@ export function formatPollResult(file: string, result: PollResult): unknown {
       next_step: "The human ended this session. Stop polling and report back in the conversation.",
     };
   }
+  return formatReview(file, result.review, Boolean(result.sessionEnded));
+}
+
+/**
+ * The overall note leads, because it is the context that makes the individual
+ * items interpretable — "cut this by a third" changes what every item means.
+ */
+export function formatReview(file: string, review: Review, sessionEnded = false): unknown {
+  const items = review.items.filter((item) => item.status === "sent" || item.status === "orphaned");
   return {
-    status: "feedback",
-    edits: result.annotations.map((entry: Annotation) => ({
-      id: entry.id,
-      request: entry.body,
-      anchor_text: entry.text,
-      selector_hint: entry.selector,
+    status: "review",
+    review_id: review.id,
+    overall_note: review.note || null,
+    items: items.map((item) => ({
+      id: item.id,
+      request: item.body,
+      anchor_text: item.text,
+      selector_hint: item.selector,
+      ...(item.anchors ? { covers: item.anchors.length } : {}),
+      ...(item.status === "orphaned" ? { note: "this item's anchor no longer exists" } : {}),
     })),
     next_step:
-      `Apply each edit by editing ${file} directly. The open browser patches itself in place — never ask the user to reload. ` +
-      `Give top-level sections stable \`id\` attributes so edits can be matched precisely. ` +
-      `The open browser marks each edit applied automatically once your change touches its anchor. If the same edit comes back ` +
-      `on the next cycle, the browser could not confirm it — run \`plan-editor applied ${file} --id <id>\` so it stops repeating. ` +
-      `Then run \`plan-editor watch ${file}\` so the next edit reaches you in milliseconds instead of waiting for the human to message you.` +
-      (result.sessionEnded ? " Note: the human ended the session with this batch, so do not poll again." : ""),
+      `This is one review, not a stream — read the overall note first, then every item, and work out how they fit together ` +
+      `before changing anything. Two items can pull in opposite directions, and the note usually says which wins. ` +
+      `Apply them all by editing ${file} directly; the open browser patches itself in place, so never ask the user to reload. ` +
+      `Give top-level sections stable \`id\` attributes so items can be matched precisely. ` +
+      `When you are done, run \`plan-editor respond ${file} --summary "<what you changed and why>"\` — that closes the review ` +
+      `and is what puts your work in front of the human to accept or reject. ` +
+      `If an item was ambiguous or you chose not to do it, flag it with ` +
+      `\`plan-editor answer ${file} --id <id> --outcome needs-call|caveat|skipped --note "<why>"\` before responding, ` +
+      `rather than guessing.` +
+      (sessionEnded ? " Note: the human ended the session with this review, so do not wait for another." : ""),
   };
 }
 
@@ -307,33 +324,52 @@ async function watchCommand(args: string[]): Promise<unknown> {
   return formatPollResult(canonical, result);
 }
 
-/**
- * Declares an edit applied. The browser normally detects this itself by watching
- * which element the agent's change touched, but that path is unavailable when the
- * tab is closed, stale, or was blanked — and then the edit never leaves
- * "submitted" and `watch` hands the agent its own work forever.
- */
-async function appliedCommand(args: string[]): Promise<unknown> {
+/** Closes out the pending review with the agent's overall response. */
+async function respondCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor applied <file.html> --id <id>`"]);
-  const ids = args.flatMap((arg, index) => (arg === "--id" && args[index + 1] ? [String(args[index + 1])] : []));
-  if (ids.length === 0) throw new CliError("At least one --id is required");
-  const noteIndex = args.indexOf("--note");
-  const note = noteIndex !== -1 ? args[noteIndex + 1] : undefined;
+  if (!file) throw new CliError("An HTML file path is required", ['Run `plan-editor respond <file.html> --summary "..."`']);
+  const summaryIndex = args.indexOf("--summary");
+  const summary = summaryIndex !== -1 ? String(args[summaryIndex + 1] ?? "") : "";
+  if (!summary) throw new CliError("--summary is required", ["The human needs to know what you did and why."]);
 
   const canonical = await canonicalFile(file);
   await ensureServer();
   const { key, token } = await tokenFor(canonical);
-  const results: string[] = [];
-  for (const id of ids) {
-    const response = await fetch(`${baseUrl()}/api/${key}/annotations/${id}/applied?t=${encodeURIComponent(token)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(note ? { note } : {}),
-    });
-    results.push(`${id}: ${response.ok ? ((await response.json()) as { status: string }).status : response.status}`);
-  }
-  return { marked: results };
+  const response = await fetch(`${baseUrl()}/api/${key}/review/respond?t=${encodeURIComponent(token)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ summary }),
+  });
+  const result = (await response.json()) as { status: string };
+  return {
+    ...result,
+    next_step:
+      result.status === "answered"
+        ? `The review is now in front of the human to accept or reject item by item. Run \`plan-editor watch ${canonical}\` to wait for their next review.`
+        : `There was no pending review to respond to.`,
+  };
+}
+
+/** Flags how one item was handled, when it was not a straightforward apply. */
+async function answerCommand(args: string[]): Promise<unknown> {
+  const file = args.find((arg) => !arg.startsWith("--"));
+  if (!file) throw new CliError("An HTML file path is required");
+  const value = (flag: string) => {
+    const index = args.indexOf(flag);
+    return index !== -1 ? args[index + 1] : undefined;
+  };
+  const id = value("--id");
+  if (!id) throw new CliError("--id is required");
+
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const { key, token } = await tokenFor(canonical);
+  const response = await fetch(`${baseUrl()}/api/${key}/items/${id}/answer?t=${encodeURIComponent(token)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ outcome: value("--outcome") ?? "applied", note: value("--note") }),
+  });
+  return await response.json();
 }
 
 async function endCommand(args: string[]): Promise<unknown> {
@@ -528,9 +564,11 @@ async function statusCommand(): Promise<unknown> {
       status: session.status,
       bound_agent: session.authoredBy ? `${session.authoredBy.slice(0, 8)}… (${session.authoredIn})` : "none",
       url: `${baseUrl()}/s/${session.key}?t=${session.token}`,
-      open_edits: session.annotations.filter((entry) => entry.status === "submitted").length,
-      addressed: session.annotations.filter((entry) => entry.status === "addressed").length,
-      resolved: session.annotations.filter((entry) => entry.status === "resolved").length,
+      drafting: session.reviews.find((r) => r.status === "drafting")?.items.length ?? 0,
+      awaiting_agent: session.reviews.filter((r) => r.status === "sent").length,
+      awaiting_your_review: session.reviews
+        .flatMap((r) => r.items)
+        .filter((i) => i.status === "answered").length,
     })),
   };
 }
@@ -558,7 +596,8 @@ const HELP = `plan-editor — click an element, say what to change, watch it cha
 Usage:
   plan-editor <file.html> [--no-open]   Open the artifact for review
   plan-editor watch <file.html>         Park until the human submits an edit (the responsive path)
-  plan-editor applied <file> --id <id>  Declare an edit applied when the browser cannot confirm
+  plan-editor respond <file> --summary  Close the review with what you changed and why
+  plan-editor answer <file> --id <id>   Flag one item: --outcome caveat|needs-call|skipped --note ".."
   plan-editor poll <file.html>          Wait for edits (long-polls; never kill it)
       [--reply "..."] [--timeout-ms n]
   plan-editor end <file.html>           End the session
@@ -581,7 +620,8 @@ async function main(): Promise<void> {
     setup: setupCommand,
     hook: hookCommand,
     watch: watchCommand,
-    applied: appliedCommand,
+    respond: respondCommand,
+    answer: answerCommand,
     export: exportCommand,
     undo: undoCommand,
     "notify-edit": notifyEditCommand,

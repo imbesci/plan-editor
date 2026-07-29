@@ -3,7 +3,15 @@
 // API — which is also why the session token never leaves this file.
 
 import { diffDocuments, diffWords, type SectionChange } from "../sdk/diff.ts";
-import type { AgentIdentityView, AgentPresence, Annotation, ChatMessage, ServerEvent, VersionMeta } from "../protocol.ts";
+import type {
+  AgentIdentityView,
+  AgentPresence,
+  ChatMessage,
+  Review,
+  ReviewItem,
+  ServerEvent,
+  VersionMeta,
+} from "../protocol.ts";
 
 interface Bootstrap {
   key: string;
@@ -20,7 +28,9 @@ const frame = $<HTMLIFrameElement>("artifact");
 const list = $("list");
 const input = $<HTMLTextAreaElement>("input");
 const search = $<HTMLInputElement>("search");
-const submitButton = $<HTMLButtonElement>("submit");
+const overall = $<HTMLTextAreaElement>("overall");
+const addNote = $<HTMLButtonElement>("addNote");
+const sendButton = $<HTMLButtonElement>("send");
 const endButton = $<HTMLButtonElement>("end");
 const modeToggle = $<HTMLInputElement>("modeToggle");
 const presence = $("presence");
@@ -34,26 +44,38 @@ const chatLog = $("chatLog");
 const targetHint = $("targetHint");
 const layout = $("layout");
 
-interface Draft {
+/** The element(s) the next note will be pinned to. */
+interface Armed {
   clientId: string;
   anchors: Array<{ selector: string; text: string }>;
   kind: "element" | "text";
-  body: string;
 }
 
-type Filter = "open" | "review" | "done" | "all";
-
-let annotations: Annotation[] = [];
+let reviews: Review[] = [];
 let chat: ChatMessage[] = [];
 let versions: VersionMeta[] = [];
 let presenceState: AgentPresence = "waiting";
 let agentView: AgentIdentityView = { session: null, lastContact: null, viaHooks: false };
-let drafts: Draft[] = [];
-let armed: Draft | null = null;
+let armed: Armed | null = null;
 let repointing: string | null = null;
-let filter: Filter = "open";
 let query = "";
+let noteSaveTimer: number | undefined;
 const trackedIds = new Set<string>();
+
+const draftReview = () => reviews.find((review) => review.status === "drafting");
+const sentReview = () => reviews.find((review) => review.status === "sent");
+/** The most recent review the agent has answered and the human has not closed. */
+const answeredReview = () => [...reviews].reverse().find((review) => review.status === "answered");
+
+/**
+ * Which of the two phases the panel is in. The whole point of the batch model is
+ * that these never blur: you are either marking up, or reading the agent's work.
+ */
+function phase(): "drafting" | "sent" | "reviewing" {
+  if (sentReview()) return "sent";
+  if (answeredReview()) return "reviewing";
+  return "drafting";
+}
 
 frame.src = `/artifact/${key}/index.html?t=${encodeURIComponent(token)}`;
 
@@ -131,93 +153,95 @@ function ago(iso: string | undefined): string {
  * before a reload can never be marked addressed.
  */
 function syncTracking(): void {
-  for (const annotation of annotations) {
-    if (annotation.status !== "submitted" || annotation.tag === "message") continue;
-    if (trackedIds.has(annotation.id)) continue;
-    trackedIds.add(annotation.id);
-    toFrame({
-      type: "pe:track",
-      id: annotation.id,
-      selector: annotation.selector,
-      text: annotation.text,
-      anchors: annotation.anchors,
-    });
+  for (const review of reviews) {
+    for (const item of review.items) {
+      if (item.status !== "sent" || item.tag === "page") continue;
+      if (trackedIds.has(item.id)) continue;
+      trackedIds.add(item.id);
+      toFrame({ type: "pe:track", id: item.id, selector: item.selector, text: item.text, anchors: item.anchors });
+    }
   }
 }
 
 // --- rendering --------------------------------------------------------------
 
-const STATUS_LABEL: Record<Annotation["status"], string> = {
-  draft: "draft",
-  submitted: "waiting for agent",
-  addressed: "applied — review it",
-  resolved: "accepted",
+const OUTCOME_LABEL: Record<string, string> = {
+  applied: "applied",
+  caveat: "applied with a caveat",
+  "needs-call": "needs your call",
+  skipped: "not done",
+};
+
+const ITEM_LABEL: Record<ReviewItem["status"], string> = {
+  draft: "in your review",
+  sent: "with the agent",
+  answered: "review it",
+  accepted: "accepted",
+  rejected: "rejected",
   orphaned: "target changed",
 };
 
-type Bucket = "open" | "review" | "done";
-
-const BUCKET: Record<Annotation["status"], Bucket> = {
-  draft: "open",
-  submitted: "open",
-  orphaned: "open",
-  addressed: "review",
-  resolved: "done",
-};
-
-function matchesFilter(annotation: Annotation): boolean {
-  if (filter !== "all" && BUCKET[annotation.status] !== filter) return false;
+function matches(item: ReviewItem): boolean {
   if (!query) return true;
-  return `${annotation.body} ${annotation.text} ${annotation.selector}`.toLowerCase().includes(query);
+  return `${item.body} ${item.text} ${item.selector}`.toLowerCase().includes(query);
 }
 
 function render(): void {
-  const counts: Record<Bucket, number> = { open: 0, review: 0, done: 0 };
-  for (const annotation of annotations) counts[BUCKET[annotation.status]] += 1;
-  $("countOpen").textContent = String(counts.open);
-  $("countReview").textContent = String(counts.review);
-  $("countDone").textContent = String(counts.done);
+  const current = phase();
+  const draft = draftReview();
+  const sent = sentReview();
+  const answered = answeredReview();
+
   $("chatCount").textContent = String(chat.length);
+  document.body.dataset.phase = current;
 
-  const visible = annotations.filter(matchesFilter);
-  const banner =
-    counts.open > 0 && presenceState === "waiting"
-      ? `<div class="alert"><strong>${counts.open} edit${counts.open === 1 ? "" : "s"} waiting to be picked up.</strong>
-           <span>${
-             agentView.session
-               ? "An agent is bound to this artifact but has not checked in. Send it any message, or have it run watch."
-               : "No agent is bound. Install hooks, then edits reach the Claude session you're already in."
-           }</span>
-           <code>plan-editor watch ${escapeHtml(bootstrap.file)}</code></div>`
-      : "";
+  if (current === "drafting") {
+    const count = draft?.items.length ?? 0;
+    $("phaseTitle").textContent = "Your review";
+    $("phaseHint").textContent =
+      count === 0
+        ? "Mark up the whole document, then send it as one review."
+        : `${count} note${count === 1 ? "" : "s"} so far. Nothing reaches the agent until you send.`;
+    const items = (draft?.items ?? []).filter(matches);
+    list.innerHTML = items.length
+      ? items.map(renderItem).join("")
+      : `<p class="empty">Turn on Annotate, click an element — or select text — and describe the change. Add as many notes as you like; the document stays still while you work.</p>`;
+    sendButton.textContent = count > 0 ? `Send review (${count})` : "Send review";
+    sendButton.disabled = count === 0 && !overall.value.trim();
+  }
 
-  const repointBanner = repointing
-    ? `<div class="alert repoint"><strong>Pick a new anchor.</strong><span>Click the element this edit should point at.</span>
-         <button class="link" data-cancel-repoint>Cancel</button></div>`
-    : "";
+  if (current === "sent") {
+    const count = sent?.items.length ?? 0;
+    $("phaseTitle").textContent = "With the agent";
+    $("phaseHint").textContent = `${count} note${count === 1 ? "" : "s"} sent. The agent is working through them as a set.`;
+    list.innerHTML =
+      (sent?.note ? `<div class="overall-note"><b>Overall</b>${escapeHtml(sent.note)}</div>` : "") +
+      (sent?.items ?? []).filter(matches).map(renderItem).join("");
+    sendButton.textContent = "Waiting…";
+    sendButton.disabled = true;
+  }
 
-  const cards = [...visible.map(renderCard), ...drafts.map(renderDraft)];
-  const body = cards.length
-    ? cards.join("")
-    : `<p class="empty">${
-        annotations.length === 0
-          ? "Turn on Annotate, then click an element — or select some text — and describe the change. It is applied in place, no reload."
-          : query
-            ? "Nothing matches that filter."
-            : "Nothing here. Try another filter."
-      }</p>`;
+  if (current === "reviewing") {
+    const open = (answered?.items ?? []).filter((item) => item.status === "answered").length;
+    $("phaseTitle").textContent = "The agent's work";
+    $("phaseHint").textContent = open
+      ? `${open} change${open === 1 ? "" : "s"} to accept or reject.`
+      : "All settled. Start marking up again whenever you like.";
+    list.innerHTML =
+      (answered?.summary ? `<div class="summary"><b>Agent</b>${escapeHtml(answered.summary)}</div>` : "") +
+      (answered?.items ?? []).filter(matches).map(renderItem).join("");
+    sendButton.textContent = "Send review";
+    sendButton.disabled = (draftReview()?.items.length ?? 0) === 0;
+  }
 
-  list.innerHTML = banner + repointBanner + body;
   renderChat();
-
   undoButton.disabled = versions.length < 2;
-  submitButton.disabled = drafts.length === 0 && !input.value.trim();
-  submitButton.textContent = drafts.length > 1 ? `Submit ${drafts.length}` : "Submit";
+  addNote.disabled = !input.value.trim();
   targetHint.textContent = armed
     ? armed.anchors.length > 1
       ? `${armed.anchors.length} elements selected — ⇧-click to add or remove`
-      : `Anchored to “${(armed.anchors[0]?.text ?? "").slice(0, 60)}”`
-    : "";
+      : `Pinned to “${(armed.anchors[0]?.text ?? "").slice(0, 60)}”`
+    : "Nothing selected — this note will apply to the page as a whole.";
 }
 
 function renderChat(): void {
@@ -232,27 +256,20 @@ function renderChat(): void {
     : `<p class="empty">Replies from your agent appear here.</p>`;
 }
 
-function anchorLabel(anchors: Array<{ selector: string; text: string }>, kind: string): string {
+function anchorLabel(item: ReviewItem): string {
+  const anchors = item.anchors ?? [{ selector: item.selector, text: item.text }];
+  if (item.tag === "page") return `<span class="chunk">whole page</span>`;
   if (anchors.length > 1) {
     return `<span class="chunk">${anchors.length} elements</span> ${escapeHtml(
       anchors.map((anchor) => anchor.text.slice(0, 24)).join(" · ").slice(0, 90),
     )}`;
   }
   const first = anchors[0];
-  return `${kind === "text" ? "❝ " : ""}${escapeHtml(first?.text.slice(0, 90) || first?.selector || "whole page")}`;
+  return `${item.tag === "text" ? "❝ " : ""}${escapeHtml(first?.text.slice(0, 90) || first?.selector || "whole page")}`;
 }
 
-function renderDraft(draft: Draft): string {
-  return `<article class="card" data-status="draft">
-    <div class="anchor">${anchorLabel(draft.anchors, draft.kind)}</div>
-    <div class="body">${escapeHtml(draft.body || "…")}</div>
-    <div class="meta"><span class="status">draft</span>
-      <button class="link" data-drop-draft="${draft.clientId}">remove</button></div>
-  </article>`;
-}
-
-function renderCard(annotation: Annotation): string {
-  const thread = (annotation.thread ?? [])
+function renderItem(item: ReviewItem): string {
+  const thread = (item.thread ?? [])
     .map(
       (message) =>
         `<div class="msg ${message.role}"><b>${message.role === "human" ? "You" : "Agent"}</b><span>${escapeHtml(message.text)}</span></div>`,
@@ -260,25 +277,29 @@ function renderCard(annotation: Annotation): string {
     .join("");
 
   const actions: string[] = [];
-  if (annotation.status === "addressed") {
-    actions.push(`<button class="link accept" data-accept="${annotation.id}">Accept</button>`);
-    actions.push(`<button class="link reject" data-reject="${annotation.id}">Reject…</button>`);
+  if (item.status === "draft") actions.push(`<button class="link" data-drop="${item.id}">remove</button>`);
+  if (item.status === "answered") {
+    actions.push(`<button class="link accept" data-accept="${item.id}">Accept</button>`);
+    actions.push(`<button class="link reject" data-reject="${item.id}">Reject…</button>`);
   }
-  if (annotation.status === "orphaned") actions.push(`<button class="link" data-repoint="${annotation.id}">Re-point…</button>`);
-  if (annotation.tag !== "message") actions.push(`<button class="link" data-jump="${annotation.id}">Show</button>`);
-  actions.push(`<button class="link" data-reply="${annotation.id}">Reply…</button>`);
+  if (item.status === "orphaned") actions.push(`<button class="link" data-repoint="${item.id}">Re-point…</button>`);
+  if (item.tag !== "page") actions.push(`<button class="link" data-jump="${item.id}">Show</button>`);
 
-  const when = annotation.addressedAt ?? annotation.submittedAt ?? annotation.createdAt;
-  return `<article class="card" data-status="${annotation.status}" data-id="${escapeHtml(annotation.id)}">
-    <div class="anchor">${anchorLabel(annotation.anchors ?? [{ selector: annotation.selector, text: annotation.text }], annotation.tag)}</div>
-    <div class="body">${escapeHtml(annotation.body)}</div>
-    ${annotation.agentNote ? `<div class="note">${escapeHtml(annotation.agentNote)}</div>` : ""}
+  const outcome =
+    item.outcome && item.status === "answered"
+      ? `<span class="outcome ${item.outcome}">${OUTCOME_LABEL[item.outcome]}</span>`
+      : "";
+
+  return `<article class="card" data-status="${item.status}" data-outcome="${item.outcome ?? ""}" data-id="${escapeHtml(item.id)}">
+    <div class="anchor">${anchorLabel(item)}</div>
+    <div class="body">${escapeHtml(item.body)}</div>
+    ${item.agentNote ? `<div class="note">${escapeHtml(item.agentNote)}</div>` : ""}
     ${thread ? `<div class="thread">${thread}</div>` : ""}
-    <div class="meta"><span class="status">${STATUS_LABEL[annotation.status]}</span><time>${ago(when)}</time>${actions.join("")}</div>
+    <div class="meta">${outcome}<span class="status">${ITEM_LABEL[item.status]}</span><time>${ago(item.answeredAt ?? item.createdAt)}</time>${actions.join("")}</div>
   </article>`;
 }
 
-// --- annotation flow --------------------------------------------------------
+// --- markup phase -----------------------------------------------------------
 
 function setMode(next: boolean): void {
   modeToggle.checked = next;
@@ -286,63 +307,58 @@ function setMode(next: boolean): void {
 }
 
 modeToggle.addEventListener("change", () => setMode(modeToggle.checked));
-input.addEventListener("input", () => {
-  if (armed) armed.body = input.value;
-  render();
-});
+input.addEventListener("input", () => render());
 search.addEventListener("input", () => {
   query = search.value.trim().toLowerCase();
   render();
 });
-$("filters").addEventListener("click", (event) => {
-  const chip = (event.target as HTMLElement).closest<HTMLElement>("[data-filter]");
-  if (!chip) return;
-  filter = chip.dataset.filter as Filter;
-  for (const other of $("filters").querySelectorAll(".chip")) other.classList.toggle("active", other === chip);
+
+// The overall note is saved as you type, not on send: losing it to a stray
+// reload would cost more than the round trip does.
+overall.addEventListener("input", () => {
+  clearTimeout(noteSaveTimer);
+  noteSaveTimer = setTimeout(() => {
+    void api("/review/note", { method: "POST", body: JSON.stringify({ note: overall.value }) });
+  }, 400) as unknown as number;
   render();
 });
-submitButton.addEventListener("click", () => void submit());
 
-function stageArmed(): void {
-  if (!armed) return;
-  armed.body = input.value.trim();
-  if (!armed.body) {
-    toFrame({ type: "pe:cancel", clientId: armed.clientId });
-  } else if (!drafts.includes(armed)) {
-    drafts.push(armed);
+addNote.addEventListener("click", () => void commitNote());
+sendButton.addEventListener("click", () => void sendReview());
+
+/** Adds the typed note to the draft review. Still nothing leaves the browser. */
+async function commitNote(): Promise<void> {
+  const body = input.value.trim();
+  if (!body) return;
+  const item = armed
+    ? { body, selector: armed.anchors[0]?.selector ?? "", text: armed.anchors[0]?.text ?? "", anchors: armed.anchors, tag: armed.kind }
+    : { body, selector: "", text: "", tag: "page" as const };
+
+  const result = await guard("Adding the note", async () => {
+    const response = await api("/items", { method: "POST", body: JSON.stringify({ items: [item] }) });
+    if (!response.ok) throw new Error(`server said ${response.status}`);
+    return (await response.json()) as { items: ReviewItem[] };
+  });
+
+  if (result?.items[0] && armed) {
+    toFrame({ type: "pe:bind", clientId: armed.clientId, id: result.items[0].id });
   }
   armed = null;
   input.value = "";
+  render();
 }
 
-async function submit(): Promise<void> {
-  stageArmed();
-  const freeform = input.value.trim();
-  const payload: Array<Record<string, unknown>> = drafts.map((draft) => ({
-    body: draft.body,
-    selector: draft.anchors[0]?.selector ?? "",
-    text: draft.anchors[0]?.text ?? "",
-    anchors: draft.anchors,
-    tag: draft.kind,
-  }));
-  if (freeform) payload.push({ body: freeform, selector: "", text: "", tag: "message" });
-  if (payload.length === 0) return;
-
-  submitButton.disabled = true;
-  const result = await guard("Submitting", async () => {
-    const response = await api("/annotations", { method: "POST", body: JSON.stringify({ annotations: payload }) });
-    if (!response.ok) throw new Error(`server said ${response.status}`);
-    return (await response.json()) as { annotations: Annotation[] };
+async function sendReview(): Promise<void> {
+  await commitNote();
+  sendButton.disabled = true;
+  const done = await guard("Sending the review", async () => {
+    const response = await api("/review/send", { method: "POST", body: "{}" });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `server said ${response.status}`);
+    return true;
   });
-
-  if (result) {
-    drafts.forEach((draft, index) => {
-      const created = result.annotations[index];
-      if (created) toFrame({ type: "pe:bind", clientId: draft.clientId, id: created.id });
-    });
-    drafts = [];
-    input.value = "";
-    toast(`${payload.length} edit${payload.length === 1 ? "" : "s"} sent to your agent`);
+  if (done) {
+    overall.value = "";
+    toast("Review sent — the agent has the whole set");
   }
   render();
 }
@@ -353,11 +369,10 @@ list.addEventListener("click", (event) => {
   const target = event.target as HTMLElement;
   const action = (name: string) => target.closest(`[data-${name}]`)?.getAttribute(`data-${name}`);
 
-  const drop = action("drop-draft");
+  const drop = action("drop");
   if (drop) {
-    drafts = drafts.filter((draft) => draft.clientId !== drop);
-    toFrame({ type: "pe:cancel", clientId: drop });
-    return render();
+    void guard("Removing the note", () => api(`/items/${drop}`, { method: "DELETE" }));
+    return;
   }
   if (target.closest("[data-cancel-repoint]")) {
     repointing = null;
@@ -367,35 +382,25 @@ list.addEventListener("click", (event) => {
 
   const jump = action("jump");
   if (jump) {
-    const annotation = annotations.find((entry) => entry.id === jump);
-    if (annotation) toFrame({ type: "pe:scrollTo", id: jump, selector: annotation.selector, text: annotation.text });
+    const item = reviews.flatMap((review) => review.items).find((entry) => entry.id === jump);
+    if (item) toFrame({ type: "pe:scrollTo", id: jump, selector: item.selector, text: item.text });
     return;
   }
 
   const accept = action("accept");
   if (accept) {
-    void guard("Accepting", () => api(`/annotations/${accept}/accept`, { method: "POST", body: "{}" }));
+    void guard("Accepting", () => api(`/items/${accept}/accept`, { method: "POST", body: "{}" }));
     return;
   }
 
   const reject = action("reject");
   if (reject) {
-    const reason = prompt("What's wrong with the change?");
+    const reason = prompt("What's wrong with it? This goes back to the agent in your next review.");
     if (reason?.trim()) {
-      void guard("Rejecting", () =>
-        api(`/annotations/${reject}/reject`, { method: "POST", body: JSON.stringify({ text: reason.trim() }) }),
-      );
-    }
-    return;
-  }
-
-  const reply = action("reply");
-  if (reply) {
-    const text = prompt("Reply to the agent about this edit:");
-    if (text?.trim()) {
-      void guard("Replying", () =>
-        api(`/annotations/${reply}/reply`, { method: "POST", body: JSON.stringify({ text: text.trim() }) }),
-      );
+      void guard("Rejecting", async () => {
+        await api(`/items/${reject}/reject`, { method: "POST", body: JSON.stringify({ text: reason.trim() }) });
+        toast("Added back to your next review");
+      });
     }
     return;
   }
@@ -450,7 +455,7 @@ document.addEventListener(
     }
     if (meta && event.key === "Enter") {
       event.preventDefault();
-      return void submit();
+      return void (event.shiftKey ? sendReview() : commitNote());
     }
     if (meta && event.key.toLowerCase() === "f") {
       event.preventDefault();
@@ -721,12 +726,18 @@ window.addEventListener("message", (event: MessageEvent) => {
       const clientId = String(data.clientId);
       const anchors = (data.anchors ?? []) as Array<{ selector: string; text: string }>;
       if (armed?.clientId === clientId) {
-        // A modifier-click extended the existing selection rather than starting
-        // a new edit — keep whatever has been typed so far.
+        // A modifier-click extended the selection rather than starting a new
+        // note — keep whatever has been typed so far.
         armed.anchors = anchors;
       } else {
-        stageArmed();
-        armed = { clientId, anchors, kind: data.kind === "text" ? "text" : "element", body: "" };
+        // Clicking a different element while a note is half-written commits it,
+        // so nothing is lost by moving on.
+        void commitNote().then(() => {
+          armed = { clientId, anchors, kind: data.kind === "text" ? "text" : "element" };
+          render();
+        });
+        input.focus();
+        break;
       }
       input.focus();
       render();
@@ -736,7 +747,7 @@ window.addEventListener("message", (event: MessageEvent) => {
     case "pe:repointed": {
       repointing = null;
       void guard("Re-pointing", () =>
-        api(`/annotations/${String(data.id)}/repoint`, {
+        api(`/items/${String(data.id)}/repoint`, {
           method: "POST",
           body: JSON.stringify({ selector: String(data.selector), text: String(data.text) }),
         }),
@@ -791,12 +802,17 @@ stream.addEventListener("message", (event) => {
     case "patch":
       void applyPatch();
       break;
-    case "sync":
-      annotations = payload.annotations;
+    case "sync": {
+      reviews = payload.reviews;
       chat = payload.chat;
+      // The server owns the draft note; only adopt it when the field is idle so
+      // it never overwrites what is being typed.
+      const note = draftReview()?.note ?? "";
+      if (document.activeElement !== overall && overall.value !== note) overall.value = note;
       syncTracking();
       render();
       break;
+    }
     case "versions":
       versions = payload.list;
       render();
