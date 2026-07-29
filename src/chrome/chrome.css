@@ -42,6 +42,18 @@
   --panel: #fafafa;
   color-scheme: light;
 }
+/* The `hidden` attribute only sets `display: none` in the UA stylesheet, so any
+   author `display:` rule — a class on the same element — silently beats it.
+   That is not a hypothetical: `.frame-overlay` (display: grid, opaque) sat over
+   the artifact forever and the page looked broken, and `.status-bar`
+   (position: fixed) covered the whole toolbar. Both passed typecheck and every
+   test. This one rule closes the class of bug for every element in the page;
+   the specific guards further down are kept as documentation of where it bit.
+
+   Audit new markup with:
+     grep -o 'id="[a-zA-Z]*" hidden' src/chrome/chrome-html.ts */
+[hidden] { display: none !important; }
+
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
 /* The status bar is a layout row, never an overlay: as `position: fixed` it sat
@@ -60,8 +72,12 @@ body {
   padding: 10px 16px; border-bottom: 1px solid var(--line);
 }
 .file { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The three gestures sit together and push right as one group: they are
+   alternatives to each other, and a toolbar that spread them apart implied you
+   could arm two. */
+.gestures { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .toggle {
-  display: flex; align-items: center; gap: 8px; margin-left: auto;
+  display: flex; align-items: center; gap: 8px;
   cursor: pointer; user-select: none;
   padding: 5px 10px 5px 7px; border-radius: 999px;
   border: 1px solid var(--line); background: var(--panel);
@@ -441,3 +457,220 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
 .card.focused {
   outline: 2px solid var(--accent); outline-offset: 1px;
 }
+/* Cards are focusable now that a/r/u act on the focused one, so the browser's
+   own ring would double up with ours. */
+.card:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* --- armed gestures --- */
+.gesture {
+  flex: 0 0 auto; font-size: 12px; padding: 6px 11px; border-radius: 999px;
+  background: transparent; color: var(--muted); border: 1px solid var(--line);
+}
+.gesture:hover { color: var(--fg); border-color: var(--accent); }
+/* The armed state is loud on purpose: the next click in the document does
+   something other than annotate, and a subtle hint is not enough warning for a
+   gesture whose first option is "delete this". */
+.gesture.armed {
+  background: var(--done); border-color: var(--done); color: #04220f; font-weight: 600;
+}
+.gesture-select {
+  flex: 0 0 auto; font: inherit; font-size: 12px; padding: 5px 8px; border-radius: 999px;
+  background: var(--bg); color: var(--muted); border: 1px solid var(--line);
+}
+.gesture-select.armed { background: var(--pending); border-color: var(--pending); color: #1a1205; font-weight: 600; }
+
+/* --- panel drawers: navigator, contract, locks --- */
+.drawer { border-bottom: 1px solid var(--line); }
+.drawer[hidden] { display: none; }
+.drawer > summary {
+  padding: 9px 16px; font-size: 11.5px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted); cursor: pointer; user-select: none;
+}
+.drawer > summary b { color: var(--fg); }
+.drawer-hint { margin: 0 16px 8px; font-size: 12px; color: var(--muted); }
+.finder { display: flex; align-items: center; gap: 8px; padding: 0 16px 8px; }
+.find-count { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.outline { max-height: 210px; overflow-y: auto; padding: 0 12px 10px; display: flex; flex-direction: column; gap: 1px; }
+.section {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px; text-align: left;
+  background: transparent; border: 0; border-radius: 6px; color: var(--fg);
+  font-size: 12.5px; padding: 4px 6px;
+}
+.section:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.sec-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.sec-count {
+  flex: 0 0 auto; font-size: 10.5px; font-weight: 700; padding: 0 6px;
+  border-radius: 999px; background: var(--line); color: var(--muted);
+}
+.sec-dot { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--pending); }
+
+/* A rule is not a note. Notes are consumed by one exchange and disappear;
+   these persist, so they are typeset as a list of statements rather than as
+   cards with a lifecycle. */
+.standing { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.rules { padding: 0 12px 8px; display: flex; flex-direction: column; gap: 4px; }
+.rule {
+  display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: baseline;
+  padding: 7px 10px; border-left: 3px solid var(--accent); border-radius: 0 6px 6px 0;
+  background: var(--bg); font-size: 13px;
+}
+.rule.off { opacity: .55; border-left-color: var(--muted); }
+.rule.off .rule-text { text-decoration: line-through; }
+.rule-text { overflow-wrap: anywhere; }
+.rule-meta { grid-column: 1; display: flex; gap: 8px; font-size: 11px; color: var(--muted); }
+.rule-meta .from { color: var(--pending); }
+.rule .link { grid-row: 1; grid-column: 2; }
+.retired { margin-top: 6px; }
+.retired > summary { font-size: 11.5px; color: var(--muted); cursor: pointer; padding: 4px 2px; }
+.rule-add { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 6px; }
+
+.locklist { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 4px; }
+.lock {
+  display: flex; gap: 8px; align-items: baseline; font-size: 12.5px;
+  padding: 6px 10px; border: 1px dashed var(--line); border-radius: 6px; background: var(--bg);
+}
+.lock-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- an item the agent is parked on --- */
+.card[data-awaiting] {
+  border-left-color: var(--pending);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--pending) 45%, transparent);
+}
+.awaiting {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--pending); margin-bottom: 5px;
+}
+.answer { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.reply { margin-top: 8px; }
+.reply > summary { font-size: 11.5px; color: var(--muted); cursor: pointer; user-select: none; }
+.reply textarea { margin-top: 6px; }
+.reply .add, .answer .add { align-self: flex-start; }
+
+/* --- verbatim and structural items --- */
+.verbatim, .structural {
+  margin-top: 7px; padding: 7px 9px; border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  font-size: 13px;
+}
+.tagline {
+  display: block; font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted); margin-bottom: 4px;
+}
+.structural { display: flex; gap: 8px; align-items: baseline; }
+.op {
+  flex: 0 0 auto; font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; padding: 1px 7px; border-radius: 999px;
+  background: var(--accent); color: #fff;
+}
+.op.delete { background: #ef4444; }
+.op.split { background: #a855f7; }
+.op.merge { background: #14b8a6; }
+.op-target { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- alternatives --- */
+.alts { margin-top: 8px; display: flex; flex-direction: column; gap: 5px; }
+.alts > b { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+/* Scoped to `.alts`: `.alt` is also the hint line inside an `.alert`, and an
+   unscoped rule painted that sentence as a clickable-looking box. */
+.alts .alt {
+  flex: 0 0 auto; text-align: left; font-size: 13px; padding: 7px 10px; border-radius: 7px;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+}
+.alts .alt:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.alts .alt.chosen { border-color: var(--done); background: color-mix(in srgb, var(--done) 12%, transparent); font-weight: 600; }
+
+/* --- weak anchors --- */
+.alert.weak { border-color: var(--muted); background: color-mix(in srgb, var(--muted) 10%, transparent); margin-top: 8px; }
+.alert.pattern { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.alert b { font-size: 12.5px; }
+.candidate {
+  flex: 0 0 auto; text-align: left; font-size: 12.5px; padding: 6px 9px; border-radius: 6px;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.candidate:hover { border-color: var(--accent); }
+.cscore {
+  display: inline-block; font: 10px ui-monospace, monospace; color: var(--muted);
+  margin-right: 7px; min-width: 30px;
+}
+.weak-badge {
+  margin-top: 6px; font-size: 11.5px; color: var(--muted);
+  display: flex; gap: 8px; align-items: baseline;
+}
+
+/* --- bulk triage --- */
+.triage { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+.triage .link { font-size: 12px; }
+.reverted, .requeued {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  padding: 1px 7px; border-radius: 999px; background: var(--line); color: var(--muted);
+}
+
+/* --- chat composer --- */
+.chat-composer { padding: 0 16px 12px; display: flex; gap: 6px; align-items: flex-start; }
+.chat-composer textarea { flex: 1; }
+.chat-composer .add { flex: 0 0 auto; }
+.chat .msg.user b { color: var(--pending); }
+
+/* --- sheets: forms --- */
+.form { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+.form code {
+  font: 11.5px ui-monospace, monospace; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+  max-height: 90px; overflow: auto; white-space: pre-wrap;
+}
+.form-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.form-actions button { flex: 0 0 auto; }
+.check { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
+.check input { margin-top: 3px; }
+
+/* --- history: names, pins, A/B --- */
+.version {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 8px; min-width: 118px;
+}
+.version-pick {
+  display: flex; flex-direction: column; gap: 1px; align-items: flex-start;
+  background: transparent; border: 0; padding: 0; color: var(--fg); text-align: left; width: 100%;
+}
+.vlabel { font-size: 11px; color: var(--muted); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vlabel i { font-style: normal; opacity: .8; }
+.vname { font: inherit; font-size: 11px; width: 130px; padding: 2px 4px; border: 1px solid var(--accent); border-radius: 4px; background: var(--bg); color: var(--fg); }
+.pinned { font-size: 10px; }
+.vtools { display: flex; gap: 3px; align-items: center; }
+.ab {
+  flex: 0 0 auto; font: 700 10px ui-monospace, monospace; padding: 1px 6px; border-radius: 4px;
+  background: transparent; color: var(--muted); border: 1px solid var(--line);
+}
+.ab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.vtools .link { font-size: 10.5px; }
+.diff-head { margin: 0 0 10px; font: 600 12px ui-monospace, monospace; color: var(--muted); }
+
+.churn { border-top: 1px solid var(--line); }
+.churn > summary { padding: 10px 18px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.churn-row { display: flex; gap: 10px; align-items: baseline; padding: 4px 18px; font-size: 13px; }
+.churn-count { font: 700 12px ui-monospace, monospace; color: var(--pending); min-width: 28px; }
+.churn-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.churn .when { font-size: 11px; color: var(--muted); }
+
+/* --- record sheet --- */
+.record { padding: 8px 18px 18px; overflow-y: auto; }
+.record section { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.record section:last-child { border-bottom: 0; }
+.record h3 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.record .drawer-hint { margin: 0 0 8px; }
+.record .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.record .row button { flex: 0 0 auto; font-size: 12.5px; padding: 6px 12px; }
+.record select { font: inherit; font-size: 12.5px; padding: 6px 8px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); max-width: 260px; }
+.record textarea { margin: 8px 0; }
+.import { display: block; margin-top: 10px; font-size: 12.5px; color: var(--muted); }
+.import input { display: block; margin-top: 5px; font-size: 12px; }
+.git-status { font-size: 12.5px; color: var(--muted); }
+.git-status b { color: var(--fg); }
+.companions { display: flex; flex-direction: column; gap: 4px; }
+.companions code { font: 11.5px ui-monospace, monospace; color: var(--muted); }
+
+/* Sheets scroll as one column; the versions strip keeps its own row scroll. */
+.sheet > .form, .sheet > .shortcuts, .sheet > .sessions { overflow-y: auto; }

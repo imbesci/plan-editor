@@ -1,124 +1,22 @@
-import { spawn } from "node:child_process";
-import { openSync } from "node:fs";
-import { mkdir, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import open from "open";
 
-import { defaultPort, LOOPBACK, serverLogFile, stateDir } from "./paths.ts";
-import type { PollResult, Review } from "./protocol.ts";
-import { canonicalFile, SessionStore, sessionKey } from "./store/session-store.ts";
+import { baseUrl, call, CliError, codeSignature, ensureServer, health, tokenFor } from "./client.ts";
+import { formatPollResult } from "./cli-format.ts";
+import { awaitAnswer, longPoll } from "./cli-wait.ts";
+import { stateDir } from "./paths.ts";
+import type { ContractRule } from "./protocol.ts";
+import { canonicalFile, SessionStore } from "./store/session-store.ts";
 
-const PACKAGE_VERSION = process.env.PLAN_EDITOR_BUILD_VERSION ?? "0.1.0";
-
-/**
- * The detached server only restarts when the CLI's version differs from the
- * running one. Keying that on package.json alone means every edit to src/ is
- * silently ignored until someone bumps a version by hand — the failure is a
- * server quietly running stale code, which looks like the new code not working.
- * Folding the newest source/bundle mtime into the identity makes any change
- * restart it.
- */
-async function codeSignature(): Promise<string> {
-  const roots = [fileURLToPath(new URL("./", import.meta.url)), fileURLToPath(new URL("../dist/", import.meta.url))];
-  let newest = 0;
-  for (const root of roots) {
-    let entries: string[] = [];
-    try {
-      entries = await readdir(root, { recursive: true, encoding: "utf8" });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const info = await stat(path.join(root, entry)).catch(() => null);
-      if (info?.isFile()) newest = Math.max(newest, info.mtimeMs);
-    }
-  }
-  return `${PACKAGE_VERSION}+${Math.round(newest)}`;
-}
-
-let VERSION = PACKAGE_VERSION;
-
-class CliError extends Error {
-  constructor(
-    message: string,
-    readonly hints: string[] = [],
-  ) {
-    super(message);
-  }
-}
-
-function baseUrl(): string {
-  return `http://${LOOPBACK}:${defaultPort()}`;
-}
-
-async function health(): Promise<{ app?: string; version?: string } | null> {
-  try {
-    const response = await fetch(`${baseUrl()}/health`, { signal: AbortSignal.timeout(600) });
-    if (!response.ok) return null;
-    return (await response.json()) as { app?: string; version?: string };
-  } catch {
-    return null;
-  }
-}
-
-async function ensureServer(): Promise<void> {
-  VERSION = await codeSignature();
-  const existing = await health();
-  if (existing?.app === "plan-editor" && existing.version === VERSION) return;
-  if (existing?.app === "plan-editor") {
-    await fetch(`${baseUrl()}/shutdown`, { method: "POST" }).catch(() => {});
-    await delay(200);
-  } else if (existing) {
-    throw new CliError(`Port ${defaultPort()} is occupied by another server`, [
-      "Set PLAN_EDITOR_PORT to a free port.",
-    ]);
-  }
-
-  await mkdir(stateDir(), { recursive: true });
-  const logFd = openSync(serverLogFile(), "a");
-  // process.execPath is the bun binary; re-invoking this same source file keeps
-  // the detached server on exactly the runtime that spawned it.
-  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "server"], {
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-    env: process.env,
-  });
-  child.unref();
-
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    await delay(100);
-    const probe = await health();
-    if (probe?.app === "plan-editor" && probe.version === VERSION) return;
-  }
-  throw new CliError("plan-editor server did not start", [`Check ${serverLogFile()} for details.`]);
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * The session token is the credential for every route. The CLI reads it from the
- * session file, which it can only do because it already has filesystem access to
- * the state directory — the same trust level as reading the artifact itself.
- */
-async function tokenFor(canonical: string): Promise<{ key: string; token: string }> {
-  const store = new SessionStore(stateDir());
-  const key = sessionKey(canonical);
-  const session = await store.read(key);
-  if (!session) {
-    throw new CliError(`No plan-editor session for ${canonical}`, [`Run \`plan-editor ${canonical}\` first.`]);
-  }
-  return { key, token: session.token };
-}
+export { formatPollResult, formatReview } from "./cli-format.ts";
 
 // --- commands ---------------------------------------------------------------
 
 async function openCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor <file.html>`"]);
+  if (!file) throw new CliError("An artifact path is required", ["Run `plan-editor <file.html|file.md>`"]);
   const canonical = await canonicalFile(file);
   await ensureServer();
 
@@ -156,40 +54,9 @@ async function openCommand(args: string[]): Promise<unknown> {
   };
 }
 
-/**
- * Long-polls in bounded slices until an edit arrives or the deadline passes.
- *
- * A single 15-minute HTTP request looks fine and is not: Bun's fetch applies its
- * own timeout well before that, which surfaced as an unhandled TimeoutError that
- * killed the command mid-wait. Chunking keeps every request short enough that no
- * client, proxy, or runtime default has an opinion about it, and a dropped
- * connection just costs one slice instead of the whole wait.
- */
-const POLL_SLICE_MS = 45_000;
-
-async function longPoll(canonical: string, token: string, deadline: number): Promise<PollResult> {
-  while (Date.now() < deadline) {
-    const slice = Math.max(1_000, Math.min(POLL_SLICE_MS, deadline - Date.now()));
-    const url =
-      `${baseUrl()}/api/poll?file=${encodeURIComponent(canonical)}&t=${encodeURIComponent(token)}` +
-      `&timeoutMs=${slice}`;
-    let result: PollResult | null = null;
-    try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(slice + 15_000) });
-      if (response.ok) result = (await response.json()) as PollResult;
-    } catch {
-      // Transient: the server restarted, or a slice timed out. Try the next one.
-      await delay(500);
-      continue;
-    }
-    if (result && result.status !== "waiting") return result;
-  }
-  return { status: "waiting" };
-}
-
 async function pollCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor poll <file.html>`"]);
+  if (!file) throw new CliError("An artifact path is required", ["Run `plan-editor poll <file>`"]);
   const canonical = await canonicalFile(file);
   await ensureServer();
   const { token } = await tokenFor(canonical);
@@ -237,55 +104,6 @@ async function which(name: string): Promise<string | null> {
   return null;
 }
 
-export function formatPollResult(file: string, result: PollResult): unknown {
-  if (result.status === "waiting") {
-    return {
-      status: "waiting",
-      next_step: `No review arrived before the timeout. Run \`plan-editor watch ${file}\` to keep waiting.`,
-    };
-  }
-  if (result.status === "ended") {
-    return {
-      status: "ended",
-      ended_by: result.endedBy,
-      next_step: "The human ended this session. Stop polling and report back in the conversation.",
-    };
-  }
-  return formatReview(file, result.review, Boolean(result.sessionEnded));
-}
-
-/**
- * The overall note leads, because it is the context that makes the individual
- * items interpretable — "cut this by a third" changes what every item means.
- */
-export function formatReview(file: string, review: Review, sessionEnded = false): unknown {
-  const items = review.items.filter((item) => item.status === "sent" || item.status === "orphaned");
-  return {
-    status: "review",
-    review_id: review.id,
-    overall_note: review.note || null,
-    items: items.map((item) => ({
-      id: item.id,
-      request: item.body,
-      anchor_text: item.text,
-      selector_hint: item.selector,
-      ...(item.anchors ? { covers: item.anchors.length } : {}),
-      ...(item.status === "orphaned" ? { note: "this item's anchor no longer exists" } : {}),
-    })),
-    next_step:
-      `This is one review, not a stream — read the overall note first, then every item, and work out how they fit together ` +
-      `before changing anything. Two items can pull in opposite directions, and the note usually says which wins. ` +
-      `Apply them all by editing ${file} directly; the open browser patches itself in place, so never ask the user to reload. ` +
-      `Give top-level sections stable \`id\` attributes so items can be matched precisely. ` +
-      `When you are done, run \`plan-editor respond ${file} --summary "<what you changed and why>"\` — that closes the review ` +
-      `and is what puts your work in front of the human to accept or reject. ` +
-      `If an item was ambiguous or you chose not to do it, flag it with ` +
-      `\`plan-editor answer ${file} --id <id> --outcome needs-call|caveat|skipped --note "<why>"\` before responding, ` +
-      `rather than guessing.` +
-      (sessionEnded ? " Note: the human ended the session with this review, so do not wait for another." : ""),
-  };
-}
-
 /**
  * Blocks until the human submits an edit, then returns it.
  *
@@ -298,7 +116,7 @@ export function formatReview(file: string, review: Review, sessionEnded = false)
  */
 async function watchCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor watch <file.html>`"]);
+  if (!file) throw new CliError("An artifact path is required", ["Run `plan-editor watch <file>`"]);
   const canonical = await canonicalFile(file);
   await ensureServer();
   const { token } = await tokenFor(canonical);
@@ -327,7 +145,7 @@ async function watchCommand(args: string[]): Promise<unknown> {
 /** Closes out the pending review with the agent's overall response. */
 async function respondCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required", ['Run `plan-editor respond <file.html> --summary "..."`']);
+  if (!file) throw new CliError("An artifact path is required", ['Run `plan-editor respond <file> --summary "..."`']);
   const summaryIndex = args.indexOf("--summary");
   const summary = summaryIndex !== -1 ? String(args[summaryIndex + 1] ?? "") : "";
   if (!summary) throw new CliError("--summary is required", ["The human needs to know what you did and why."]);
@@ -353,7 +171,7 @@ async function respondCommand(args: string[]): Promise<unknown> {
 /** Flags how one item was handled, when it was not a straightforward apply. */
 async function answerCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required");
+  if (!file) throw new CliError("An artifact path is required");
   const value = (flag: string) => {
     const index = args.indexOf(flag);
     return index !== -1 ? args[index + 1] : undefined;
@@ -374,7 +192,7 @@ async function answerCommand(args: string[]): Promise<unknown> {
 
 async function endCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required");
+  if (!file) throw new CliError("An artifact path is required");
   const canonical = await canonicalFile(file);
   const { key, token } = await tokenFor(canonical);
   await ensureServer();
@@ -450,7 +268,8 @@ function readStdin(): Promise<string> {
 }
 
 async function setupCommand(args: string[]): Promise<unknown> {
-  if (args[0] !== "hooks") throw new CliError("Unknown setup action", ["Run `plan-editor setup hooks`"]);
+  if (args[0] === "mcp") return setupMcp(args.slice(1));
+  if (args[0] !== "hooks") throw new CliError("Unknown setup action", ["Run `plan-editor setup hooks` or `setup mcp`"]);
   const { mergeHookSettings } = await import("./hooks.ts");
   const { readFile, writeFile, mkdir: makeDir } = await import("node:fs/promises");
   const os = await import("node:os");
@@ -485,20 +304,59 @@ async function setupCommand(args: string[]): Promise<unknown> {
   };
 }
 
+/**
+ * Prints the MCP client config rather than editing a config file.
+ *
+ * `setup hooks` writes to ~/.claude/settings.json because there is exactly one
+ * such file and its shape is known. MCP clients are many — Claude Desktop,
+ * Cursor, editors — with different config paths and schemas, and silently
+ * rewriting the wrong one is worse than printing the four lines to paste.
+ */
+async function setupMcp(args: string[]): Promise<unknown> {
+  const { mcpServerConfig } = await import("./mcp.ts");
+  const onPath = await which("plan-editor");
+  const command = onPath ?? `${process.execPath} ${fileURLToPath(new URL("./cli.ts", import.meta.url))}`;
+  const config = mcpServerConfig(command);
+
+  const out = valueOf(args, "--out");
+  if (out) {
+    const { writeFile } = await import("node:fs/promises");
+    const target = path.resolve(out);
+    await writeFile(target, `${JSON.stringify(config, null, 2)}\n`);
+    return { written: target, config };
+  }
+  return {
+    config,
+    help: [
+      "Add this to your MCP client's config (Claude Desktop: claude_desktop_config.json).",
+      "For Claude Code, `plan-editor setup hooks` is strictly better — hooks deliver a review into the session you " +
+        "are already in, with no tool call required at all.",
+    ],
+  };
+}
+
 async function exportCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor export <file.html>`"]);
+  if (!file) throw new CliError("An artifact path is required", ["Run `plan-editor export <file>`"]);
   const canonical = await canonicalFile(file);
   const { readFile, writeFile } = await import("node:fs/promises");
   const { stripSdk } = await import("./html-transform.ts");
+  const { isMarkdownPath, renderMarkdown } = await import("./markdown.ts");
 
   const outIndex = args.indexOf("--out");
   const out =
     outIndex !== -1 && args[outIndex + 1]
       ? path.resolve(String(args[outIndex + 1]))
-      : canonical.replace(/\.html?$/i, "") + ".export.html";
+      : `${canonical.replace(/\.(html?|md|markdown|mdx)$/i, "")}.export.html`;
 
-  const html = stripSdk(await readFile(canonical, "utf8"));
+  // An export is a standalone *readable* copy, so a markdown artifact is
+  // rendered rather than copied. Writing the source into a `.export.html` was
+  // the previous behaviour and produced a file that opened as a wall of
+  // unformatted text.
+  const source = await readFile(canonical, "utf8");
+  const html = isMarkdownPath(canonical)
+    ? renderMarkdown(source, { title: path.basename(canonical) }).html
+    : stripSdk(source);
   await writeFile(out, html);
 
   // Honest about what this does not do: remote and sibling-file references are
@@ -519,7 +377,7 @@ async function exportCommand(args: string[]): Promise<unknown> {
 
 async function undoCommand(args: string[]): Promise<unknown> {
   const file = args.find((arg) => !arg.startsWith("--"));
-  if (!file) throw new CliError("An HTML file path is required", ["Run `plan-editor undo <file.html>`"]);
+  if (!file) throw new CliError("An artifact path is required", ["Run `plan-editor undo <file>`"]);
   const canonical = await canonicalFile(file);
   await ensureServer();
   const { key, token } = await tokenFor(canonical);
@@ -530,6 +388,285 @@ async function undoCommand(args: string[]): Promise<unknown> {
   });
   if (!response.ok) throw new CliError("Nothing to undo for this artifact");
   return { ...((await response.json()) as object), file: canonical };
+}
+
+// --- shared argument plumbing ------------------------------------------------
+//
+// Every command below needs the same three things: the file, the session token,
+// and a JSON round trip. Hand-rolling that per command is how the older ones
+// drifted apart in their error handling.
+
+function valueOf(args: string[], flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  return index !== -1 ? args[index + 1] : undefined;
+}
+
+function fileArg(args: string[], usage: string): string {
+  const file = args.find((arg) => !arg.startsWith("--"));
+  if (!file) throw new CliError("An artifact path is required", [usage]);
+  return file;
+}
+
+/**
+ * Asks the human a question about one item and parks until they answer.
+ *
+ * `--outcome needs-call` was a dead end before this: the agent could flag an
+ * ambiguity and had no way to hear the answer short of the human happening to
+ * send a whole new review. Guessing instead is how a review comes back with
+ * three items right and one confidently wrong.
+ */
+async function askCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, 'Run `plan-editor ask <file> --id <item-id> --question "..."`');
+  const id = valueOf(args, "--id");
+  const question = valueOf(args, "--question");
+  if (!id) throw new CliError("--id is required", ["Use the item id from the review you were given."]);
+  if (!question) throw new CliError("--question is required");
+
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  await call(canonical, `/items/${id}/ask`, { method: "POST", body: { text: question } });
+
+  const maxMs = Number(valueOf(args, "--max-ms") ?? 15 * 60_000);
+  process.stderr.write(`[plan-editor] Asked, and waiting for an answer on ${path.basename(canonical)}.\n`);
+  const item = await awaitAnswer(canonical, id, Date.now() + Math.max(0, maxMs));
+  if (!item) {
+    return {
+      status: "unanswered",
+      next_step:
+        `The human has not answered yet. Do not guess: either run \`plan-editor ask\` again to keep waiting, or leave the ` +
+        `item with \`--outcome needs-call\` and respond to the rest of the review.`,
+    };
+  }
+  const reply = [...(item.thread ?? [])].reverse().find((message) => message.role === "human");
+  return {
+    status: "answered",
+    item_id: id,
+    answer: reply?.text ?? null,
+    ...(item.chosenAlternative ? { chose: item.chosenAlternative } : {}),
+    next_step: "Apply the item as answered, then respond to the review as usual.",
+  };
+}
+
+
+/** Offers the human two or more versions rather than picking one blind. */
+async function alternativesCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor alternatives <file> --id <item-id> --json <file.json>`");
+  const id = valueOf(args, "--id");
+  if (!id) throw new CliError("--id is required");
+  const jsonPath = valueOf(args, "--json");
+  const inline = valueOf(args, "--alternatives");
+  if (!jsonPath && !inline) {
+    throw new CliError("--json <file> or --alternatives '<json>' is required", [
+      'Each entry is {"id","label","html"} and at least two are needed.',
+    ]);
+  }
+  const { readFile } = await import("node:fs/promises");
+  const raw = jsonPath ? await readFile(path.resolve(jsonPath), "utf8") : inline!;
+  let alternatives: unknown;
+  try {
+    alternatives = JSON.parse(raw);
+  } catch {
+    throw new CliError("The alternatives payload is not valid JSON");
+  }
+
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  await call(canonical, `/items/${id}/alternatives`, { method: "POST", body: { alternatives } });
+  return {
+    status: "offered",
+    next_step:
+      `The human now picks one in the browser. Run \`plan-editor ask ${canonical} --id ${id} --question "which option?"\` ` +
+      `only if you also need prose; otherwise \`plan-editor watch ${canonical}\` picks the choice up.`,
+  };
+}
+
+/** The rules that outlive every review. */
+async function contractCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, 'Run `plan-editor contract <file> [--add "rule"] [--retire <id>]`');
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+
+  const add = valueOf(args, "--add");
+  if (add) return { ...(await call(canonical, "/contract", { method: "POST", body: { text: add } })) };
+  const retire = valueOf(args, "--retire");
+  if (retire) return { ...(await call(canonical, `/contract/${retire}`, { method: "DELETE" })) };
+
+  const result = (await call(canonical, "/contract")) as { active?: ContractRule[] };
+  return {
+    rules: (result.active ?? []).map((rule) => ({ id: rule.id, text: rule.text })),
+    note: "These are injected ahead of every review of this document.",
+  };
+}
+
+/** Promotes a rejection into a standing rule. */
+async function promoteCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor promote <file> --id <item-id>`");
+  const id = valueOf(args, "--id");
+  if (!id) throw new CliError("--id is required");
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  return call(canonical, `/items/${id}/promote`, {
+    method: "POST",
+    body: { ...(valueOf(args, "--text") ? { text: valueOf(args, "--text") } : {}) },
+  });
+}
+
+async function lockCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, 'Run `plan-editor lock <file> --selector "#budget" [--label "..."]`');
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const remove = valueOf(args, "--remove");
+  if (remove) return call(canonical, `/locks/${remove}`, { method: "DELETE" });
+  const selector = valueOf(args, "--selector");
+  if (!selector) throw new CliError("--selector is required", ["Or use --remove <lock-id>."]);
+  return call(canonical, "/locks", {
+    method: "POST",
+    body: { selector, text: valueOf(args, "--text") ?? "", label: valueOf(args, "--label") },
+  });
+}
+
+/** Lints an artifact against the contract that makes anchoring work. */
+async function doctorCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor doctor <file.html>`");
+  const canonical = await canonicalFile(file);
+  const { readFile } = await import("node:fs/promises");
+  const { inspectArtifactSource } = await import("./doctor.ts");
+  const { isMarkdownPath } = await import("./markdown.ts");
+  const findings = inspectArtifactSource(canonical, await readFile(canonical, "utf8"));
+  const errors = findings.filter((finding) => finding.severity === "error");
+  return {
+    file: canonical,
+    ok: errors.length === 0,
+    findings,
+    help: findings.length
+      ? [
+          "Stable section ids are the highest-value fix: idiomorph matches on id first, so ids are the difference " +
+            "between a note being marked addressed and being marked orphaned.",
+        ]
+      : isMarkdownPath(canonical)
+        ? ["Markdown artifacts get their ids from the renderer, so there is nothing to fix by hand."]
+        : ["This artifact follows the contract."],
+  };
+}
+
+/** Writes a starter artifact that already satisfies the contract. */
+async function newCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor new <file.html> --template plan|spec|report`");
+  const { renderTemplate, TEMPLATES } = await import("./doctor.ts");
+  const kind = (valueOf(args, "--template") ?? "plan") as keyof typeof TEMPLATES;
+  if (!(kind in TEMPLATES)) throw new CliError(`Unknown template: ${kind}`, [`Try: ${Object.keys(TEMPLATES).join(", ")}`]);
+  const title = valueOf(args, "--title") ?? path.basename(file).replace(/\.html?$/i, "").replace(/[-_]/g, " ");
+
+  const { writeFile } = await import("node:fs/promises");
+  const target = path.resolve(file);
+  const { access } = await import("node:fs/promises");
+  const exists = await access(target).then(
+    () => true,
+    () => false,
+  );
+  // Never silently overwrite a document someone is working on.
+  if (exists && !args.includes("--force")) {
+    throw new CliError(`${target} already exists`, ["Pass --force to overwrite it."]);
+  }
+  await writeFile(target, renderTemplate(kind, title));
+  return { created: target, template: kind, next_step: `Open it with \`plan-editor ${target}\`.` };
+}
+
+/** The review record — what was asked, what was done, what was accepted. */
+async function transcriptCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor transcript <file> [--out path.md]`");
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const { key, token } = await tokenFor(canonical);
+  const response = await fetch(`${baseUrl()}/api/${key}/transcript?t=${encodeURIComponent(token)}`);
+  if (!response.ok) throw new CliError("Could not build a transcript for this artifact");
+  const markdown = await response.text();
+  const out = valueOf(args, "--out");
+  if (!out) return { transcript: markdown };
+  const { writeFile } = await import("node:fs/promises");
+  const target = path.resolve(out);
+  await writeFile(target, markdown);
+  return { written: target };
+}
+
+/** Sequential handoff: no server exposure, no accounts, no merge problem. */
+async function packetCommand(args: string[]): Promise<unknown> {
+  const action = args[0];
+  const rest = args.slice(1);
+  const file = fileArg(rest, "Run `plan-editor packet export|import <file> …`");
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const { readFile, writeFile } = await import("node:fs/promises");
+
+  if (action === "export") {
+    const { key, token } = await tokenFor(canonical);
+    const reviewId = valueOf(rest, "--review");
+    if (!reviewId) throw new CliError("--review <review-id> is required", ["`plan-editor status` lists them."]);
+    const response = await fetch(`${baseUrl()}/api/${key}/packet/${reviewId}?t=${encodeURIComponent(token)}`);
+    if (!response.ok) throw new CliError("No such review on this artifact");
+    const target = path.resolve(valueOf(rest, "--out") ?? "review.packet.json");
+    await writeFile(target, await response.text());
+    return { written: target, help: ["Send this file to your reviewer; they import it against their own copy."] };
+  }
+
+  if (action === "import") {
+    const source = valueOf(rest, "--in");
+    if (!source) throw new CliError("--in <review.packet.json> is required");
+    const packet = JSON.parse(await readFile(path.resolve(source), "utf8")) as unknown;
+    return call(canonical, "/packet/import", {
+      method: "POST",
+      body: { packet, from: valueOf(rest, "--from") ?? path.basename(source) },
+    });
+  }
+
+  throw new CliError("Unknown packet action", ["Use `packet export` or `packet import`."]);
+}
+
+async function commitCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, 'Run `plan-editor commit <file> --message "..."`');
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const message = valueOf(args, "--message");
+  if (!message) throw new CliError("--message is required");
+  return call(canonical, "/git/commit", { method: "POST", body: { message } });
+}
+
+/** Names or pins a version, so history is not a row of anonymous `v7`s. */
+async function versionCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, 'Run `plan-editor version <file> --seq 12 --label "sent to leadership" [--pin]`');
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const seq = valueOf(args, "--seq");
+  if (!seq) throw new CliError("--seq is required");
+  return call(canonical, `/versions/${seq}/label`, {
+    method: "POST",
+    body: {
+      ...(valueOf(args, "--label") !== undefined ? { label: valueOf(args, "--label") } : {}),
+      ...(args.includes("--pin") ? { pinned: true } : args.includes("--unpin") ? { pinned: false } : {}),
+    },
+  });
+}
+
+/** Which sections keep being rewritten — i.e. where the disagreement is. */
+async function churnCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor churn <file>`");
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const result = (await call(canonical, "/churn")) as { churn?: Array<{ id: string; rewrites: number }> };
+  return {
+    churn: result.churn ?? [],
+    note: "A section rewritten many times is one you and the agent still disagree about.",
+  };
+}
+
+/** Artifacts reviewed together, so a cross-cutting note is answerable. */
+async function companionsCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor companions <file> --with a.md b.html`");
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const index = args.indexOf("--with");
+  const files = index === -1 ? [] : args.slice(index + 1).filter((arg) => !arg.startsWith("--"));
+  return call(canonical, "/companions", { method: "POST", body: { files } });
 }
 
 /**
@@ -569,6 +706,11 @@ async function statusCommand(): Promise<unknown> {
       awaiting_your_review: session.reviews
         .flatMap((r) => r.items)
         .filter((i) => i.status === "answered").length,
+      // A parked agent is the one state where someone is actively blocked, so
+      // it is worth surfacing above the tallies that merely accumulate.
+      awaiting_your_answer: session.reviews.flatMap((r) => r.items).filter((i) => i.awaitingHuman).length,
+      standing_rules: (session.contract ?? []).filter((rule) => !rule.retiredAt).length,
+      locked_regions: (session.locks ?? []).length,
     })),
   };
 }
@@ -580,30 +722,65 @@ async function stopCommand(): Promise<unknown> {
 
 async function serverCommand(): Promise<never> {
   const { serve } = await import("./server.ts");
-  VERSION = await codeSignature();
   const verbose = process.argv.includes("--verbose") || process.env.PLAN_EDITOR_DEBUG === "1";
-  await serve({
-    version: VERSION,
+  const instance = await serve({
+    version: await codeSignature(),
     onLog: verbose ? (message) => process.stderr.write(`${message}\n`) : undefined,
   });
-  return new Promise<never>(() => {});
+
+  // Park until the server actually stops, then leave. This used to park on a
+  // promise that never settled, so `plan-editor stop` and every version-driven
+  // restart closed the listener and left the process running forever — one
+  // leaked process per edit to src/, since the code signature is part of the
+  // server's identity.
+  await instance.closed;
+  process.exit(0);
 }
 
 // --- dispatch ---------------------------------------------------------------
 
 const HELP = `plan-editor — click an element, say what to change, watch it change in place.
 
-Usage:
-  plan-editor <file.html> [--no-open]   Open the artifact for review
-  plan-editor watch <file.html>         Park until the human submits an edit (the responsive path)
+Reviewing (.html, .htm, .md):
+  plan-editor <file> [--no-open]        Open the artifact for review
+  plan-editor watch <file>              Park until the human sends a review (the responsive path)
   plan-editor respond <file> --summary  Close the review with what you changed and why
   plan-editor answer <file> --id <id>   Flag one item: --outcome caveat|needs-call|skipped --note ".."
-  plan-editor poll <file.html>          Wait for edits (long-polls; never kill it)
+  plan-editor ask <file> --id <id>      Ask about one item and park until answered
+      --question "..." [--max-ms n]
+  plan-editor alternatives <file>       Offer two or more versions to pick from
+      --id <id> --json alts.json
+  plan-editor poll <file>               Wait for a review (long-polls; never kill it)
       [--reply "..."] [--timeout-ms n]
-  plan-editor end <file.html>           End the session
-  plan-editor undo <file.html>          Restore the previous version
-  plan-editor export <file.html>        Write a standalone copy [--out path]
-  plan-editor status                    List sessions and open edit counts
+  plan-editor end <file>                End the session
+
+Standing context (outlives any one review):
+  plan-editor contract <file>           List the rules injected into every review
+      [--add "rule"] [--retire <id>]
+  plan-editor promote <file> --id <id>  Turn a rejection into a standing rule
+  plan-editor lock <file>               Mark a region the agent must not touch
+      --selector "#budget" [--label ".."] [--remove <id>]
+  plan-editor companions <file>         Review several artifacts as one set
+      --with a.md b.html
+
+History and the record:
+  plan-editor undo <file>               Restore the previous version
+  plan-editor version <file> --seq n    Name or pin a version [--label ".."] [--pin]
+  plan-editor churn <file>              Which sections keep being rewritten
+  plan-editor transcript <file>         The review record as Markdown [--out path]
+  plan-editor export <file>             Write a standalone copy [--out path]
+  plan-editor commit <file>             Commit the artifact [--message "..."]
+  plan-editor packet export <file>      Hand a review to another reviewer
+      --review <id> [--out path]
+  plan-editor packet import <file>      Take one back [--in path] [--from name]
+
+Authoring and setup:
+  plan-editor new <file>                Write a compliant starter artifact
+      [--template plan|spec|report] [--title ".."]
+  plan-editor doctor <file>             Lint an artifact for anchoring problems
+  plan-editor setup hooks               Install the Claude Code hooks
+  plan-editor mcp                       Run the MCP server on stdio
+  plan-editor status                    List sessions and open review counts
   plan-editor stop                      Shut the background server down
   plan-editor server [--verbose]        Run the server in the foreground
 
@@ -624,6 +801,19 @@ async function main(): Promise<void> {
     answer: answerCommand,
     export: exportCommand,
     undo: undoCommand,
+    ask: askCommand,
+    alternatives: alternativesCommand,
+    contract: contractCommand,
+    promote: promoteCommand,
+    lock: lockCommand,
+    doctor: doctorCommand,
+    new: newCommand,
+    transcript: transcriptCommand,
+    packet: packetCommand,
+    commit: commitCommand,
+    version: versionCommand,
+    churn: churnCommand,
+    companions: companionsCommand,
     "notify-edit": notifyEditCommand,
     "notify-contact": notifyContactCommand,
   };
@@ -631,6 +821,12 @@ async function main(): Promise<void> {
   try {
     if (command === "server") {
       await serverCommand();
+      return;
+    }
+    // The MCP server owns stdio and must never have JSON help written into it.
+    if (command === "mcp") {
+      const { runMcpServer } = await import("./mcp.ts");
+      await runMcpServer();
       return;
     }
     if (!command || command === "--help" || command === "-h") {

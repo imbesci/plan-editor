@@ -11,11 +11,15 @@ import { mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 
 import type {
-  Anchor,
+  Alternative,
   ChatMessage,
+  ContractRule,
+  IncomingItem,
   ItemOutcome,
+  Lock,
   Review,
   ReviewItem,
+  ReviewPacket,
   Session,
   ThreadMessage,
 } from "../protocol.ts";
@@ -64,6 +68,12 @@ export class SessionStore {
       // Records written before reviews existed carried a flat annotation list.
       if (!Array.isArray(session.reviews)) session.reviews = [];
       if ("annotations" in session) delete session.annotations;
+      // Records written before the standing contract, locks, and review sets.
+      // Defaulting on read rather than migrating on write means an old session
+      // opens without a rewrite pass and a downgrade loses nothing.
+      if (!Array.isArray(session.contract)) session.contract = [];
+      if (!Array.isArray(session.locks)) session.locks = [];
+      if (!Array.isArray(session.companions)) session.companions = [];
       return session;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -134,6 +144,9 @@ export class SessionStore {
         ...(origin.authoredIn ? { authoredIn: origin.authoredIn } : {}),
         reviews: [],
         chat: [],
+        contract: [],
+        locks: [],
+        companions: [],
         createdAt: now,
         updatedAt: now,
       };
@@ -161,10 +174,7 @@ export class SessionStore {
    * Adds a note to the draft review. Nothing reaches the agent until the human
    * sends it — that separation is the whole point of the batch model.
    */
-  async addItems(
-    key: string,
-    incoming: Array<{ body: string; selector: string; text: string; anchors?: Anchor[]; tag: ReviewItem["tag"] }>,
-  ): Promise<ReviewItem[] | null> {
+  async addItems(key: string, incoming: IncomingItem[]): Promise<ReviewItem[] | null> {
     return this.mutate(key, (session) => {
       const draft = this.draftOf(session);
       const now = new Date().toISOString();
@@ -314,6 +324,29 @@ export class SessionStore {
   }
 
   /**
+   * Puts an item back to `answered`, undoing an accept or reject.
+   *
+   * A rejection that was already requeued leaves its copy in the draft; that
+   * copy is the human's to delete. Silently hunting it down and removing it
+   * would mean an undo that also deletes something the human may have since
+   * edited.
+   */
+  async clearVerdict(key: string, itemId: string): Promise<ReviewItem | null> {
+    return this.mutate(key, (session) => {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        if (item.status !== "accepted" && item.status !== "rejected") return null;
+        item.status = "answered";
+        delete item.revertedAt;
+        if (review.status === "closed") review.status = "answered";
+        return item;
+      }
+      return null;
+    });
+  }
+
+  /**
    * Moves rejected items into a fresh draft so they go back to the agent with
    * the next review. A rejection the agent never hears about is the worst
    * possible outcome.
@@ -382,6 +415,249 @@ export class SessionStore {
       // Unbounded chat was a real growth driver in lavish-axi; cap it here.
       if (session.chat.length > 500) session.chat.splice(0, session.chat.length - 500);
       return message;
+    });
+  }
+
+  // --- the standing contract -----------------------------------------------
+  //
+  // Everything above is scoped to one review. A contract rule is not: it is
+  // injected ahead of every review from now on, which is the only thing that
+  // stops the same correction being made in round four that was made in round
+  // one. Repeat corrections are the tax that makes iterating with an agent feel
+  // slower than writing it yourself.
+
+  async addContractRule(key: string, text: string, fromItemId?: string): Promise<ContractRule | null> {
+    return this.mutate(key, (session) => {
+      const normalized = text.trim();
+      // Same rule twice is noise in every future injection, so dedupe on text.
+      const existing = session.contract.find(
+        (rule) => !rule.retiredAt && rule.text.toLowerCase() === normalized.toLowerCase(),
+      );
+      if (existing) return existing;
+      const rule: ContractRule = {
+        id: newId(),
+        text: normalized,
+        createdAt: new Date().toISOString(),
+        ...(fromItemId ? { fromItemId } : {}),
+      };
+      session.contract.push(rule);
+      return rule;
+    });
+  }
+
+  /** Retires rather than deletes: the rule explains past reviews. */
+  async retireContractRule(key: string, ruleId: string): Promise<boolean | null> {
+    return this.mutate(key, (session) => {
+      const rule = session.contract.find((entry) => entry.id === ruleId);
+      if (!rule) return false;
+      rule.retiredAt = new Date().toISOString();
+      return true;
+    });
+  }
+
+  async restoreContractRule(key: string, ruleId: string): Promise<boolean | null> {
+    return this.mutate(key, (session) => {
+      const rule = session.contract.find((entry) => entry.id === ruleId);
+      if (!rule) return false;
+      delete rule.retiredAt;
+      return true;
+    });
+  }
+
+  /**
+   * Turns a rejection into a standing rule.
+   *
+   * Rejection reasons are the highest-signal data the system holds and until
+   * now it did nothing with them but requeue. The reason is what generalises —
+   * the item body is about one paragraph, the reason is about the document.
+   */
+  async promoteRejection(key: string, itemId: string, override?: string): Promise<ContractRule | null> {
+    const session = await this.read(key);
+    if (!session) return null;
+    let text = override?.trim();
+    if (!text) {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        const lastHuman = [...(item.thread ?? [])].reverse().find((message) => message.role === "human");
+        text = (lastHuman?.text ?? item.body).trim();
+        break;
+      }
+    }
+    if (!text) return null;
+    return this.addContractRule(key, text, itemId);
+  }
+
+  /** Rules the agent should actually be told about. */
+  activeContract(session: Session): ContractRule[] {
+    return session.contract.filter((rule) => !rule.retiredAt);
+  }
+
+  // --- locks ----------------------------------------------------------------
+
+  async addLock(key: string, input: { selector: string; text: string; label?: string }): Promise<Lock | null> {
+    return this.mutate(key, (session) => {
+      const existing = session.locks.find((lock) => lock.selector === input.selector);
+      if (existing) return existing;
+      const lock: Lock = { id: newId(), createdAt: new Date().toISOString(), ...input };
+      session.locks.push(lock);
+      return lock;
+    });
+  }
+
+  async removeLock(key: string, lockId: string): Promise<boolean | null> {
+    return this.mutate(key, (session) => {
+      const before = session.locks.length;
+      session.locks = session.locks.filter((lock) => lock.id !== lockId);
+      return session.locks.length !== before;
+    });
+  }
+
+  // --- clarification round trip ---------------------------------------------
+
+  /**
+   * The agent asks and parks. Before this, `needs-call` was a dead end: the
+   * agent could flag an ambiguity and had no way to hear the answer short of
+   * waiting for the human to send a whole new review.
+   */
+  async askOnItem(key: string, itemId: string, question: string): Promise<ReviewItem | null> {
+    return this.mutate(key, (session) => {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        item.thread = [...(item.thread ?? []), { role: "agent", text: question, at: new Date().toISOString() }];
+        item.awaitingHuman = true;
+        item.outcome = item.outcome ?? "needs-call";
+        return item;
+      }
+      return null;
+    });
+  }
+
+  /** The human answers, which is what unparks the agent. */
+  async answerQuestion(key: string, itemId: string, text: string): Promise<ReviewItem | null> {
+    return this.mutate(key, (session) => {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        item.thread = [...(item.thread ?? []), { role: "human", text, at: new Date().toISOString() }];
+        delete item.awaitingHuman;
+        // An answered question puts the item back in front of the agent. A
+        // question the agent asked and then never acted on is worse than one it
+        // never asked.
+        if (item.status === "answered") {
+          item.status = "sent";
+          delete item.answeredAt;
+        }
+        if (review.status === "answered") {
+          review.status = "sent";
+          delete review.deliveredTo;
+        }
+        return item;
+      }
+      return null;
+    });
+  }
+
+  /** Items with an unanswered agent question. */
+  pendingQuestions(session: Session): ReviewItem[] {
+    return session.reviews.flatMap((review) => review.items).filter((item) => item.awaitingHuman);
+  }
+
+  // --- alternatives ---------------------------------------------------------
+
+  async setAlternatives(key: string, itemId: string, alternatives: Alternative[]): Promise<ReviewItem | null> {
+    return this.mutate(key, (session) => {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        item.alternatives = alternatives;
+        delete item.chosenAlternative;
+        item.outcome = "needs-call";
+        item.awaitingHuman = true;
+        return item;
+      }
+      return null;
+    });
+  }
+
+  async chooseAlternative(key: string, itemId: string, alternativeId: string): Promise<ReviewItem | null> {
+    return this.mutate(key, (session) => {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        if (!item.alternatives?.some((alt) => alt.id === alternativeId)) return null;
+        item.chosenAlternative = alternativeId;
+        delete item.awaitingHuman;
+        item.thread = [
+          ...(item.thread ?? []),
+          {
+            role: "human",
+            text: `Chose: ${item.alternatives.find((alt) => alt.id === alternativeId)?.label ?? alternativeId}`,
+            at: new Date().toISOString(),
+          },
+        ];
+        return item;
+      }
+      return null;
+    });
+  }
+
+  // --- surgical revert ------------------------------------------------------
+
+  /**
+   * Records that rejecting this item also undid the agent's change to it.
+   *
+   * Rejecting used to record a verdict and requeue, which left the unwanted
+   * change sitting in the document until the next round — the human said "no"
+   * and the text stayed.
+   */
+  async markReverted(key: string, itemId: string): Promise<ReviewItem | null> {
+    return this.mutate(key, (session) => {
+      for (const review of session.reviews) {
+        const item = review.items.find((entry) => entry.id === itemId);
+        if (!item) continue;
+        item.revertedAt = new Date().toISOString();
+        return item;
+      }
+      return null;
+    });
+  }
+
+  // --- review sets ----------------------------------------------------------
+
+  async setCompanions(key: string, files: string[]): Promise<string[] | null> {
+    return this.mutate(key, (session) => {
+      session.companions = [...new Set(files)].slice(0, 20);
+      return session.companions;
+    });
+  }
+
+  // --- packets --------------------------------------------------------------
+
+  /**
+   * Imports a review someone else wrote against their own copy. Items land in
+   * the draft rather than as a sent review: the owner of the artifact decides
+   * what crosses to their agent, which is the same rule the local markup phase
+   * follows.
+   */
+  async importPacket(key: string, packet: ReviewPacket, from: string): Promise<number | null> {
+    return this.mutate(key, (session) => {
+      const draft = this.draftOf(session);
+      const now = new Date().toISOString();
+      for (const item of packet.review.items) {
+        draft.items.push({
+          ...item,
+          id: newId(),
+          body: `${item.body} — from ${from}`,
+          status: "draft",
+          createdAt: now,
+        });
+      }
+      if (packet.review.note) {
+        draft.note = draft.note ? `${draft.note}\n\n${from}: ${packet.review.note}` : `${from}: ${packet.review.note}`;
+      }
+      return packet.review.items.length;
     });
   }
 

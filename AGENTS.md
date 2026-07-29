@@ -6,10 +6,17 @@ Guidance for coding agents working in this repository.
 
 ```sh
 bun run check      # build + typecheck + test — run before pushing
-bun test           # node:test files, executed by Bun's runner
+bun run test       # node:test files, one process per file (never bare `bun test`)
+bun run test:e2e   # Playwright against a real browser and a real server
 bun run build      # browser bundles only
 bun run typecheck  # tsc --noEmit
 ```
+
+`check` deliberately does **not** run `test:e2e`: it needs a Chromium download
+(`bunx playwright install chromium`) and takes minutes rather than seconds. Run
+it before shipping anything that touches the chrome, the SDK, or the boundary
+between them — which is where every bug listed under "Bugs only a real browser
+found" lived.
 
 Run one file: `bun test test/morph.test.ts`.
 
@@ -60,6 +67,122 @@ delivery. An annotation stays `submitted` until the browser reports that the age
 edit actually touched its anchored element, at which point it becomes `addressed`.
 This is the whole reason the tool can show which feedback landed.
 
+## Markdown artifacts are rendered, never round-tripped
+
+`.md` files are first-class artifacts, and the rule that makes that safe is that
+**the conversion is one-way**. The markdown on disk is the source of truth; the
+agent edits it exactly as it edits HTML; the browser only ever renders it
+(`renderMarkdown`, `src/markdown.ts`). There is no HTML→Markdown path and there
+must never be one — it is the only operation in this tool capable of silently
+rewriting the user's prose, and it would run on every patch.
+
+Consequences that are easy to get wrong:
+
+- **Version snapshots hold the source, not the render.** Storing the render
+  would make restore write HTML over someone's `.md`. Every *read* path renders
+  (`renderArtifact`); every *write* path does not.
+- **`POST /api/:key/write` refuses markdown with a 409.** The browser holds the
+  rendered document, so writing it back is the round trip by another name.
+- **The agent is given source line ranges, not selectors.** A CSS selector is an
+  artefact of the render and useless to an agent about to open the file;
+  `sourceLinesFor` maps ids to `plan.md:42-47` at poll time. Computed at poll
+  time deliberately — the file moves under the review, so a line recorded when
+  the note was written points at the wrong line by the time it is read.
+- The renderer assigns every block a stable id derived from the nearest heading
+  slug, because that is what the whole anchoring model rests on.
+
+## The standing contract outlives the review
+
+`Session.contract` is the fourth primitive, after pointing, batching, and
+attribution. Reviews were stateless: nothing accumulated, so the same correction
+came back in round four that was made in round one.
+
+- **Rules are repeated on every injection; items are compacted after the first.**
+  This is the exact inverse of the `deliveredAt` rule for items, and it is
+  deliberate. A rule stated once and never again is a rule the agent breaks three
+  turns later, and unlike an item it is not visible in the file it is looking at.
+- **Retire, never delete.** A retired rule still explains past reviews, so it
+  stays in `contract` and drops out of `activeContract`.
+- **Promotion takes the rejection's *reason*, not the item body.** The body is
+  about one paragraph; the reason is about the document, and only the reason
+  generalises. Rejection reasons were the highest-signal data in the system and
+  the only thing done with them was requeueing.
+
+## Locks constrain the agent, not the human
+
+A locked region is delivered to the agent as `do_not_touch` and rendered with a
+badge in the artifact. Clicking one in annotate mode still creates a note — the
+human is always allowed to ask. The badge lives in a body-level `[data-pe-ui]`
+layer positioned in page coordinates, **never inside the locked element**: a
+child node there is not stripped by `markupWithoutOurClasses`, so the element
+would compare as changed on every single patch.
+
+## Asking must park on the item, not the review
+
+`plan-editor ask` and the MCP `ask_human` wait on
+`GET /api/:key/items/:id/await-answer`, not on `/api/poll`.
+
+The obvious implementation is wrong and quietly so: an item can only be asked
+about while its review is still `sent`, so `takeFeedback` returns that same
+review immediately and the agent unparks a millisecond after asking with
+`answer: null` — and then guesses, which is the precise failure that asking
+exists to prevent. This shipped once and looked like it worked. There are three
+regression tests for it in `test/standing.test.ts`.
+
+Answering a question moves the review back to `sent` and clears `deliveredTo`,
+so a plain `watch` picks it up too; the agent should never need a special
+command to hear a reply it asked for.
+
+## Anchors are scored, not matched
+
+`resolveAnchor` used to require **exact** equality of collapsed `textContent`
+against a snippet truncated to 300 characters. That meant it could only re-find
+elements the agent had *not* edited — the complement of the set that matters —
+and no paragraph over 300 characters could ever re-anchor at all.
+
+`src/sdk/anchor.ts` is a pure, DOM-free module: `hash` and `shingles` are
+computed over the **full** text while the stored `text` is clipped, and
+candidates are scored (`CONFIDENT = 0.72`). Two rules are load-bearing:
+
+- **Ties break toward the earlier candidate.** The old code took the first
+  document-order match with no arbitration, so repeated boilerplate silently
+  re-anchored to the wrong node.
+- **Prefer an empty candidate list to false precision.** A fully reworded
+  paragraph is lexically indistinguishable from noise; `pe:trackResult` reports
+  it as `weak` with ranked candidates so the human can re-point in one click,
+  rather than the tool confidently attaching a note to the wrong element.
+
+## Packets, and why they do not break the refusal set
+
+There is still no multiplayer, no CRDT, and no identity model. A packet is
+*sequential handoff*: a review exported to a file, opened against someone else's
+copy, sent back. Two rules keep it that way:
+
+- **An imported packet lands in the draft, never as a sent review.** The owner
+  of the artifact decides what crosses to their agent — the same rule the local
+  markup phase follows.
+- **Drift is always reported.** `summarizePacket` compares the artifact hash,
+  because a packet written against a different revision is exactly the case
+  where anchors resolve cleanly to the *wrong* element.
+
+`parseReviewPacket` is the one place untrusted *file* content enters the store,
+so it is parsed field by field rather than spread.
+
+## The MCP server owns stdout
+
+`src/mcp.ts` speaks newline-delimited JSON-RPC on stdio. **A stray `console.log`
+corrupts the stream**, and the failure looks like the client hanging rather than
+like a log line. Everything diagnostic goes to stderr.
+
+Two protocol details that fail silently if broken: a notification (no `id`) must
+draw no response at all, and a failing tool returns `isError` content rather than
+a JSON-RPC error, so the agent can read the message and recover instead of having
+the call fail underneath it.
+
+Requests are handled sequentially, not concurrently — `await_review` and
+`ask_human` park for minutes, and a client pipelining behind them expects
+queueing, not racing.
+
 ## Invariants
 
 - **Never `await read` … `await write` without the queue.** `src/store/atomic.ts`
@@ -99,6 +222,35 @@ This is the whole reason the tool can show which feedback landed.
   back.
 - **Asset serving confines by `realpath`, not just by lexical `..` rejection.** A
   symlink inside the artifact directory otherwise escapes it.
+- **Version payloads are written atomically too, not just the index.** The
+  payload used to be a plain `writeFile` while only `index.json` was atomic, so a
+  crash mid-write left a truncated snapshot the index still advertised as valid —
+  and undo restoring a half-written file is worse than having no undo.
+- **A new `seq` never reuses a filename already on disk.** `readIndex` turns any
+  unreadable index into an empty history, so without the `highestSeqOnDisk`
+  check a corrupt index restarts numbering at 1 and silently overwrites `1.html`.
+- **Pinned versions are exempt from the `MAX_VERSIONS` cap.** Pinning is the
+  human saying "this one is the record"; ageing out the version someone named is
+  the one drop that is never acceptable.
+- **Companion paths are resolved and `stat`ed server-side**, exactly like
+  `POST /api/sessions`. A client-supplied path must never become a path the
+  server trusts.
+- **`sectionsOf` refuses rather than guesses.** The server has no DOM, so
+  `src/html-slice.ts` balances tags by hand; anything it cannot bracket
+  confidently is simply not reported. A wrong slice would attribute one
+  section's rewrites to another, and an absent entry is honest where a wrong one
+  is not.
+- **Undoing a verdict does not hunt down the requeued copy.** A rejection that
+  already requeued leaves its copy in the draft; that copy is the human's to
+  delete, because by then they may have edited it.
+- **The detached server must exit, not merely stop listening.** `serve()` returns
+  a `closed` promise and `serverCommand` awaits it before `process.exit(0)`. It
+  used to park on `new Promise<never>(() => {})`, so `shutdown()` closed the
+  listener and the process lived on. Combined with the code signature being part
+  of the server's identity — which restarts it on *every* edit to `src/` — that
+  leaked one ~9MB process per edit. Forty-eight were found running, only two of
+  them listening. Nothing surfaced it, because a leaked process is invisible to
+  every command the tool offers.
 
 ## Testing notes
 
@@ -326,6 +478,139 @@ Lifecycle invariants:
 - **`anchors[0]` mirrors `selector`/`text`** so single-anchor consumers need no
   branching.
 
+## Diagrams: the source is authoritative, the render is presentation
+
+Mermaid diagrams render in the browser. Three rules keep that from fighting
+everything else this tool does, and all three were learned from the predecessor
+tool (see below).
+
+- **The source element stays in the document and keeps its id.** It is hidden,
+  not replaced. It is what exists in the file, so it stays the unit of diffing,
+  anchoring, and word-level highlighting — and it is what the agent edits.
+- **The rendered SVG is a `[data-pe-ui]` sibling, inserted `afterend`.** Not a
+  child, and never in place of the source. Two reasons: `morphDocument` skips
+  `[data-pe-ui]`, and the SVG is generated client-side so it is *not in the
+  file* — without the marker every single patch would delete it. Putting it
+  beside the source rather than inside also means a re-render churns within a
+  hidden element and cannot destroy anything the human is looking at.
+- **Rendering is deterministic or it is useless.** `deterministicIds: true` plus
+  a render id derived from the host element's id makes `mermaid.render` return
+  byte-identical SVG for identical source, with all inner ids namespaced under
+  that render id. Mermaid's default random ids would make every diagram look
+  rewritten on every patch: highlight flashing, a bogus entry in "changes nobody
+  asked for", and any note anchored nearby orphaned. Verified in a real browser
+  before any of this was built.
+
+**Identity is the host element's `id`, never ordinal position.** The predecessor
+keyed diagrams by their index among `.mermaid` elements, computed independently
+in the browser and on the server. Inserting one diagram above another silently
+reassigned every saved diagram to the wrong one. We diff by id everywhere else;
+`doctor` warns (`diagram-without-id`) when a diagram has no id to key on.
+
+**A note on a diagram node anchors to the node's identity and label, never to
+coordinates.** `Anchor.node = {id, label}` rides along with an anchor that still
+points at the *source* element. A diagram is re-rendered from source on every
+patch and every theme change, so any x/y would be stale the moment the agent
+touched it — whereas the node id comes from the source text and survives. A
+click also snaps up to the whole `<g>`, so you annotate the node rather than the
+`<rect>` under the cursor.
+
+**Mermaid is lazy-loaded and vendored.** `dist/mermaid.js` is ~2.6MB against the
+SDK's 30kb, so it is a separate bundle fetched only once a diagram is actually
+found, as a classic `<script>` tag — a module `import()` would need CORS the
+server does not grant to an opaque-origin frame. Vendored rather than a CDN
+because artifacts must render offline, which is the same reason `doctor` flags
+remote references.
+
+**Deliberately not adopted from the predecessor:** an embedded Excalidraw
+whiteboard. It is a genuinely good feature there, but it costs React plus
+Excalidraw plus a mermaid-to-scene converter plus vendored fonts, pins mermaid
+to an exact version because the converter reaches into its internals, and brings
+a font-metrics repair pass and a two-iframe teardown protocol with it. Its own
+design also makes whiteboarded diagrams un-annotatable, because the source
+container is hidden and there is nothing left to click. Per-node annotation is
+the cheaper half of that idea and the half that fits a tool whose whole thesis
+is anchoring notes to elements.
+
+## Keyboard shortcuts must be relayed out of the iframe
+
+The chrome and the artifact are separate documents with no `allow-same-origin`
+between them, so **they cannot see each other's key events**. A shortcut bound
+only on `document` in `chrome-client.ts` is dead the moment focus enters the
+frame — which is immediately, because clicking the document is the primary
+interaction.
+
+Only `⌘I` was ever relayed. Everything else — `j`/`k`, `a`/`r`/`u`, `/`, `?`,
+`⌘H`, `⌘Z`, `⌘F`, `⌘\`, arrows — silently did nothing in exactly the situation
+you would reach for it, which reads as "the keybinds don't work".
+
+The SDK now posts `pe:key {key, meta, shift}` and the chrome runs it through the
+same `handleKey` as a real event. Two rules:
+
+- **The SDK must `preventDefault()`**, because the chrome cannot cancel an event
+  in another document — otherwise `⌘F` opens the browser's find bar and `/`
+  triggers quick-find.
+- **Bare letters must be suppressed while typing in the artifact**
+  (`typingInArtifact`). An artifact can contain inputs, and `j` typed into one
+  must not scroll the review list.
+
+Adding a chrome shortcut means adding it to `META_KEYS` or `PLAIN_KEYS` in
+`sdk.ts` too. There is no way for the chrome alone to notice it is missing.
+
+## A selection must be releasable
+
+Clicking an element arms a note. Until this was fixed there was **no way to take
+that back**: `pe:cancel` existed in the SDK and the chrome only ever sent it on
+a failed submit, so a mis-click left a pulsing outline whose only exit was to
+write a note you did not want and then delete it from the panel.
+
+Three paths now release it, and all three go through `clearArmed()` in the SDK
+and `unarm()` in the chrome: clicking the armed element again, `Escape`, and a
+visible **Clear selection** button (Escape alone is not discoverable).
+
+`clearArmed()` only ever drops the *armed* group. Everything else in `pending`
+is a real note that exists on the server, and clearing those marks would tell
+the human their feedback had vanished.
+
+**Leaving annotate mode clears the selection too**, and `.pe-pending` is styled
+only inside `.pe-annotate` — the marks are an annotating affordance, so the mode
+that produced them going away has to take them with it. Otherwise the document
+still looks marked up while none of the tools that made the marks are on screen.
+
+## Bugs only a real browser found
+
+Every one of these passed the whole `node:test` suite. They were caught by
+driving Chromium against a live server (`e2e/`, Playwright), and each is now
+covered there.
+
+- **A note typed straight after a click was filed against the whole page.** The
+  click and the first keystroke are separated by a `postMessage` hop across the
+  sandbox, so `armed` was still null when the text arrived; the chrome
+  auto-committed it as a `page` note, cleared the box, and *then* displayed
+  "Pinned to …" for the element. The auto-commit is only correct when a previous
+  target existed — with nothing pinned, the text belongs to the element just
+  clicked. Silent mis-filing is the worst failure this tool can have.
+- **Settling the last item made the review vanish.** Giving every item a verdict
+  closes the review, and `phase()` fell straight back to `drafting`, so the work
+  disappeared mid-keystroke and `u` — the documented undo for a misfired verdict
+  — became unreachable, because it acts on the focused card and there was no
+  longer a card. A closed review now stays visible until the human starts marking
+  up again. Note the render path reads `answeredReview() ?? closedReview()`, not
+  `visibleReview()`; changing one without the other renders an empty list.
+- **The navigator's outline had no click handler at all.** It rendered buttons
+  that highlighted on hover and did nothing, which is worse than not shipping it.
+- **Every morph nested a second `<head>` and `<body>`.** `innerHTML` morphing
+  takes the *children* of the new content, so it must be handed
+  `parsed.head.innerHTML`, not `parsed.head`. Invisible to jsdom, invisible to
+  the user, and it does not compound — it just quietly mangles the document.
+- **`markupWithoutOurClasses` stripped our classes but not our nodes.** A
+  rendered diagram or a lock badge is a `[data-pe-ui]` child that exists only in
+  the live DOM, so any element containing one compared as changed on *every*
+  patch — marking every note on that section addressed by an edit nobody made.
+
+The lesson worth keeping: this codebase's hardest bugs live at the boundary
+between the two documents, and jsdom cannot see across it.
+
 ## Chrome UI invariants
 
 - **Any element rendered with `hidden` needs an explicit `[hidden] { display: none }`
@@ -356,5 +641,11 @@ Lifecycle invariants:
 
 No multiplayer, no CRDT, no identity model. The artifact is agent-owned and humans
 propose changes to it; that design call is what keeps the annotation layer a simple
-append-only record instead of a merge problem. No version history yet — it is the
-natural next feature, and the morph diff already computes most of what it needs.
+append-only record instead of a merge problem. Packets give sequential handoff
+without touching any of that — see above.
+
+No AI in the tool itself. plan-editor never calls a model. It moves reviews to
+your agent and changes back to your browser; the intelligence is entirely in the
+conversation you were already having. Grouping rejections for the
+"promote to a rule" hint is string comparison, deliberately, and should stay
+that way.

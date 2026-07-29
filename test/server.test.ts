@@ -57,6 +57,28 @@ after(async () => {
 
 const withToken = (pathname: string) => `${origin}${pathname}${pathname.includes("?") ? "&" : "?"}t=${session.token}`;
 
+describe("shutdown", () => {
+  test("the server reports when it has actually stopped", async () => {
+    // Without this the detached process has no way to know it is done: the CLI
+    // parked on a promise that never settled, so `stop` and every
+    // version-driven restart closed the listener and left the process alive.
+    // Because the code signature is part of the server's identity, that leaked
+    // one process per edit to src/ — 48 were found running.
+    const directory = await mkdtemp(path.join(os.tmpdir(), "plan-editor-shutdown-"));
+    const other = await serve({ port: 0, stateDirectory: directory, version: "test", idleTimeoutMs: 60_000 });
+
+    let stopped = false;
+    void other.closed.then(() => (stopped = true));
+    assert.equal(stopped, false, "it must not resolve while the server is up");
+
+    await other.shutdown();
+    await other.closed;
+    assert.equal(stopped, true);
+
+    await rm(directory, { recursive: true, force: true });
+  });
+});
+
 describe("session creation", () => {
   test("returns a capability token, not just a key", () => {
     assert.ok(session.token.length >= 30, "token must be long enough to resist guessing");

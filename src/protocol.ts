@@ -16,6 +16,76 @@
 export interface Anchor {
   selector: string;
   text: string;
+  /**
+   * Hash of the anchored text at capture time. The selector is a hint and the
+   * text is exact-match-only, so neither survives the agent rewriting the very
+   * element the note is about — which is precisely the set of elements that
+   * change. The hash lets re-anchoring score candidates instead of demanding
+   * equality. See `src/sdk/anchor.ts`.
+   */
+  hash?: string;
+  /** Word shingles of the anchored text, for similarity scoring. */
+  shingles?: string[];
+  /**
+   * Set when the human clicked a node inside a rendered diagram.
+   *
+   * The anchor itself still points at the *source* element — the `<pre>` holding
+   * the diagram text, which is what exists in the file and what the agent edits.
+   * This just says which node they meant.
+   *
+   * Deliberately identity and label, never coordinates. A diagram is re-rendered
+   * from its source on every patch and on every theme change, so any x/y would
+   * be stale the moment the agent touched it; the node id comes from the source
+   * text and survives.
+   */
+  node?: { id: string; label: string };
+}
+
+/**
+ * A rule that outlives any single review.
+ *
+ * The overall note dies with its review, so the same correction gets made in
+ * round four that was made in round one. A contract rule is injected ahead of
+ * every review, forever, until the human retires it.
+ */
+export interface ContractRule {
+  id: string;
+  text: string;
+  createdAt: string;
+  /** Set when promoted from a rejection, so the panel can show its provenance. */
+  fromItemId?: string;
+  /** Retired rules are kept for provenance but never injected. */
+  retiredAt?: string;
+}
+
+/**
+ * A region the agent must not touch.
+ *
+ * Attribution already reports changes nobody asked for; a lock upgrades that
+ * from a report into an enforcement, which is what a document containing
+ * load-bearing numbers needs.
+ */
+export interface Lock {
+  id: string;
+  selector: string;
+  text: string;
+  label?: string;
+  createdAt: string;
+}
+
+/** One of several versions of a section the agent wants the human to pick from. */
+export interface Alternative {
+  id: string;
+  label: string;
+  html: string;
+}
+
+/** A structural intent, which prose describes worst and a diff verifies best. */
+export interface StructuralOp {
+  kind: "delete" | "move-before" | "move-after" | "split" | "merge";
+  /** The other element involved, for move/merge. */
+  targetSelector?: string;
+  targetText?: string;
 }
 
 export interface ThreadMessage {
@@ -45,6 +115,15 @@ export type ItemOutcome =
   | "needs-call" // ambiguous; the agent wants a decision rather than guessing
   | "skipped"; // deliberately not done, with a reason
 
+/**
+ * `verbatim` and `structural` exist because prose is the worst way to express
+ * the two cheapest kinds of change. "Change 'leverage' to 'use'" is a round
+ * trip and an ambiguity; the replacement text is neither. Likewise "move Risks
+ * above Milestones but leave the intro" is an id-set operation dressed up as a
+ * sentence.
+ */
+export type ItemTag = "element" | "text" | "page" | "verbatim" | "structural";
+
 export interface ReviewItem {
   id: string;
   /** What the human wants changed. */
@@ -55,14 +134,29 @@ export interface ReviewItem {
   text: string;
   /** Every element this item covers; several when chunk-selected. */
   anchors?: Anchor[];
-  tag: "element" | "text" | "page";
+  tag: ItemTag;
+  /** For `verbatim`: the exact text the human wants in place of `text`. */
+  replacement?: string;
+  /** For `structural`: the operation requested. */
+  op?: StructuralOp;
   status: ItemStatus;
   outcome?: ItemOutcome;
   /** The agent's note about how it handled this item. */
   agentNote?: string;
   thread?: ThreadMessage[];
+  /**
+   * True when the agent asked a question and is waiting. `needs-call` without
+   * this was a dead end: the agent flagged ambiguity and had no way to hear an
+   * answer short of a whole new review cycle.
+   */
+  awaitingHuman?: boolean;
+  /** Versions of this section the agent wants the human to choose between. */
+  alternatives?: Alternative[];
+  chosenAlternative?: string;
   createdAt: string;
   answeredAt?: string;
+  /** Set when the human rejected this item *and* undid the agent's change. */
+  revertedAt?: string;
   /** Carried into a later review after rejection; prevents duplicating it. */
   requeued?: boolean;
 }
@@ -118,6 +212,16 @@ export interface Session {
   /** cwd at open time; the fallback route when there is no session id. */
   authoredIn?: string;
   chat: ChatMessage[];
+  /** Rules that outlive every review. Injected ahead of the review itself. */
+  contract: ContractRule[];
+  /** Regions the agent must not touch. */
+  locks: Lock[];
+  /**
+   * Other artifacts reviewed alongside this one. A cross-cutting note — "these
+   * three disagree about the retry budget" — is not expressible against a
+   * single file, and the agent needs to see the set to answer it.
+   */
+  companions: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -127,7 +231,14 @@ export type ServerEvent =
   | { type: "patch"; reason: "file-changed" }
   | { type: "agent-activity"; active: boolean }
   | { type: "agent-reply"; text: string }
-  | { type: "sync"; reviews: Review[]; chat: ChatMessage[] }
+  | {
+      type: "sync";
+      reviews: Review[];
+      chat: ChatMessage[];
+      contract: ContractRule[];
+      locks: Lock[];
+      companions: string[];
+    }
   | { type: "versions"; list: VersionMeta[] }
   | { type: "presence"; state: AgentPresence; agent: AgentIdentityView };
 
@@ -136,6 +247,22 @@ export interface VersionMeta {
   at: string;
   bytes: number;
   origin: "open" | "edit" | "restore";
+  /** A human name, so history is not a row of anonymous `v7`s. */
+  label?: string;
+  /** Pinned versions are exempt from the oldest-first cap. */
+  pinned?: boolean;
+}
+
+/**
+ * How often one section has been rewritten. The sharpest signal in the system:
+ * a section rewritten six times is a section the human and the agent still
+ * disagree about, and nothing surfaced that before.
+ */
+export interface SectionChurn {
+  id: string;
+  label: string;
+  rewrites: number;
+  lastAt: string;
 }
 
 export type AgentPresence = "waiting" | "listening" | "working";
@@ -150,11 +277,42 @@ export interface AgentIdentityView {
   viaHooks: boolean;
 }
 
-/** Agent-facing poll result. A whole review, never a loose note. */
+/**
+ * Agent-facing poll result. A whole review, never a loose note — and never a
+ * review without the standing context that makes it interpretable.
+ */
 export type PollResult =
   | { status: "waiting" }
   | { status: "ended"; endedBy: "user" | "agent" }
-  | { status: "review"; review: Review; sessionEnded?: boolean; endedBy?: "user" | "agent" };
+  | {
+      status: "review";
+      review: Review;
+      /** Rules that apply to every review, not just this one. */
+      contract?: ContractRule[];
+      /** Regions the agent must not touch. */
+      locks?: Lock[];
+      /** Other artifacts under review alongside this one. */
+      companions?: string[];
+      /**
+       * For markdown artifacts, where each anchored id lives in the source.
+       * A CSS selector is useless to an agent editing a .md file; "42-47" is
+       * something it can act on directly.
+       */
+      sourceLines?: Record<string, { line: number; endLine: number }>;
+      sessionEnded?: boolean;
+      endedBy?: "user" | "agent";
+    };
+
+/** A review made portable, so a second reviewer needs no server and no account. */
+export interface ReviewPacket {
+  packet: 1;
+  artifact: string;
+  /** sha256 of the artifact the review was written against. */
+  artifactSha: string;
+  exportedAt: string;
+  review: Review;
+  contract: ContractRule[];
+}
 
 // ---------------------------------------------------------------------------
 // Validators. Hand-written and total: every field is coerced or rejected, never
@@ -187,27 +345,80 @@ export function parseItemOutcome(value: unknown): ItemOutcome {
   return value === "caveat" || value === "needs-call" || value === "skipped" ? value : "applied";
 }
 
-/** Parses one client-submitted review item. Server owns id/status/timestamps. */
-export function parseIncomingItem(input: unknown): {
+const ITEM_TAGS = new Set<ItemTag>(["element", "text", "page", "verbatim", "structural"]);
+const STRUCTURAL_KINDS = new Set<StructuralOp["kind"]>([
+  "delete",
+  "move-before",
+  "move-after",
+  "split",
+  "merge",
+]);
+
+function parseStructuralOp(input: unknown): StructuralOp {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const kind = raw.kind as StructuralOp["kind"];
+  if (!STRUCTURAL_KINDS.has(kind)) throw new ValidationError("unknown structural operation");
+  return {
+    kind,
+    ...(raw.targetSelector !== undefined
+      ? { targetSelector: str(raw.targetSelector, MAX_SELECTOR, "op.targetSelector") }
+      : {}),
+    ...(raw.targetText !== undefined ? { targetText: str(raw.targetText, MAX_TEXT, "op.targetText") } : {}),
+  };
+}
+
+export interface IncomingItem {
   body: string;
   selector: string;
   text: string;
   anchors?: Anchor[];
-  tag: ReviewItem["tag"];
-} {
+  tag: ItemTag;
+  replacement?: string;
+  op?: StructuralOp;
+}
+
+/** Parses one client-submitted review item. Server owns id/status/timestamps. */
+export function parseIncomingItem(input: unknown): IncomingItem {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new ValidationError("item must be an object");
   }
   const raw = input as Record<string, unknown>;
-  const body = str(raw.body ?? "", MAX_BODY, "body").trim();
+  const tag: ItemTag = ITEM_TAGS.has(raw.tag as ItemTag) ? (raw.tag as ItemTag) : "element";
+
+  // A verbatim item carries its own instruction: the replacement text *is* the
+  // request, so demanding prose on top of it would be busywork.
+  const replacement = tag === "verbatim" ? str(raw.replacement ?? "", MAX_BODY, "replacement") : undefined;
+  const op = tag === "structural" ? parseStructuralOp(raw.op) : undefined;
+
+  const body = str(
+    raw.body ?? (replacement !== undefined ? "Replace with the supplied text." : op ? `${op.kind} this` : ""),
+    MAX_BODY,
+    "body",
+  ).trim();
   if (!body) throw new ValidationError("body must not be empty");
-  const tag = raw.tag === "page" ? "page" : raw.tag === "text" ? "text" : "element";
+
   const anchors = Array.isArray(raw.anchors)
     ? raw.anchors.slice(0, 40).map((entry) => {
         const anchor = (entry ?? {}) as Record<string, unknown>;
         return {
           selector: str(anchor.selector ?? "", MAX_SELECTOR, "anchor.selector"),
           text: str(anchor.text ?? "", MAX_TEXT, "anchor.text"),
+          ...(anchor.hash !== undefined ? { hash: str(anchor.hash, 64, "anchor.hash") } : {}),
+          ...(anchor.node && typeof anchor.node === "object"
+            ? {
+                node: {
+                  id: str((anchor.node as Record<string, unknown>).id ?? "", 200, "anchor.node.id"),
+                  label: str((anchor.node as Record<string, unknown>).label ?? "", 200, "anchor.node.label"),
+                },
+              }
+            : {}),
+          ...(Array.isArray(anchor.shingles)
+            ? {
+                shingles: anchor.shingles
+                  .slice(0, 120)
+                  .filter((s): s is string => typeof s === "string" && s.length <= 120),
+              }
+            : {}),
         };
       })
     : [];
@@ -216,7 +427,12 @@ export function parseIncomingItem(input: unknown): {
     selector: str(raw.selector ?? anchors[0]?.selector ?? "", MAX_SELECTOR, "selector"),
     text: str(raw.text ?? anchors[0]?.text ?? "", MAX_TEXT, "text"),
     tag,
-    ...(anchors.length > 1 ? { anchors } : {}),
+    ...(replacement !== undefined ? { replacement } : {}),
+    ...(op ? { op } : {}),
+    // Kept even for a single anchor now that anchors carry the hash and
+    // shingles re-anchoring needs. `anchors[0]` still mirrors selector/text, so
+    // single-anchor consumers need no branching.
+    ...(anchors.length ? { anchors } : {}),
   };
 }
 
@@ -250,4 +466,90 @@ export function parseThreadText(input: unknown): string {
   const text = str(raw.text ?? "", MAX_BODY, "text").trim();
   if (!text) throw new ValidationError("text must not be empty");
   return text;
+}
+
+export function parseContractText(input: unknown): string {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const text = str(raw.text ?? "", MAX_BODY, "text").trim();
+  if (!text) throw new ValidationError("a rule must not be empty");
+  return text;
+}
+
+export function parseLockInput(input: unknown): { selector: string; text: string; label?: string } {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const selector = str(raw.selector ?? "", MAX_SELECTOR, "selector").trim();
+  if (!selector) throw new ValidationError("a lock needs a selector");
+  return {
+    selector,
+    text: str(raw.text ?? "", MAX_TEXT, "text"),
+    ...(raw.label !== undefined ? { label: str(raw.label, 200, "label") } : {}),
+  };
+}
+
+export function parseAlternatives(input: unknown): Alternative[] {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  if (!Array.isArray(raw.alternatives)) throw new ValidationError("alternatives must be an array");
+  if (raw.alternatives.length < 2) throw new ValidationError("offer at least two alternatives");
+  if (raw.alternatives.length > 6) throw new ValidationError("too many alternatives");
+  return raw.alternatives.map((entry, index) => {
+    const alt = (entry ?? {}) as Record<string, unknown>;
+    return {
+      id: str(alt.id ?? `alt${index + 1}`, 64, "alternative.id"),
+      label: str(alt.label ?? `Option ${index + 1}`, 200, "alternative.label"),
+      html: str(alt.html ?? "", 40_000, "alternative.html"),
+    };
+  });
+}
+
+export function parseVersionLabel(input: unknown): { label?: string; pinned?: boolean } {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  return {
+    ...(raw.label !== undefined ? { label: str(raw.label, 200, "label").trim() } : {}),
+    ...(raw.pinned !== undefined ? { pinned: Boolean(raw.pinned) } : {}),
+  };
+}
+
+/**
+ * Validates an imported packet. This is the one place untrusted *file* content
+ * enters the store, so it is parsed field by field rather than spread — a
+ * packet arrives from another machine and another person.
+ */
+export function parseReviewPacket(input: unknown): ReviewPacket {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  if (raw.packet !== 1) throw new ValidationError("not a plan-editor review packet");
+  const review = (raw.review ?? {}) as Record<string, unknown>;
+  if (!Array.isArray(review.items)) throw new ValidationError("packet review has no items");
+  if (review.items.length > 200) throw new ValidationError("packet has too many items");
+  return {
+    packet: 1,
+    artifact: str(raw.artifact ?? "", 1024, "artifact"),
+    artifactSha: str(raw.artifactSha ?? "", 64, "artifactSha"),
+    exportedAt: str(raw.exportedAt ?? new Date(0).toISOString(), 40, "exportedAt"),
+    contract: Array.isArray(raw.contract)
+      ? raw.contract.slice(0, 100).map((entry) => {
+          const rule = (entry ?? {}) as Record<string, unknown>;
+          return {
+            id: str(rule.id ?? "", 64, "contract.id"),
+            text: str(rule.text ?? "", MAX_BODY, "contract.text"),
+            createdAt: str(rule.createdAt ?? new Date(0).toISOString(), 40, "contract.createdAt"),
+          };
+        })
+      : [],
+    review: {
+      id: str(review.id ?? "", 64, "review.id"),
+      note: str(review.note ?? "", MAX_BODY, "review.note"),
+      status: "sent",
+      createdAt: str(review.createdAt ?? new Date(0).toISOString(), 40, "review.createdAt"),
+      items: review.items.map((entry) => {
+        const parsed = parseIncomingItem(entry);
+        const item = (entry ?? {}) as Record<string, unknown>;
+        return {
+          ...parsed,
+          id: str(item.id ?? "", 64, "item.id"),
+          status: "draft" as const,
+          createdAt: str(item.createdAt ?? new Date(0).toISOString(), 40, "item.createdAt"),
+        };
+      }),
+    },
+  };
 }

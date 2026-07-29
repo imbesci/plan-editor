@@ -8,10 +8,16 @@ work item by item. No reload, no losing your scroll position, and the review goe
 back to the agent you were already talking to, not a fresh one that has never seen
 the document.
 
+Works on `.html` and `.md`.
+
+There is also a full reference as a browsable page: **[`README.html`](README.html)**.
+It is itself a compliant artifact, so `plan-editor README.html` opens the docs for
+review — which is the shortest way to see what the tool does.
+
 ```sh
 bun install
 bun run build
-bun run bin/plan-editor.js plan.html
+bun run bin/plan-editor.js plan.md
 bun run bin/plan-editor.js setup hooks     # once, then restart Claude Code
 ```
 
@@ -24,8 +30,16 @@ bun run bin/plan-editor.js setup hooks     # once, then restart Claude Code
 - [The two phases](#the-two-phases)
 - [Why batched, not live](#why-batched-not-live)
 - [The overall note](#the-overall-note)
+- [Saying it precisely](#saying-it-precisely)
+- [Standing rules](#standing-rules)
+- [Locked regions](#locked-regions)
+- [When the agent is unsure](#when-the-agent-is-unsure)
 - [The lifecycle](#the-lifecycle)
 - [Versions, undo, and diff](#versions-undo-and-diff)
+- [Diagrams](#diagrams)
+- [Markdown artifacts](#markdown-artifacts)
+- [Reviewing with someone else](#reviewing-with-someone-else)
+- [The record](#the-record)
 - [How a review reaches your agent](#how-a-review-reaches-your-agent)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [CLI reference](#cli-reference)
@@ -152,6 +166,102 @@ because it is the context that makes the individual notes interpretable.
 
 ---
 
+## Saying it precisely
+
+Prose is the worst way to express the two cheapest kinds of change. Both have
+their own gesture.
+
+**Suggest an exact replacement.** For a typo, a wrong number, a bad sentence,
+writing *"change 'leverage' to 'use'"* is a round trip and an ambiguity. Turn on
+suggest mode and type the replacement directly. It goes to the agent as
+`replace this → with exactly this`, and the agent is told to apply it literally
+or skip it and say why — never to paraphrase it.
+
+The document is agent-owned, so your edit is restored in the browser the instant
+you commit it. You are proposing, not editing; the file changes when the agent
+changes it.
+
+**Ask for a structural change by doing it.** Delete, move above, move below,
+split, merge. *"Move Risks above Milestones but leave the intro where it is"* is
+an id-set operation dressed up as a sentence — these send it as the operation.
+
+| Item kind | What the agent receives |
+| --- | --- |
+| note | your prose, plus the anchored text |
+| verbatim | the original text and the exact replacement |
+| structural | the operation, the subject, and the target |
+
+---
+
+## Standing rules
+
+The overall note dies with its review. A standing rule does not.
+
+*"Never use the word 'leverage'."* *"Keep sections under 200 words."* *"Every
+claim needs a number."* Rules are injected ahead of **every** review of this
+document, forever, until you retire them.
+
+This is the one feature aimed squarely at the thing that makes iterating with an
+agent feel slower than writing it yourself: making the same correction in round
+four that you made in round one.
+
+The inverse of the item rule applies deliberately. Items are listed in full once
+and then compacted to a count, because they are visible in the file the agent is
+looking at. **Rules are repeated every single time**, because they are not.
+
+**Promote a rejection into a rule.** When you reject an item you give a reason,
+and the reason is the part that generalises — the item was about one paragraph,
+the reason is about the document. One click turns it into a standing rule.
+
+```sh
+plan-editor contract plan.md --add "Never use the word 'leverage'."
+plan-editor contract plan.md                    # list them
+plan-editor promote plan.md --id <item-id>      # from a rejection
+```
+
+Retiring a rule keeps it on the record — it still explains the reviews it shaped.
+
+---
+
+## Locked regions
+
+Mark a section, a table, or a number **do not touch**.
+
+The agent is told about locks before it is told about the review, and it is told
+to raise the conflict rather than resolve it — even when an item seems to ask for
+a change inside one.
+
+A lock constrains the agent, not you: you can still pin a note to locked content.
+Asking is always allowed; changing it unasked is not.
+
+```sh
+plan-editor lock plan.md --selector "#budget" --label "Budget table"
+```
+
+This is the natural completion of the *changes nobody asked for* report, which
+already tells you when the agent went outside the brief. A lock turns that from
+a report into a rule.
+
+---
+
+## When the agent is unsure
+
+Guessing is how a review comes back with three items right and one confidently
+wrong. There are two ways out, and both put the decision back in the browser.
+
+**It asks.** `plan-editor ask <file> --id <item> --question "..."` parks the
+agent. The question appears on the item, pinned to the top of your panel because
+something is waiting on it. You answer, and the agent unparks in milliseconds.
+
+**It shows you two versions.** For a choice better seen than described, the agent
+offers alternatives. Hovering one previews it in the document in place; clicking
+picks it.
+
+Either way the item's thread records the exchange, so the transcript shows not
+just what changed but what was uncertain and how it was settled.
+
+---
+
 ## The lifecycle
 
 ```
@@ -172,10 +282,23 @@ leaves the agent's queue only when the agent responds.
 **A rejection is never lost.** It keeps its `rejected` status and reappears in
 your next draft with your reason attached.
 
-**Re-point** rescues an item whose anchor vanished: click **Re-point…**, then
-click the element it should refer to.
+**Rejecting can also undo the change.** Recording a verdict used to leave the
+agent's unwanted text sitting in the document until the next round — you said no
+and the words stayed. Reject now offers *"…and undo that change"*, which puts
+just that section back to how it was before the review, leaving every other item
+the agent got right in place.
 
-`⌘F` filters notes by text or anchor.
+**A verdict is undoable.** Accept and Reject are one keystroke each (`a` and
+`r`); `u` puts an item back if you misfire.
+
+**Re-point** rescues an item whose anchor moved. It rarely needs you now: anchors
+carry a content hash and word shingles, so an item survives the agent rewriting
+the very paragraph it points at. When a match is genuinely uncertain the item is
+flagged and offered ranked candidates to re-point to in one click, rather than
+the tool guessing and attaching your note to the wrong element.
+
+`⌘F` filters notes by text or anchor. `/` searches inside the document itself,
+and the outline lists every section with a count of the notes open on it.
 
 ---
 
@@ -195,6 +318,128 @@ one reflowed paragraph rewrites a 400-character line.
 
 Snapshots are whole files, capped at 40, oldest dropped. About 20KB each, so a
 full history is well under a megabyte.
+
+**Name the ones that matter.** A row of anonymous `v7`s is not history. Label a
+version — *"sent to leadership"* — and pin it, and pinned versions are exempt
+from the cap, because ageing out the one you deliberately named is the only drop
+that is never acceptable.
+
+**Compare any two versions**, not just the current one against an older one.
+
+**Churn** answers a question the tool always had the data for and never asked:
+which sections keep getting rewritten? A section rewritten six times is one you
+and the agent still disagree about, and it is usually not the one you would have
+guessed.
+
+```sh
+plan-editor version plan.md --seq 12 --label "sent to leadership" --pin
+plan-editor churn plan.md
+```
+
+---
+
+## Diagrams
+
+Mermaid diagrams render in the browser, in both `.html` and `.md` artifacts.
+
+```html
+<pre class="mermaid" id="retry-flow">
+flowchart LR
+  IN[Job arrives] --> TRY[Attempt]
+</pre>
+```
+
+In markdown, a ```` ```mermaid ```` fence is enough — the renderer gives it a
+stable id for you.
+
+**Click a node to pin a note to it.** The note anchors to the node's identity and
+its label, never to a position on screen, and the anchor itself still points at
+the diagram's *source* — so the agent is told "the node labelled Classify" and
+edits the text that produced it.
+
+**The source is authoritative.** The diagram text stays in the document and keeps
+its id; the rendered SVG sits beside it as generated presentation. Nothing you do
+in the browser rewrites the file, and an export contains the same diagram source
+the agent wrote.
+
+Three properties make this safe rather than a constant source of noise:
+
+- Rendering is **deterministic** — identical source produces byte-identical SVG,
+  so an untouched diagram produces no diff. Mermaid's default random ids would
+  have made every diagram look rewritten on every single patch.
+- The SVG is **excluded from the diff**, because it is generated in the browser
+  and is not in the file.
+- Diagram identity is the **container's `id`**, not its position in the document,
+  so inserting a diagram above another does not re-point notes on it. `doctor`
+  warns when a diagram has no id.
+
+Mermaid is ~2.6MB, so it is vendored and fetched **only when a diagram is
+actually present** — artifacts without one pay nothing, and artifacts with one
+still work offline.
+
+---
+
+## Markdown artifacts
+
+Agents write `PLAN.md` far more often than they write `plan.html`, so `.md` is a
+first-class artifact.
+
+**The markdown stays markdown.** It is the source of truth on disk; the agent
+edits it exactly as it edits HTML; the browser only ever renders it. There is no
+HTML-back-to-Markdown path and there never will be — a lossy round trip is the
+one operation in this tool capable of quietly rewriting your prose, and it would
+run on every patch.
+
+Two things follow, both of which you get for free:
+
+- **Every block gets a stable id**, derived from the nearest heading. Section ids
+  are the highest-value property an artifact can have, and here you do not have
+  to write them.
+- **The agent is given source line ranges, not selectors.** An item arrives as
+  `plan.md:42-47`. A CSS selector is an artefact of the render and useless to an
+  agent about to open the file.
+
+Version history stores the markdown, so undo and revert write markdown back.
+
+---
+
+## Reviewing with someone else
+
+There is still no multiplayer, no CRDT, and no identity model — that refusal is
+what keeps anchoring, threading, and undo tractable. But *"let my colleague
+review this"* is a real need, so it is handled by sequential handoff instead.
+
+```sh
+plan-editor packet export plan.md --review <id> --out review.packet.json
+# they open it against their own copy
+plan-editor packet import plan.md --in review.packet.json --from "Sam"
+```
+
+An imported packet lands in **your draft**, never as a sent review: you still
+decide what crosses to your agent, exactly as with your own markup. And a packet
+carries the hash of the document it was written against, so if your copy has
+moved on you are told — that is precisely the case where anchors resolve cleanly
+to the wrong element.
+
+---
+
+## The record
+
+`export` writes the artifact. The more useful artifact of a review cycle is the
+**record**: what was asked, what the agent said it did, what you accepted, and
+why you rejected the rest.
+
+```sh
+plan-editor transcript plan.md --out review-record.md
+```
+
+That is the handoff document, the audit trail, and the thing that goes in a PR
+description.
+
+Artifacts also live in repos, so version history no longer has to be a parallel
+universe: `plan-editor commit plan.md --message "..."` stages and commits just
+that file, and the panel shows the artifact's git status and its diff against
+`HEAD`.
 
 ---
 
@@ -233,7 +478,18 @@ it used to — with batching, nobody is waiting on a trickle.
 
 `plan-editor respond <file> --summary "..."` closes the review and puts the work
 in front of you. `plan-editor answer <file> --id <id> --outcome needs-call --note
-"..."` flags a single ambiguous item rather than guessing.
+"..."` flags a single ambiguous item rather than guessing — and
+`plan-editor ask` goes further, parking the agent until you actually answer.
+
+### 4. Agents that are not Claude Code
+
+`plan-editor mcp` is an MCP server over stdio, so any MCP client gets typed tools
+— `open_artifact`, `await_review`, `respond_to_review`, `ask_human`,
+`offer_alternatives`, `list_standing_rules` and the rest — instead of shelling
+out and parsing prose. `plan-editor setup mcp` prints the config to paste.
+
+For Claude Code the hooks remain strictly better: they deliver a review into the
+session you are already in, with no tool call required at all.
 
 ### Who gets the edit
 
@@ -254,36 +510,78 @@ The presence indicator shows which session is bound and when it was last seen.
 | Key | Action |
 | --- | --- |
 | `⌘I` | Toggle annotate mode |
+| `⌘E` | Suggest mode — type the exact replacement |
+| Click | Anchor a note to an element |
+| Select text, then click | Anchor to the selection instead |
+| `⇧`-click | Add another element to the same note (again to remove) |
+| Click it again | Un-select an element you did not mean to pick |
 | `⌘Enter` | Add the note you are typing |
 | `⇧⌘Enter` | Send the review |
-| `j` / `k` | Move through your notes — the document scrolls to follow |
-| `Enter` | Jump the document to the focused note |
 | `⌘F` | Filter notes |
+| `/` | Find in the document |
 | `⌘Z` | Undo the last change |
 | `⌘H` | Version history |
 | `← →` | Scrub versions (while history is open) |
 | `⌘\` | Hide or show the panel (focus mode) |
+| `j` / `k` | Move through your notes — the document scrolls to follow |
+| `Enter` | Jump the document to the focused note |
+| `a` / `r` | Accept or reject the focused note |
+| `u` | Undo a verdict on the focused note |
 | Theme button | Cycle system → light → dark |
-| `Esc` | Close an overlay, or cancel re-pointing |
+| `Esc` | Close an overlay, disarm a gesture, cancel re-pointing, or clear the selection |
 | `?` | Shortcut list |
 
 ---
 
 ## CLI reference
 
+**Reviewing** — `.html`, `.htm`, `.md`
+
 | Command | Description |
 | --- | --- |
-| `plan-editor <file.html>` | Open for review. Reuses an existing tab if one is watching. |
+| `plan-editor <file>` | Open for review. Reuses an existing tab if one is watching. |
 | `plan-editor watch <file>` | Park until a review arrives. `--max-ms` bounds the wait. |
 | `plan-editor poll <file>` | Long-poll for a review. `--timeout-ms`. |
 | `plan-editor respond <file> --summary "..."` | Close the review with what you changed and why. |
 | `plan-editor answer <file> --id <id>` | Flag one item: `--outcome caveat\|needs-call\|skipped --note "..."`. |
-| `plan-editor undo <file>` | Restore the previous version. |
-| `plan-editor export <file>` | Write a standalone copy. `--out <path>`. |
-| `plan-editor status` | Server state, sessions, bound agents, edit counts. |
+| `plan-editor ask <file> --id <id> --question "..."` | Ask about one item and **park until answered**. |
+| `plan-editor alternatives <file> --id <id> --json alts.json` | Offer two or more versions to pick from. |
 | `plan-editor end <file>` | End a session. |
-| `plan-editor stop` | Shut the background server down. |
+
+**Standing context** — outlives any one review
+
+| Command | Description |
+| --- | --- |
+| `plan-editor contract <file>` | List the rules injected into every review. |
+| `plan-editor contract <file> --add "rule"` | Add one. `--retire <id>` retires it. |
+| `plan-editor promote <file> --id <id>` | Turn a rejection's reason into a standing rule. |
+| `plan-editor lock <file> --selector "#budget"` | Mark a region do-not-touch. `--label`, `--remove <id>`. |
+| `plan-editor companions <file> --with a.md b.html` | Review several artifacts as one set. |
+
+**History and the record**
+
+| Command | Description |
+| --- | --- |
+| `plan-editor undo <file>` | Restore the previous version. |
+| `plan-editor version <file> --seq n --label "..." [--pin]` | Name or pin a version. |
+| `plan-editor churn <file>` | Which sections keep being rewritten. |
+| `plan-editor transcript <file>` | The review record as Markdown. `--out <path>`. |
+| `plan-editor export <file>` | Write a standalone copy. `--out <path>`. |
+| `plan-editor commit <file> --message "..."` | Stage and commit just this artifact. |
+| `plan-editor packet export <file> --review <id>` | Hand a review to another reviewer. `--out`. |
+| `plan-editor packet import <file> --in <path>` | Take one back. `--from <name>`. |
+
+**Authoring and setup**
+
+| Command | Description |
+| --- | --- |
+| `plan-editor new <file>` | Write a compliant starter artifact. `--template plan\|spec\|report`, `--title`. |
+| `plan-editor doctor <file>` | Lint an artifact for anchoring problems. |
 | `plan-editor setup hooks` | Install the Claude Code hooks. |
+| `plan-editor setup mcp` | Print the MCP client config. `--out <path>`. |
+| `plan-editor mcp` | Run the MCP server on stdio. |
+| `plan-editor status` | Server state, sessions, bound agents, review counts. |
+| `plan-editor stop` | Shut the background server down. |
 | `plan-editor server [--verbose]` | Run the server in the foreground. |
 
 Flags worth knowing: `--no-open` (never launch a browser), `--force-open` (launch
@@ -292,6 +590,24 @@ even when a tab is already watching).
 ---
 
 ## Writing artifacts that work well
+
+**Start from a template, or check what you have.**
+
+```sh
+plan-editor new plan.html --template plan --title "Ingest retry budget"
+plan-editor doctor plan.html
+```
+
+`doctor` checks the properties this tool actually depends on — duplicate ids
+(which make a section invisible to the diff), sections with no id at all, missing
+theme support, an SDK tag committed into the file, slabs of text too large to
+diff usefully, and references that will not resolve in an export. It is the check
+that used to not exist, which is why every anchoring failure surfaced a long way
+from its cause.
+
+On a `.md` file it lints the render, so it has nothing to complain about: the
+ids are generated for you.
+
 
 **Support the theme toggle.** plan-editor can force light or dark regardless of
 the OS setting, and it tells the artifact by setting `data-theme` on its root. An
@@ -392,6 +708,16 @@ State lives in `~/.plan-editor`: one JSON file per session (never a single globa
 document — that makes unrelated projects clobber each other), and per-session
 version directories holding whole-file snapshots plus a flat index.
 
+A session record holds the reviews, the standing contract, the locks, and the
+companion set. Markdown artifacts are rendered on every read path
+(`src/markdown.ts`) and never on a write path, which is what keeps the source of
+truth in the format you chose.
+
+Anchors are scored rather than matched (`src/sdk/anchor.ts`): each carries a
+content hash and word shingles over the full text, so an item still resolves
+after the agent rewrites the paragraph it points at. Below the confidence
+threshold the tool reports candidates instead of guessing.
+
 Writes go through a per-key promise chain and tmp+rename. The naive
 read-modify-write this replaces loses an average of 24 of 25 concurrent submits
 and corrupts the file outright about 15% of the time.
@@ -430,11 +756,17 @@ code signature over `src/` and `dist/`. If you edited something outside those,
 **No multiplayer, no CRDT, no identity model.** The artifact is agent-owned and
 humans propose changes to it. That single decision is what keeps the annotation
 layer a simple append-only record rather than a merge problem — and it is why
-anchoring, threading, and undo are all tractable.
+anchoring, threading, and undo are all tractable. [Packets](#reviewing-with-someone-else)
+give you a second reviewer without touching any of it.
 
-**No AI in the tool itself.** plan-editor never calls a model. It moves edits to
+**No AI in the tool itself.** plan-editor never calls a model. It moves reviews to
 your agent and changes back to your browser; the intelligence is entirely in the
-conversation you were already having.
+conversation you were already having. Even the "these rejections look alike"
+hint is string comparison, and should stay that way.
+
+**No HTML-to-Markdown conversion.** Markdown artifacts render one way only. The
+round trip is the single operation here capable of quietly rewriting your prose,
+and it would run on every patch.
 
 ---
 
@@ -442,13 +774,23 @@ conversation you were already having.
 
 ```sh
 bun run check      # build + typecheck + test
-bun test           # 107 tests
+bun run test       # 334 unit tests — not bare `bun test`, see AGENTS.md
+bun run test:e2e   # 82 end-to-end tests in a real browser
 bun run build      # browser bundles only
 ```
 
+The end-to-end suite (`e2e/`) drives Chromium against a real detached server: it
+clicks into the sandboxed artifact frame, types, drags selections, fires every
+keyboard shortcut from inside the iframe, and runs the CLI as an agent would. It
+needs a one-off `bunx playwright install chromium` and is kept out of `check`
+because it takes minutes. It exists because this codebase's hardest bugs live at
+the boundary between the two documents, and jsdom cannot see across it.
+
 Tests cover store concurrency, the two-phase review lifecycle, morph semantics
 (including multi-anchor rules and the guarantee that the tool never highlights its
-own marker classes), the diff engine, version history, auth and path confinement,
-and hook routing. `AGENTS.md` records the invariants and the bugs
-that motivated them — including several that jsdom passed and a real browser did
-not.
+own marker classes), anchor scoring, the diff engine, version history, the
+markdown renderer, the artifact linter, transcripts, packets, git integration,
+the MCP protocol, auth and path confinement, and hook routing. `AGENTS.md` records
+the invariants and the bugs that motivated them — including several that jsdom
+passed and a real browser did not, and several that looked like working features
+until something waited on them.

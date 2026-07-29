@@ -308,3 +308,51 @@ describe("the tool must not highlight its own bookkeeping", () => {
     restore();
   });
 });
+
+describe("the tool's own injected nodes are invisible to the comparison", () => {
+  test("an element containing a [data-pe-ui] child is not reported changed", () => {
+    // Rendered diagrams and lock badges are `data-pe-ui` children that exist
+    // only in the live DOM. Stripping our *classes* was not enough: the section
+    // wrapping one compared as changed on every single patch, which marks every
+    // note on that section addressed by an edit nobody made to it.
+    const { document, restore } = setup(PAGE);
+    const section = document.getElementById("alpha")!;
+    const injected = document.createElement("div");
+    injected.setAttribute("data-pe-ui", "");
+    injected.innerHTML = "<svg><g>generated</g></svg>";
+    section.appendChild(injected);
+
+    const result = morphDocument(document.documentElement, PAGE, []);
+
+    assert.equal(
+      result.changed.some((element) => element.id === "alpha"),
+      false,
+      "our own injected node must not make the element look edited",
+    );
+    assert.ok(section.querySelector("[data-pe-ui]"), "and it must survive the morph");
+    restore();
+  });
+
+  test("a real edit is still detected on an element carrying an injected node", () => {
+    const { document, restore } = setup(PAGE);
+    const section = document.getElementById("alpha")!;
+    const injected = document.createElement("div");
+    injected.setAttribute("data-pe-ui", "");
+    section.appendChild(injected);
+
+    const result = morphDocument(document.documentElement, PAGE.replace("Alpha body.", "Rewritten alpha."), []);
+    assert.ok(result.changed.some((element) => element.id === "a-body"));
+    restore();
+  });
+
+  test("the document keeps exactly one head and one body", () => {
+    // jsdom does not reproduce the nesting a real browser showed when the
+    // <head>/<body> elements were passed to an innerHTML morph, but asserting
+    // the shape here at least fails loudly if the structure is ever mangled.
+    const { document, restore } = setup(PAGE);
+    morphDocument(document.documentElement, PAGE.replace("Original title", "New title"), []);
+    assert.equal(document.querySelectorAll("head").length, 1);
+    assert.equal(document.querySelectorAll("body").length, 1);
+    restore();
+  });
+});

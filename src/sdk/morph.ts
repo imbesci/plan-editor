@@ -65,10 +65,16 @@ function isStructuralRoot(element: Element): boolean {
  * green on every patch.
  */
 function markupWithoutOurClasses(element: Element): string {
-  if (!/\bpe-[a-z]/.test(element.className || "") && !/\bpe-[a-z]/.test(element.innerHTML)) {
+  const html = element.innerHTML;
+  if (!/\bpe-[a-z]/.test(element.className || "") && !/\bpe-[a-z]/.test(html) && !html.includes(UI_ATTRIBUTE)) {
     return element.outerHTML;
   }
   const clone = element.cloneNode(true) as Element;
+  // Our *nodes* have to go too, not just our classes. A rendered diagram and a
+  // lock badge are `[data-pe-ui]` children that exist only in the live DOM, so
+  // an element containing one compared as changed on every single patch — which
+  // marks every note on that section addressed by an edit nobody made to it.
+  for (const injected of clone.querySelectorAll(`[${UI_ATTRIBUTE}]`)) injected.remove();
   for (const node of [clone, ...clone.querySelectorAll("[class]")]) {
     const kept = (node.getAttribute("class") ?? "")
       .split(/\s+/)
@@ -143,8 +149,17 @@ export function morphDocument(root: Element, html: string, tracked: Iterable<Tra
     },
   };
 
-  if (liveHead && parsed.head) Idiomorph.morph(liveHead, parsed.head, options);
-  if (liveBody && parsed.body) Idiomorph.morph(liveBody, parsed.body, options);
+  // `innerHTML` morphing takes the *children* of the new content, so it has to
+  // be handed the children — not the `<head>`/`<body>` element itself.
+  //
+  // Passing the element nested a second `<head>` inside `<head>` and a second
+  // `<body>` inside `<body>` on the first patch of every document. The edit
+  // still applied and the page still looked right, which is why it survived: it
+  // is invisible to jsdom, invisible to the user, and only shows up when
+  // something queries the document's structure. Verified in a real browser both
+  // before and after this line changed.
+  if (liveHead && parsed.head) Idiomorph.morph(liveHead, parsed.head.innerHTML, options);
+  if (liveBody && parsed.body) Idiomorph.morph(liveBody, parsed.body.innerHTML, options);
 
   const changedList = [...changed];
   const deepest = changedList.filter(

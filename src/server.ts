@@ -8,21 +8,31 @@ import chokidar, { type FSWatcher } from "chokidar";
 import express, { type NextFunction, type Request, type Response } from "express";
 
 import { canonicalDir } from "./hooks.ts";
+import { sectionsOf } from "./html-slice.ts";
 import { injectSdk } from "./html-transform.ts";
+import { isMarkdownPath, renderMarkdown } from "./markdown.ts";
 import { allowedHostnames, bindHost, defaultPort, hostnameFromHeader, stateDir } from "./paths.ts";
-import type { AgentIdentityView } from "./protocol.ts";
+import type { AgentIdentityView, SectionChurn } from "./protocol.ts";
 import {
+  parseAlternatives,
+  parseContractText,
   parseIncomingItems,
   parseItemOutcome,
+  parseLockInput,
   parseMorphReport,
   parseRepoint,
   parseReviewNote,
+  parseReviewPacket,
   parseThreadText,
+  parseVersionLabel,
   ValidationError,
   type AgentPresence,
   type PollResult,
   type Session,
 } from "./protocol.ts";
+import { buildPacket, summarizePacket } from "./packet.ts";
+import { renderTranscript } from "./transcript.ts";
+import { commitArtifact, diffAgainstHead, gitInfo } from "./git.ts";
 import { canonicalFile, SessionStore, sessionKey } from "./store/session-store.ts";
 import { VersionStore } from "./store/version-store.ts";
 import { stripSdk } from "./html-transform.ts";
@@ -32,7 +42,37 @@ import { renderChrome } from "./chrome/chrome-html.ts";
 // source (bun src/cli.ts) or from an installed package.
 const DIST = fileURLToPath(new URL("../dist/", import.meta.url));
 const IDLE_TIMEOUT_MS = 30 * 60_000;
-const ARTIFACT_EXTENSIONS = new Set([".html", ".htm"]);
+const ARTIFACT_EXTENSIONS = new Set([".html", ".htm", ".md", ".markdown", ".mdx"]);
+/**
+ * A document the browser hands back to be written. Bounded, like every input.
+ *
+ * Kept under the `express.json` body limit below it: a larger value here can
+ * never fire, because the parser rejects the request first — and the caller
+ * gets an opaque 413 instead of the message explaining what the real limit is.
+ */
+const MAX_WRITE_BYTES = 1_500_000;
+
+/**
+ * Markdown artifacts stay markdown on disk — the agent edits the source, the
+ * browser only ever renders it. Converting HTML back to markdown would be the
+ * one operation in this tool capable of corrupting the user's file, so the
+ * conversion is deliberately one-way and every read path goes through here.
+ */
+/**
+ * A section's heading, for labelling it in the churn list. Mirrors
+ * `diffDocuments`'s rule so the two never disagree about what a section is
+ * called. Falls back to the id, which is always present but rarely readable.
+ */
+function headingOf(markup: string): string | null {
+  const match = /<(h[1-4]|legend|summary)\b[^>]*>([\s\S]*?)<\/\1>/i.exec(markup);
+  if (!match) return null;
+  const text = match[2]!.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, 60) : null;
+}
+
+export function renderArtifact(file: string, source: string): string {
+  return isMarkdownPath(file) ? renderMarkdown(source, { title: path.basename(file) }).html : source;
+}
 
 interface ServeOptions {
   port?: number;
@@ -221,7 +261,7 @@ export async function serve(options: ServeOptions = {}) {
       const raw = String((req.body as Record<string, unknown>)?.file ?? "");
       if (!raw) throw new ValidationError("file is required");
       if (!ARTIFACT_EXTENSIONS.has(path.extname(raw).toLowerCase())) {
-        throw new ValidationError("only .html and .htm artifacts can be opened");
+        throw new ValidationError("only .html, .htm and .md artifacts can be opened");
       }
       const canonical = await canonicalFile(raw);
       const info = await stat(canonical);
@@ -299,7 +339,7 @@ export async function serve(options: ServeOptions = {}) {
     try {
       const session = await loadAuthorized(req, res);
       if (!session) return;
-      const html = await readFile(session.file, "utf8");
+      const html = renderArtifact(session.file, await readFile(session.file, "utf8"));
       res.type("html").send(injectSdk(html));
     } catch (error) {
       next(error);
@@ -312,7 +352,27 @@ export async function serve(options: ServeOptions = {}) {
     try {
       const session = await loadAuthorized(req, res);
       if (!session) return;
-      res.type("text/plain").send(await readFile(session.file, "utf8"));
+      res.type("text/plain").send(renderArtifact(session.file, await readFile(session.file, "utf8")));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * The markdown source behind the rendered view, with the line ranges each
+   * section came from. A CSS selector is useless to an agent editing markdown;
+   * "PLAN.md:42-47" is what it can act on.
+   */
+  app.get("/artifact/:key/source", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const source = await readFile(session.file, "utf8");
+      if (!isMarkdownPath(session.file)) {
+        res.json({ format: "html", blocks: [] });
+        return;
+      }
+      res.json({ format: "markdown", blocks: renderMarkdown(source, { title: path.basename(session.file) }).blocks });
     } catch (error) {
       next(error);
     }
@@ -483,6 +543,42 @@ export async function serve(options: ServeOptions = {}) {
     }
   });
 
+  /**
+   * The human's side of the conversation. `chat` was stored, synced, and
+   * rendered read-only for several revisions — there was no way for the human
+   * to say anything back that was not attached to a specific item.
+   */
+  app.post("/api/:key/chat", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.addChat(session.key, "user", parseThreadText(req.body));
+      // The agent hears it the same way it hears everything else.
+      events.emit("feedback", session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: "ok" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * Undoes a verdict. Accept and Reject were one-way, unconfirmed, mouse-only
+   * clicks on a list that re-renders every minute — a misfire was unrecoverable
+   * and, in the reject case, had already requeued the item.
+   */
+  app.post("/api/:key/items/:id/unverdict", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const item = await store.clearVerdict(session.key, String(req.params.id));
+      await syncBrowsers(session.key);
+      res.json({ status: item ? "cleared" : "not-found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/:key/items/:id/reply", requireSameOrigin, async (req, res, next) => {
     try {
       const session = await loadAuthorized(req, res);
@@ -502,6 +598,430 @@ export async function serve(options: ServeOptions = {}) {
       await store.repointItem(session.key, String(req.params.id), parseRepoint(req.body));
       await syncBrowsers(session.key);
       res.json({ status: "repointed" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- the standing contract ------------------------------------------------
+  //
+  // Scoped to the artifact, not to a review. Everything else here is consumed
+  // by one exchange; these rules are injected ahead of every future one.
+
+  app.get("/api/:key/contract", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      res.json({ contract: session.contract, active: store.activeContract(session) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/contract", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const rule = await store.addContractRule(session.key, parseContractText(req.body));
+      await syncBrowsers(session.key);
+      res.json({ status: "added", rule });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.delete("/api/:key/contract/:id", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.retireContractRule(session.key, String(req.params.id));
+      await syncBrowsers(session.key);
+      res.json({ status: "retired" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/contract/:id/restore", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.restoreContractRule(session.key, String(req.params.id));
+      await syncBrowsers(session.key);
+      res.json({ status: "restored" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * Turns a rejection into a standing rule. Rejection reasons were the highest
+   * signal in the system and the only thing done with them was requeueing the
+   * item — the reason generalises, the item does not.
+   */
+  app.post("/api/:key/items/:id/promote", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const rule = await store.promoteRejection(
+        session.key,
+        String(req.params.id),
+        typeof body.text === "string" ? body.text : undefined,
+      );
+      await syncBrowsers(session.key);
+      res.json(rule ? { status: "promoted", rule } : { status: "nothing-to-promote" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- locks ----------------------------------------------------------------
+
+  app.post("/api/:key/locks", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const lock = await store.addLock(session.key, parseLockInput(req.body));
+      await syncBrowsers(session.key);
+      res.json({ status: "locked", lock });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.delete("/api/:key/locks/:id", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      await store.removeLock(session.key, String(req.params.id));
+      await syncBrowsers(session.key);
+      res.json({ status: "unlocked" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- the clarification round trip -----------------------------------------
+
+  /** The agent asks. Not same-origin gated: the caller is the CLI. */
+  app.post("/api/:key/items/:id/ask", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const item = await store.askOnItem(session.key, String(req.params.id), parseThreadText(req.body));
+      await syncBrowsers(session.key);
+      res.json({ status: item ? "asked" : "not-found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * Parks until *this item's* question is answered.
+   *
+   * The obvious implementation — long-poll `/api/poll` and look at the result —
+   * is wrong, and quietly so: an item can only be asked about while its review
+   * is still pending, so `takeFeedback` returns that review immediately and the
+   * agent unparks with `answer: null` a millisecond after asking. It then
+   * proceeds to guess, which is the exact failure asking was meant to prevent.
+   */
+  app.get("/api/:key/items/:id/await-answer", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const itemId = String(req.params.id);
+
+      const settledItem = async () => {
+        const current = await store.read(session.key);
+        const item = current?.reviews.flatMap((review) => review.items).find((entry) => entry.id === itemId);
+        if (!item) return { status: "not-found" as const };
+        return item.awaitingHuman ? null : { status: "answered" as const, item };
+      };
+
+      const immediate = await settledItem();
+      if (immediate) {
+        res.json(immediate);
+        return;
+      }
+
+      const timeoutMs = req.query.timeoutMs === undefined ? 45_000 : Number(req.query.timeoutMs);
+      let settled = false;
+      const finish = async () => {
+        if (settled || res.writableEnded) return;
+        const result = await settledItem();
+        if (!result) return; // a different item was answered; keep waiting
+        settled = true;
+        cleanup();
+        res.json(result);
+      };
+      const onAnswered = (changed: string) => {
+        if (changed === session.key) void finish();
+      };
+      const timer = setTimeout(() => {
+        if (settled || res.writableEnded) return;
+        settled = true;
+        cleanup();
+        res.json({ status: "waiting" });
+      }, Math.max(0, timeoutMs));
+      function cleanup(): void {
+        clearTimeout(timer);
+        events.off("answered", onAnswered);
+        events.off("ended", onAnswered);
+        refreshIdle();
+      }
+      events.on("answered", onAnswered);
+      events.on("ended", onAnswered);
+      req.on("close", () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /** The human answers, which is the event the parked agent is waiting on. */
+  app.post("/api/:key/items/:id/answer-question", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const item = await store.answerQuestion(session.key, String(req.params.id), parseThreadText(req.body));
+      events.emit("answered", session.key);
+      // An answered question makes the review pending again, so a plain `watch`
+      // picks it up too — the agent should not need a special command to hear a
+      // reply it asked for.
+      events.emit("feedback", session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: item ? "answered" : "not-found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- alternatives ---------------------------------------------------------
+
+  app.post("/api/:key/items/:id/alternatives", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const item = await store.setAlternatives(session.key, String(req.params.id), parseAlternatives(req.body));
+      await syncBrowsers(session.key);
+      res.json({ status: item ? "offered" : "not-found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/items/:id/choose", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const item = await store.chooseAlternative(session.key, String(req.params.id), String(body.alternative ?? ""));
+      events.emit("answered", session.key);
+      events.emit("feedback", session.key);
+      await syncBrowsers(session.key);
+      res.json({ status: item ? "chosen" : "not-found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- writing a document the browser computed ------------------------------
+
+  /**
+   * Surgical revert and structural undo both need one *section* put back, not
+   * the whole file, and the merge has to happen where a real DOM already is —
+   * the same reason `diffDocuments` runs in the browser. So the browser sends
+   * the finished document and the server owns the write.
+   *
+   * This is no more capability than `/restore` already grants a same-origin
+   * caller holding the token, but it is unbounded content rather than a
+   * snapshot, so it is size-capped and goes through the same atomic write and
+   * snapshot as every other change.
+   */
+  app.post("/api/:key/write", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const html = String(body.html ?? "");
+      if (!html.trim()) throw new ValidationError("html must not be empty");
+      if (Buffer.byteLength(html) > MAX_WRITE_BYTES) throw new ValidationError("document is too large to write");
+      if (isMarkdownPath(session.file)) {
+        // The browser holds rendered HTML; writing it back over the source
+        // would replace the user's markdown with the render of it.
+        res.status(409).json({ error: "markdown artifacts cannot be written back from the browser" });
+        return;
+      }
+      await writeFile(session.file, html);
+      await versions.snapshot(session.key, html, "restore");
+      if (typeof body.itemId === "string") await store.markReverted(session.key, body.itemId);
+      await syncBrowsers(session.key);
+      res.json({ status: "written" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- history: names, pins, churn ------------------------------------------
+
+  app.post("/api/:key/versions/:seq/label", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const meta = await versions.annotate(session.key, Number(req.params.seq), parseVersionLabel(req.body));
+      broadcast(session.key, { type: "versions", list: await versions.list(session.key) });
+      res.json(meta ? { status: "ok", version: meta } : { status: "not-found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * How often each section has been rewritten. A section rewritten six times is
+   * one the human and the agent still disagree about — the tool held every
+   * snapshot needed to say so and never said it.
+   */
+  app.get("/api/:key/churn", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const list = await versions.list(session.key);
+      const counts = new Map<string, { label: string; rewrites: number; lastAt: string }>();
+      let previous: Map<string, string> | null = null;
+      for (const meta of list) {
+        const source = await versions.read(session.key, meta.seq);
+        if (source === null) continue;
+        const current = sectionsOf(renderArtifact(session.file, source));
+        if (previous) {
+          for (const [id, markup] of current) {
+            if (!previous.has(id) || previous.get(id) === markup) continue;
+            const entry = counts.get(id) ?? { label: headingOf(markup) ?? id, rewrites: 0, lastAt: meta.at };
+            entry.rewrites += 1;
+            entry.lastAt = meta.at;
+            // Relabel from the newest markup seen: a section whose heading was
+            // rewritten should be listed under what it is called now.
+            entry.label = headingOf(markup) ?? entry.label;
+            counts.set(id, entry);
+          }
+        }
+        previous = current;
+      }
+      const churn: SectionChurn[] = [...counts.entries()]
+        .map(([id, entry]) => ({ id, ...entry }))
+        .sort((a, b) => b.rewrites - a.rewrites);
+      res.json({ churn });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- the record: transcript, packets, git ---------------------------------
+
+  app.get("/api/:key/transcript", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const markdown = renderTranscript(session, { versions: await versions.list(session.key) });
+      res
+        .type("text/markdown")
+        .set("Content-Disposition", 'attachment; filename="review-transcript.md"')
+        .send(markdown);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/packet/:reviewId", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const review = session.reviews.find((entry) => entry.id === String(req.params.reviewId));
+      if (!review) {
+        res.status(404).json({ error: "review not found" });
+        return;
+      }
+      const packet = buildPacket(session, review, await readFile(session.file, "utf8"));
+      res
+        .type("application/json")
+        .set("Content-Disposition", 'attachment; filename="review.packet.json"')
+        .send(JSON.stringify(packet, null, 2));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/packet/import", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const packet = parseReviewPacket(body.packet);
+      const summary = summarizePacket(packet, await readFile(session.file, "utf8"));
+      const from = typeof body.from === "string" && body.from.trim() ? body.from.slice(0, 80) : "an imported review";
+      const imported = await store.importPacket(session.key, packet, from);
+      await syncBrowsers(session.key);
+      // Imported items land in the draft, never as a sent review: the artifact's
+      // owner decides what crosses to their agent, exactly as with their own
+      // markup.
+      res.json({ status: "imported", items: imported ?? 0, drift: summary.drift, note: summary.note });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/git", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      res.json({ git: await gitInfo(session.file), diff: await diffAgainstHead(session.file) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/:key/git/commit", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const message = String(body.message ?? "").trim();
+      if (!message) throw new ValidationError("a commit message is required");
+      res.json(await commitArtifact(session.file, message.slice(0, 2_000)));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // --- review sets ----------------------------------------------------------
+
+  /**
+   * Artifacts reviewed together. A note like "these three disagree about the
+   * retry budget" is not expressible against a single file, and the agent
+   * cannot answer it without being told the set.
+   */
+  app.post("/api/:key/companions", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const raw = Array.isArray(body.files) ? body.files : [];
+      const files: string[] = [];
+      for (const entry of raw.slice(0, 20)) {
+        if (typeof entry !== "string") continue;
+        // Resolve server-side for the same reason session creation does: a
+        // client-supplied path must never become a path the server trusts.
+        const canonical = await canonicalFile(entry).catch(() => null);
+        if (!canonical || !ARTIFACT_EXTENSIONS.has(path.extname(canonical).toLowerCase())) continue;
+        const info = await stat(canonical).catch(() => null);
+        if (info?.isFile()) files.push(canonical);
+      }
+      const saved = await store.setCompanions(session.key, files);
+      await syncBrowsers(session.key);
+      res.json({ status: "ok", companions: saved ?? [] });
     } catch (error) {
       next(error);
     }
@@ -580,12 +1100,15 @@ export async function serve(options: ServeOptions = {}) {
     try {
       const session = await loadAuthorized(req, res);
       if (!session) return;
-      const html = await versions.read(session.key, Number(req.params.seq));
-      if (html === null) {
+      const source = await versions.read(session.key, Number(req.params.seq));
+      if (source === null) {
         res.status(404).json({ error: "version not found" });
         return;
       }
-      res.type("text/plain").send(html);
+      // Snapshots hold the source, so a markdown history renders on the way out
+      // and restores as markdown on the way back in. Storing the rendered form
+      // instead would make restore write HTML over the user's .md.
+      res.type("text/plain").send(renderArtifact(session.file, source));
     } catch (error) {
       next(error);
     }
@@ -644,7 +1167,10 @@ export async function serve(options: ServeOptions = {}) {
     try {
       const session = await loadAuthorized(req, res);
       if (!session) return;
-      const html = stripSdk(await readFile(session.file, "utf8"));
+      // Markdown is rendered, not copied: an export is a standalone readable
+      // copy, and the source would open as a wall of unformatted text.
+      const source = await readFile(session.file, "utf8");
+      const html = isMarkdownPath(session.file) ? renderArtifact(session.file, source) : stripSdk(source);
       res.type("html").set("Content-Disposition", 'attachment; filename="artifact.export.html"').send(html);
     } catch (error) {
       next(error);
@@ -665,7 +1191,16 @@ export async function serve(options: ServeOptions = {}) {
       sseClients.set(session.key, clients);
       refreshIdle();
 
-      res.write(`data: ${JSON.stringify({ type: "sync", reviews: session.reviews, chat: session.chat })}\n\n`);
+      res.write(
+        `data: ${JSON.stringify({
+          type: "sync",
+          reviews: session.reviews,
+          chat: session.chat,
+          contract: session.contract,
+          locks: session.locks,
+          companions: session.companions,
+        })}\n\n`,
+      );
       res.write(
         `data: ${JSON.stringify({ type: "presence", state: presenceOf(session.key), agent: await agentView(session.key) })}\n\n`,
       );
@@ -745,6 +1280,24 @@ export async function serve(options: ServeOptions = {}) {
     }
   });
 
+  /**
+   * Where each id'd block of a markdown artifact lives in the source.
+   *
+   * Computed at poll time rather than stored: the file moves under the review,
+   * and a line number recorded when the note was written would point at the
+   * wrong line by the time the agent read it.
+   */
+  async function sourceLinesFor(session: Session): Promise<Record<string, { line: number; endLine: number }> | null> {
+    if (!isMarkdownPath(session.file)) return null;
+    const source = await readFile(session.file, "utf8").catch(() => null);
+    if (source === null) return null;
+    const map: Record<string, { line: number; endLine: number }> = {};
+    for (const block of renderMarkdown(source, { title: path.basename(session.file) }).blocks) {
+      map[block.id] = { line: block.line, endLine: block.endLine };
+    }
+    return map;
+  }
+
   async function takeFeedback(key: string): Promise<PollResult> {
     const session = await store.read(key);
     if (!session) return { status: "waiting" };
@@ -754,9 +1307,18 @@ export async function serve(options: ServeOptions = {}) {
     if (!review) {
       return session.status === "ended" ? { status: "ended", endedBy: session.endedBy ?? "agent" } : { status: "waiting" };
     }
+    const sourceLines = await sourceLinesFor(session);
     return {
       status: "review",
       review,
+      // The standing contract rides along with every review, never instead of
+      // one. The rules are what stop round four repeating round one's
+      // correction, and an agent that only ever sees this review cannot know
+      // them.
+      ...(store.activeContract(session).length ? { contract: store.activeContract(session) } : {}),
+      ...(session.locks.length ? { locks: session.locks } : {}),
+      ...(session.companions.length ? { companions: session.companions } : {}),
+      ...(sourceLines ? { sourceLines } : {}),
       ...(session.status === "ended" ? { sessionEnded: true, endedBy: session.endedBy ?? "user" } : {}),
     };
   }
@@ -764,7 +1326,14 @@ export async function serve(options: ServeOptions = {}) {
   async function syncBrowsers(key: string): Promise<void> {
     const session = await store.read(key);
     if (!session) return;
-    broadcast(key, { type: "sync", reviews: session.reviews, chat: session.chat });
+    broadcast(key, {
+      type: "sync",
+      reviews: session.reviews,
+      chat: session.chat,
+      contract: session.contract,
+      locks: session.locks,
+      companions: session.companions,
+    });
   }
 
   // Static browser bundles. `no-cache` means "revalidate every time", not "never
@@ -775,6 +1344,8 @@ export async function serve(options: ServeOptions = {}) {
     res.type(type).set("Cache-Control", "no-cache").sendFile(path.join(DIST, file));
   };
   app.get("/sdk.js", bundle("sdk.js", "application/javascript"));
+  // Fetched by the SDK only when the artifact actually contains a diagram.
+  app.get("/mermaid.js", bundle("mermaid.js", "application/javascript"));
   app.get("/chrome.js", bundle("chrome.js", "application/javascript"));
   app.get("/chrome.css", bundle("chrome.css", "text/css"));
 
@@ -800,6 +1371,21 @@ export async function serve(options: ServeOptions = {}) {
   refreshIdle();
   log(`plan-editor server listening on ${host}:${port}`);
 
+  /**
+   * Resolves once the server has actually stopped, so the detached process can
+   * exit rather than linger.
+   *
+   * It used to have no way to know: `shutdown()` closed the HTTP server and the
+   * CLI parked forever on a promise that never settled, so every restart left
+   * the old process alive holding ~9MB. Because the server's identity folds in
+   * a code signature, *every* edit to src/ triggers a restart — so this leaked
+   * one process per edit, invisibly, and 48 of them were found running.
+   */
+  let markClosed: () => void;
+  const closed = new Promise<void>((resolve) => {
+    markClosed = resolve;
+  });
+
   async function shutdown(): Promise<void> {
     if (idleTimer) clearTimeout(idleTimer);
     for (const watcher of watchers.values()) await watcher.close();
@@ -809,12 +1395,14 @@ export async function serve(options: ServeOptions = {}) {
     }
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    markClosed();
   }
 
   return {
     port: (server.address() as { port: number }).port,
     store,
     shutdown,
+    closed,
   };
 }
 

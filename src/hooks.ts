@@ -210,9 +210,27 @@ export interface InjectionEntry {
   review: {
     id: string;
     note: string;
-    items: Array<{ id: string; body: string; text: string; selector: string }>;
+    items: Array<{
+      id: string;
+      body: string;
+      text: string;
+      selector: string;
+      tag?: string;
+      replacement?: string;
+      op?: { kind: string; targetText?: string };
+      /** Present when the note was dropped on a node inside a diagram. */
+      anchors?: Array<{ node?: { id: string; label: string } }>;
+    }>;
     deliveredTo?: string[];
   } | null;
+  /**
+   * Rules that apply to every review of this artifact. Unlike the items, these
+   * are repeated on every injection — a rule the agent is told once and then
+   * never again is a rule it will break in three turns' time.
+   */
+  contract?: Array<{ text: string }>;
+  /** Regions the agent must not touch. */
+  locks?: Array<{ selector: string; text: string; label?: string }>;
   /** Identifies the agent asking, so delivery is tracked per session. */
   agentKey: string;
 }
@@ -245,13 +263,38 @@ export function buildContextInjection(entries: InjectionEntry[]): Injection | nu
         ? `A review is waiting on ${entry.file} (sent from a different agent session — read the file first, you may not have the context behind it):`
         : `A review is waiting on ${entry.file}:`,
     );
+    // The standing rules are repeated every time, ahead of everything else.
+    // They are the reason round four stops re-litigating round one, and
+    // compacting them away would defeat the entire point of recording them.
+    for (const rule of entry.contract ?? []) lines.push(`  Always: ${rule.text}`);
+    for (const lock of entry.locks ?? []) {
+      lines.push(`  Do not touch: ${lock.label ?? lock.selector}${lock.text ? ` ("${lock.text.slice(0, 60)}")` : ""}`);
+    }
     if (review.note) lines.push(`  Overall: ${review.note}`);
 
     if (seen) {
       lines.push(`  (${review.items.length} item${review.items.length === 1 ? "" : "s"}, listed before and still open)`);
     } else {
       for (const item of review.items) {
-        const anchor = item.text ? ` (on: "${item.text.slice(0, 80)}")` : " (whole page)";
+        const node = item.anchors?.[0]?.node;
+        const anchor = node
+          ? ` (on the diagram node "${node.label || node.id}" — edit the diagram source)`
+          : item.text
+            ? ` (on: "${item.text.slice(0, 80)}")`
+            : " (whole page)";
+        if (item.tag === "verbatim") {
+          // The replacement text is the instruction. Summarising it back into
+          // prose would reintroduce exactly the ambiguity the human removed by
+          // typing the words themselves.
+          lines.push(`  • Replace "${item.text.slice(0, 80)}" with exactly: ${item.replacement ?? ""}`);
+          continue;
+        }
+        if (item.tag === "structural" && item.op) {
+          lines.push(
+            `  • ${item.op.kind}${anchor}${item.op.targetText ? ` → "${item.op.targetText.slice(0, 60)}"` : ""}`,
+          );
+          continue;
+        }
         lines.push(`  • ${item.body}${anchor}`);
       }
       deliver.push(review.id);
@@ -262,6 +305,7 @@ export function buildContextInjection(entries: InjectionEntry[]): Injection | nu
     "",
     "Read the overall note and every item before changing anything — they were written as one pass and can pull against each other.",
     "Apply them by editing the file directly; the open browser patches itself in place, so never tell the user to reload.",
+    'If an item is ambiguous, run `plan-editor ask <file> --id <id> --question "..."` and wait rather than guessing.',
     "When you are done, run `plan-editor respond <file> --summary \"<what you changed and why>\"` to put your work in front of them.",
   );
 
@@ -283,6 +327,12 @@ export async function runContextHook(
       file: session.file,
       ownership: ownershipOf(session, agent),
       agentKey,
+      contract: (session.contract ?? []).filter((rule) => !rule.retiredAt).map((rule) => ({ text: rule.text })),
+      locks: (session.locks ?? []).map((lock) => ({
+        selector: lock.selector,
+        text: lock.text,
+        ...(lock.label ? { label: lock.label } : {}),
+      })),
       review: review
         ? {
             id: review.id,
@@ -293,6 +343,10 @@ export async function runContextHook(
               body: item.body,
               text: item.text,
               selector: item.selector,
+              tag: item.tag,
+              ...(item.replacement !== undefined ? { replacement: item.replacement } : {}),
+              ...(item.op ? { op: { kind: item.op.kind, targetText: item.op.targetText } } : {}),
+              ...(item.anchors?.[0]?.node ? { anchors: [{ node: item.anchors[0].node }] } : {}),
             })),
           }
         : null,
@@ -320,7 +374,9 @@ export function fileFromToolInput(rawInput: string): string | null {
     const parsed = JSON.parse(rawInput || "{}") as { tool_input?: { file_path?: string } };
     const file = parsed.tool_input?.file_path;
     if (!file) return null;
-    return [".html", ".htm"].includes(path.extname(file).toLowerCase()) ? file : null;
+    // Markdown counts: the agent edits the .md source and the browser renders
+    // it, so a write to a .md is exactly as much an artifact edit as a .html.
+    return [".html", ".htm", ".md", ".markdown", ".mdx"].includes(path.extname(file).toLowerCase()) ? file : null;
   } catch {
     return null;
   }

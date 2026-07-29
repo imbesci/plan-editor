@@ -5,7 +5,7 @@
 // hundred KB of HTML, so storing deltas would cost more complexity than it saves
 // disk, and a whole-file snapshot makes restore a single write.
 
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 
 import type { VersionMeta } from "../protocol.ts";
@@ -72,16 +72,47 @@ export class VersionStore {
         if (previousHtml === html) return null;
       }
 
-      const seq = (previous?.seq ?? 0) + 1;
+      // Never reuse a seq that already has a file on disk. `readIndex` turns any
+      // unreadable index into an empty history, so without this a corrupt index
+      // restarts numbering at 1 and silently overwrites 1.html.
+      const onDisk = await highestSeqOnDisk(dir);
+      const seq = Math.max(previous?.seq ?? 0, onDisk) + 1;
       const meta: VersionMeta = { seq, at: new Date().toISOString(), bytes: Buffer.byteLength(html), origin };
-      await writeFile(path.join(dir, `${seq}.html`), html);
+      // The payload is written atomically too. It used to be a plain writeFile
+      // while only the index was atomic, so a crash mid-write left a truncated
+      // snapshot that the index still claimed was a valid version — and undo
+      // restoring a half-written file is worse than no undo.
+      await writeFileAtomically(path.join(dir, `${seq}.html`), html);
       index.versions.push(meta);
 
       // Cap oldest-first. Losing deep history is fine; losing the ability to
-      // undo the last few edits is not.
-      while (index.versions.length > MAX_VERSIONS) {
-        const dropped = index.versions.shift()!;
-        await rm(path.join(dir, `${dropped.seq}.html`), { force: true });
+      // undo the last few edits is not. Pinned versions are exempt: pinning is
+      // the human saying "this one is the record", and aging out the version
+      // someone named is the one drop that is never acceptable.
+      while (index.versions.filter((entry) => !entry.pinned).length > MAX_VERSIONS) {
+        const dropIndex = index.versions.findIndex((entry) => !entry.pinned);
+        if (dropIndex === -1) break;
+        const [dropped] = index.versions.splice(dropIndex, 1);
+        await rm(path.join(dir, `${dropped!.seq}.html`), { force: true });
+      }
+      await writeFileAtomically(this.indexFile(key), `${JSON.stringify(index, null, 2)}\n`);
+      return meta;
+    });
+  }
+
+  /** Names or pins a version, so history is not a row of anonymous `v7`s. */
+  async annotate(key: string, seq: number, patch: { label?: string; pinned?: boolean }): Promise<VersionMeta | null> {
+    return queued(`versions:${key}`, async () => {
+      const index = await this.readIndex(key);
+      const meta = index.versions.find((entry) => entry.seq === seq);
+      if (!meta) return null;
+      if (patch.label !== undefined) {
+        if (patch.label) meta.label = patch.label;
+        else delete meta.label;
+      }
+      if (patch.pinned !== undefined) {
+        if (patch.pinned) meta.pinned = true;
+        else delete meta.pinned;
       }
       await writeFileAtomically(this.indexFile(key), `${JSON.stringify(index, null, 2)}\n`);
       return meta;
@@ -96,6 +127,17 @@ export class VersionStore {
 
   async removeAll(key: string): Promise<void> {
     await rm(this.dir(key), { recursive: true, force: true });
+  }
+}
+
+async function highestSeqOnDisk(dir: string): Promise<number> {
+  try {
+    return (await readdir(dir)).reduce((highest, entry) => {
+      const match = /^(\d+)\.html$/.exec(entry);
+      return match ? Math.max(highest, Number(match[1])) : highest;
+    }, 0);
+  } catch {
+    return 0;
   }
 }
 

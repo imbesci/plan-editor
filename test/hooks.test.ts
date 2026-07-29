@@ -10,6 +10,7 @@ import {
   fileFromToolInput,
   MAX_CONSECUTIVE_BLOCKS,
   mergeHookSettings,
+  type InjectionEntry,
 } from "../src/hooks.ts";
 
 // openEdits is now "how many reviews are sent and unanswered", not loose notes.
@@ -146,11 +147,92 @@ describe("mergeHookSettings", () => {
 
 describe("buildContextInjection", () => {
   const item = (body: string) => ({ id: `i-${body}`, body, text: "Launch plan", selector: "#heading" });
-  const entry = (over: Partial<{ note: string; deliveredTo: string[]; items: ReturnType<typeof item>[] }> = {}) => ({
+  type InjectedItem = InjectionEntry["review"] extends { items: infer I } | null
+    ? I extends Array<infer E>
+      ? E
+      : never
+    : never;
+  const entry = (over: Partial<{ note: string; deliveredTo: string[]; items: InjectedItem[] }> = {}) => ({
     file: "/tmp/a.html",
     ownership: "authoring" as const,
     agentKey: "A",
     review: { id: "r1", note: "cut this by a third", items: [item("Rename the heading")], ...over },
+  });
+
+  test("standing rules lead even the overall note", () => {
+    const injection = buildContextInjection([
+      { ...entry(), contract: [{ text: "Never use the word 'leverage'." }] },
+    ]);
+    const lines = injection!.text.split("\n");
+    const rule = lines.findIndex((line) => line.includes("Always: Never use"));
+    const note = lines.findIndex((line) => line.includes("Overall:"));
+    assert.ok(rule !== -1 && rule < note, injection!.text);
+  });
+
+  test("standing rules repeat on a delivery the items are compacted out of", () => {
+    // The exact inverse of the item rule, and deliberate: a rule stated once and
+    // never again is one the agent breaks three turns later, and unlike an item
+    // it is not visible in the file it is looking at.
+    const injection = buildContextInjection([
+      { ...entry({ deliveredTo: ["A"] }), contract: [{ text: "Keep sections under 200 words." }] },
+    ]);
+    assert.match(injection!.text, /Always: Keep sections under 200 words\./);
+    assert.match(injection!.text, /1 item, listed before and still open/);
+    assert.doesNotMatch(injection!.text, /Rename the heading/);
+  });
+
+  test("locked regions are named as do-not-touch", () => {
+    const injection = buildContextInjection([
+      { ...entry(), locks: [{ selector: "#budget", text: "40 units", label: "Budget" }] },
+    ]);
+    assert.match(injection!.text, /Do not touch: Budget/);
+  });
+
+  test("a verbatim item is injected as its replacement text, not as prose", () => {
+    // Summarising it back into prose reintroduces exactly the ambiguity the
+    // human removed by typing the words themselves.
+    const injection = buildContextInjection([
+      {
+        ...entry({
+          items: [
+            {
+              id: "v1",
+              body: "Replace with the supplied text.",
+              text: "We should leverage the queue.",
+              selector: "#p1",
+              tag: "verbatim",
+              replacement: "We should reuse the queue.",
+            },
+          ],
+        }),
+      },
+    ]);
+    assert.match(injection!.text, /Replace "We should leverage the queue\." with exactly: We should reuse the queue\./);
+  });
+
+  test("a structural item is injected as its operation", () => {
+    const injection = buildContextInjection([
+      {
+        ...entry({
+          items: [
+            {
+              id: "s1",
+              body: "move it",
+              text: "Risks",
+              selector: "#risks",
+              tag: "structural",
+              op: { kind: "move-before", targetText: "Milestones" },
+            },
+          ],
+        }),
+      },
+    ]);
+    assert.match(injection!.text, /move-before.*Milestones/);
+  });
+
+  test("it tells the agent to ask rather than guess", () => {
+    const injection = buildContextInjection([entry()]);
+    assert.match(injection!.text, /plan-editor ask/);
   });
 
   test("returns null when no review is pending", () => {

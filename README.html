@@ -1,0 +1,695 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plan-editor — usage and functionality</title>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --surface: #ffffff;
+    --sunken: #f4f1ec;
+    --fg: #1c1b19;
+    --muted: #6b6862;
+    --faint: #93908a;
+    --line: #e6e2db;
+    --accent: #b8442e;
+    --accent-soft: #fbeeea;
+    --ok: #3f7d54;
+    --warn: #a8730f;
+    --radius: 10px;
+  }
+  /* Follows the OS by default, but honours plan-editor's theme toggle when the
+     reader has made an explicit choice — hence both selectors. A media-query-only
+     artifact silently keeps following the OS and looks broken next to a chrome
+     that just went dark. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #131211;
+      --surface: #1b1a18;
+      --sunken: #211f1d;
+      --fg: #f0ede8;
+      --muted: #a6a29b;
+      --faint: #7d7973;
+      --line: #2e2c29;
+      --accent: #e8785e;
+      --accent-soft: #2a1c18;
+      --ok: #6bbd86;
+      --warn: #d8a03f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #131211;
+    --surface: #1b1a18;
+    --sunken: #211f1d;
+    --fg: #f0ede8;
+    --muted: #a6a29b;
+    --faint: #7d7973;
+    --line: #2e2c29;
+    --accent: #e8785e;
+    --accent-soft: #2a1c18;
+    --ok: #6bbd86;
+    --warn: #d8a03f;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 1.5rem; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .shell { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 3rem; max-width: 1180px; margin: 0 auto; padding: 3rem 2rem 6rem; }
+  @media (max-width: 900px) { .shell { grid-template-columns: minmax(0, 1fr); gap: 0; padding: 2rem 1.25rem 4rem; } }
+
+  nav { position: sticky; top: 2rem; align-self: start; font-size: 13.5px; max-height: calc(100vh - 4rem); overflow-y: auto; }
+  /* On a phone the sidebar stacks above the content. Left at full height that
+     is 28 links to scroll past before reaching a word of the document, so it is
+     capped and scrolls internally instead. */
+  @media (max-width: 900px) {
+    nav { position: static; max-height: 38vh; overflow-y: auto; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--line); }
+  }
+  nav h2 { font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--faint); margin: 1.4rem 0 .5rem; font-weight: 600; }
+  nav h2:first-child { margin-top: 0; }
+  nav a { display: block; padding: 3px 0; color: var(--muted); text-decoration: none; border-left: 2px solid transparent; padding-left: .7rem; margin-left: -.7rem; }
+  nav a:hover { color: var(--accent); border-left-color: var(--accent); }
+
+  main { min-width: 0; }
+  section { margin-bottom: 3.5rem; }
+  h1 { font: 700 2.7rem/1.1 ui-serif, Georgia, serif; margin: 0 0 .6rem; letter-spacing: -.02em; }
+  h2 { font: 600 1.5rem/1.25 ui-serif, Georgia, serif; margin: 0 0 1rem; padding-bottom: .5rem; border-bottom: 1px solid var(--line); letter-spacing: -.01em; }
+  h3 { font-size: 1.02rem; font-weight: 650; margin: 1.9rem 0 .5rem; }
+  h4 { font-size: .93rem; font-weight: 650; margin: 1.3rem 0 .4rem; color: var(--muted); }
+  p { margin: 0 0 .95rem; }
+  ul, ol { margin: 0 0 .95rem; padding-left: 1.25rem; }
+  li { margin-bottom: .35rem; }
+  a { color: var(--accent); }
+  strong { font-weight: 650; }
+
+  .lede { font-size: 1.18rem; line-height: 1.6; color: var(--muted); margin-bottom: 1.6rem; }
+  .eyebrow { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); font-weight: 650; margin-bottom: .7rem; }
+
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .875em; background: var(--sunken); padding: .12em .38em; border-radius: 4px; }
+  pre { background: var(--sunken); border: 1px solid var(--line); border-radius: var(--radius); padding: .95rem 1.1rem; overflow-x: auto; margin: 0 0 1.1rem; line-height: 1.55; }
+  pre code { background: none; padding: 0; font-size: 13px; }
+  kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--surface); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: .12em .45em; white-space: nowrap; }
+
+  .table-wrap { overflow-x: auto; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  th, td { text-align: left; padding: .55rem .8rem .55rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--faint); font-weight: 600; }
+  td code { white-space: nowrap; }
+
+  .note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: .85rem 1.1rem; border-radius: 0 var(--radius) var(--radius) 0; margin: 0 0 1.2rem; }
+  .note p:last-child { margin-bottom: 0; }
+  .note-title { font-weight: 650; font-size: .82rem; letter-spacing: .04em; text-transform: uppercase; color: var(--accent); margin-bottom: .3rem; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: .9rem; margin-bottom: 1.2rem; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: .85rem 1rem; }
+  .card h4 { margin: 0 0 .3rem; color: var(--fg); }
+  .card p { margin: 0; font-size: 14px; color: var(--muted); }
+
+  .flow { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 1.1rem 1.2rem; overflow-x: auto; margin-bottom: 1.2rem; }
+  .flow pre { background: none; border: 0; padding: 0; margin: 0; font-size: 12.5px; color: var(--muted); }
+
+  footer { border-top: 1px solid var(--line); padding-top: 1.3rem; color: var(--faint); font-size: 13.5px; }
+</style>
+</head>
+<body>
+<div class="shell">
+
+<nav id="toc">
+  <h2>Start</h2>
+  <a href="#idea">The idea</a>
+  <a href="#install">Install</a>
+  <a href="#quickstart">Quick start</a>
+  <a href="#phases">The two phases</a>
+  <h2>Marking up</h2>
+  <a href="#gestures">Gestures</a>
+  <a href="#overall-note">The overall note</a>
+  <a href="#precise">Saying it precisely</a>
+  <a href="#contract">Standing rules</a>
+  <a href="#locks">Locked regions</a>
+  <h2>The exchange</h2>
+  <a href="#delivery">Reaching your agent</a>
+  <a href="#unsure">When it is unsure</a>
+  <a href="#verdicts">Accept and reject</a>
+  <a href="#lifecycle">The lifecycle</a>
+  <h2>History</h2>
+  <a href="#versions">Versions and undo</a>
+  <a href="#churn">Churn</a>
+  <h2>Beyond one file</h2>
+  <a href="#diagrams">Diagrams</a>
+  <a href="#markdown">Markdown artifacts</a>
+  <a href="#sets">Review sets</a>
+  <a href="#packets">Another reviewer</a>
+  <a href="#record">The record</a>
+  <h2>Reference</h2>
+  <a href="#shortcuts">Keyboard</a>
+  <a href="#cli">CLI</a>
+  <a href="#mcp">MCP tools</a>
+  <a href="#authoring">Writing artifacts</a>
+  <a href="#security">Security</a>
+  <a href="#environment">Environment</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#troubleshooting">Troubleshooting</a>
+  <a href="#absent">Deliberately absent</a>
+</nav>
+
+<main>
+
+<header id="masthead">
+  <div class="eyebrow">Documentation</div>
+  <h1>plan-editor in depth</h1>
+  <p class="lede">Mark up a document the way you would mark up a draft — freely, at your own pace — then send the whole review to your agent at once. It applies the set, the page patches itself in place, and you accept or reject its work item by item.</p>
+  <p>No reload, no losing your scroll position, and the review goes back to the agent you were already talking to, not a fresh one that has never seen the document. Works on <code>.html</code> and <code>.md</code>.</p>
+</header>
+
+<section id="idea">
+  <h2>The idea</h2>
+  <p>Your agent writes an artifact — a plan, a spec, a report. Reviewing it normally means describing changes in prose (“the third paragraph under Risks is too long”), which is slow and imprecise. plan-editor lets you point at the thing and say what you want.</p>
+  <div class="cards">
+    <div class="card">
+      <h4>You review in one pass</h4>
+      <p>Mark up the whole document while it holds still, then send it as one review. The agent sees how your notes relate before it changes anything.</p>
+    </div>
+    <div class="card">
+      <h4>It morphs, it does not reload</h4>
+      <p>A reload destroys DOM node identity, which is why comment anchors normally orphan the instant the agent rewrites the file. Morphing updates nodes in place.</p>
+    </div>
+    <div class="card">
+      <h4>Reviews route to the author</h4>
+      <p>The session records which agent session opened it. Your review lands in that conversation, with the context behind why the plan reads the way it does.</p>
+    </div>
+    <div class="card">
+      <h4>It accumulates</h4>
+      <p>Standing rules outlive any one review, so round four stops repeating the correction you made in round one.</p>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+  <p>The runtime is <strong>Bun</strong>, not Node. Bun executes the TypeScript in <code>src/</code> directly, so there is no server-side build step — <code>bun run build</code> produces only the two browser bundles and the stylesheet.</p>
+<pre><code>bun install
+bun run build
+bun run bin/plan-editor.js setup hooks   # once, then restart Claude Code</code></pre>
+  <p>Link it globally if you would rather type <code>plan-editor</code> than the full path. Every example below assumes you have.</p>
+</section>
+
+<section id="quickstart">
+  <h2>Quick start</h2>
+<pre><code>plan-editor plan.md            # opens the artifact in your browser
+plan-editor doctor plan.html   # check an artifact anchors well
+plan-editor new spec.html --template spec --title "Ingest spec"</code></pre>
+  <p>Then, in the browser:</p>
+  <ol>
+    <li>Turn on <strong>Annotate</strong> (<kbd>⌘I</kbd>) and work through the document, clicking things and describing the changes you want. Nothing leaves your browser yet.</li>
+    <li>Add an <strong>overall note</strong> if the review has a theme — <em>“cut this by a third”</em>.</li>
+    <li>Hit <strong>Send review</strong> (<kbd>⇧⌘Enter</kbd>).</li>
+  </ol>
+  <p>Your agent applies the set, the page patches itself in place, and each item comes back for you to accept or reject. If you want the agent waiting rather than picking it up on your next message, have it end its turn with <code>plan-editor watch plan.md</code>.</p>
+</section>
+
+<section id="phases">
+  <h2>The two phases</h2>
+  <p>The whole design rests on these never blurring.</p>
+  <h3>1. Marking up</h3>
+  <p>The document stays still. Nothing you write reaches the agent. Add as many notes as you like, over as long as you like — the draft lives on the server, so a reload does not lose it. <strong>Send review</strong> is the one moment anything crosses.</p>
+  <h3>2. Reading the agent’s work</h3>
+  <p>The agent applies the review as a set and responds with a summary of what it did and why. Each item comes back marked:</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Outcome</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><strong>applied</strong></td><td>Done as asked</td></tr>
+      <tr><td><strong>applied with a caveat</strong></td><td>Done, but read the agent’s note</td></tr>
+      <tr><td><strong>needs your call</strong></td><td>Ambiguous — the agent wants a decision rather than guessing</td></tr>
+      <tr><td><strong>not done</strong></td><td>Deliberately skipped, with a reason</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Each item shows <strong>what actually changed</strong> — a word-level diff of the section it touched, next to the note that asked for it. A summary tells you what the agent says it did; this shows you what it did. Anything it changed that <strong>no note asked for</strong> is called out above the list, because that is the trust question for handing over a whole review at once.</p>
+  <div class="note">
+    <div class="note-title">Why batched, not live</div>
+    <p>An earlier version sent every note the instant you wrote it. Three notes about one paragraph — <em>reword</em>, <em>too wordy</em>, <em>elaborate</em> — arrived separately and produced three rewrites that cancelled out. The agent was never wrong; it just never saw the shape of the intent. Batching also means nothing is waiting on anything, so latency stops mattering.</p>
+  </div>
+</section>
+
+<section id="gestures">
+  <h2>Gestures</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Gesture</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Click</strong> an element</td><td>Pins the note to it</td></tr>
+      <tr><td><strong>Select text</strong>, then click</td><td>Pins to the selection rather than the whole element</td></tr>
+      <tr><td><kbd>⇧</kbd>-click more elements</td><td>One note covering several — <kbd>⇧</kbd>-click again to drop one</td></tr>
+      <tr><td>Type with nothing selected</td><td>A note about the page as a whole</td></tr>
+      <tr><td><strong>Suggest</strong> (<kbd>⌘E</kbd>)</td><td>Type the exact replacement text instead of describing it</td></tr>
+      <tr><td><strong>Structure…</strong></td><td>Delete, move above, move below, split, merge</td></tr>
+      <tr><td><strong>Lock this</strong></td><td>Mark the armed target do-not-touch</td></tr>
+      <tr><td>Click an armed element again</td><td>Un-select it — or press <kbd>Esc</kbd>, or use <strong>Clear selection</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Native controls — buttons, inputs, links, <code>&lt;summary&gt;</code> — stay interactive in annotate mode, so an artifact with working UI keeps working while you review it.</p>
+</section>
+
+<section id="overall-note">
+  <h2>The overall note</h2>
+  <p>A review carries one note that frames all of it — <em>“cut this by a third”</em>, <em>“the tone is too hedged throughout”</em>. This is not another pinned comment. It leads every payload the agent receives and survives the compaction that drops repeated items, because it is the context that makes the individual notes interpretable.</p>
+</section>
+
+<section id="precise">
+  <h2>Saying it precisely</h2>
+  <p>Prose is the worst way to express the two cheapest kinds of change. Both have their own gesture.</p>
+  <h3>Suggest an exact replacement</h3>
+  <p>For a typo, a wrong number, a bad sentence, writing <em>“change ‘leverage’ to ‘use’”</em> is a round trip and an ambiguity. Turn on suggest mode and type the replacement directly. It reaches the agent as <em>replace this → with exactly this</em>, and the agent is told to apply it literally or skip it and say why — never to paraphrase it.</p>
+  <div class="note">
+    <div class="note-title">You are proposing, not editing</div>
+    <p>The document is agent-owned, so your edit is restored in the browser the instant you commit it. The file changes when the agent changes it. If the browser kept your text, the live DOM would diverge from the file and the next morph would fight it.</p>
+  </div>
+  <h3>Ask for a structural change by doing it</h3>
+  <p>“Move Risks above Milestones but leave the intro where it is” is an id-set operation dressed up as a sentence. The structural gestures send it as the operation.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Item kind</th><th>What the agent receives</th></tr></thead>
+    <tbody>
+      <tr><td>note</td><td>Your prose, plus the anchored text</td></tr>
+      <tr><td>verbatim</td><td>The original text and the exact replacement</td></tr>
+      <tr><td>structural</td><td>The operation, the subject, and the target</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="contract">
+  <h2>Standing rules</h2>
+  <p>The overall note dies with its review. A standing rule does not. <em>“Never use the word ‘leverage’.”</em> <em>“Keep sections under 200 words.”</em> Rules are injected ahead of <strong>every</strong> review of this document, forever, until you retire them.</p>
+  <p>This is the one feature aimed squarely at the thing that makes iterating with an agent feel slower than writing it yourself: making the same correction in round four that you made in round one.</p>
+  <div class="note">
+    <div class="note-title">The inverse of the item rule, deliberately</div>
+    <p>Items are listed in full once and then compacted to a count, because they are visible in the file the agent is looking at. Rules are repeated every single time, because they are not.</p>
+  </div>
+  <h3>Promote a rejection into a rule</h3>
+  <p>When you reject an item you give a reason, and the reason is the part that generalises — the item was about one paragraph, the reason is about the document. One click turns it into a standing rule. Rejections that share wording are grouped into a hint.</p>
+<pre><code>plan-editor contract plan.md --add "Never use the word 'leverage'."
+plan-editor contract plan.md                    # list them
+plan-editor contract plan.md --retire &lt;rule-id&gt;
+plan-editor promote plan.md --id &lt;item-id&gt;      # from a rejection</code></pre>
+  <p>Retiring a rule keeps it on the record — it still explains the reviews it shaped.</p>
+</section>
+
+<section id="locks">
+  <h2>Locked regions</h2>
+  <p>Mark a section, a table, or a number <strong>do not touch</strong>. The agent is told about locks before it is told about the review, and it is told to raise the conflict rather than resolve it — even when an item seems to ask for a change inside one.</p>
+  <p>A lock constrains the agent, not you: you can still pin a note to locked content. Asking is always allowed; changing it unasked is not.</p>
+<pre><code>plan-editor lock plan.md --selector "#budget" --label "Budget table"
+plan-editor lock plan.md --remove &lt;lock-id&gt;</code></pre>
+  <p>This is the natural completion of the <em>changes nobody asked for</em> report, which already tells you when the agent went outside the brief. A lock turns that from a report into a rule.</p>
+</section>
+
+<section id="delivery">
+  <h2>Reaching your agent</h2>
+  <p>Three mechanisms, layered. You want all three.</p>
+  <h3>1. Hooks — no polling, no fresh agent</h3>
+  <p><code>plan-editor setup hooks</code> merges four hooks into <code>~/.claude/settings.json</code>, preserving anything already there.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Hook</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><strong>UserPromptSubmit</strong></td><td>Injects the pending review into the session you are already talking to</td></tr>
+      <tr><td><strong>SessionStart</strong> (compact/resume)</td><td>Re-injects after a compaction, where this loop otherwise dies quietly</td></tr>
+      <tr><td><strong>PostToolUse</strong></td><td>The browser shows “agent working” the moment it touches the file</td></tr>
+      <tr><td><strong>Stop</strong></td><td>Blocks the agent from finishing with your review unanswered</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The Stop hook is bounded three ways, because a runaway one is worse than the bug it fixes: it never stacks on an already-active stop hook, it gives up after two attempts per session, and <code>PLAN_EDITOR_NO_STOP_HOOK=1</code> disables it without uninstalling.</p>
+  <h3>2. watch — for when you are actively reviewing</h3>
+  <p>Hook delivery is <em>pull-on-prompt</em>: it only fires when you type. <code>plan-editor watch</code> parks the agent so a sent review reaches it immediately, in about 40ms.</p>
+  <h3>3. MCP — for agents that are not Claude Code</h3>
+  <p><code>plan-editor mcp</code> is an MCP server over stdio, so any MCP client gets typed tools instead of shelling out and parsing prose. <code>plan-editor setup mcp</code> prints the config to paste. For Claude Code the hooks remain strictly better: they need no tool call at all.</p>
+  <h3>Who gets the review</h3>
+  <p>The session records <code>authoredBy</code> (the agent session id) and <code>authoredIn</code> (cwd):</p>
+  <ul>
+    <li><strong>authoring</strong> — same session, or same project with no competing claim. Full delivery.</li>
+    <li><strong>same-project</strong> — different session, same directory. Delivered <em>with a warning</em> that it may lack context, because you may have started a fresh session and silently dropping your review is worse.</li>
+    <li><strong>foreign</strong> — neither. Never delivered, never blocked.</li>
+  </ul>
+</section>
+
+<section id="unsure">
+  <h2>When the agent is unsure</h2>
+  <p>Guessing is how a review comes back with three items right and one confidently wrong. There are two ways out, and both put the decision back in the browser.</p>
+  <h3>It asks, and waits</h3>
+  <p><code>plan-editor ask &lt;file&gt; --id &lt;item&gt; --question "..."</code> parks the agent. The question appears on the item, pinned to the top of your panel because something is waiting on it. You answer, and the agent unparks in milliseconds.</p>
+  <h3>It shows you two versions</h3>
+  <p>For a choice better seen than described, the agent offers alternatives. Hovering one previews it in the document in place; clicking picks it.</p>
+<pre><code>plan-editor alternatives plan.md --id &lt;item-id&gt; --json alts.json</code></pre>
+  <p>Either way the item’s thread records the exchange, so the transcript shows not just what changed but what was uncertain and how it was settled.</p>
+</section>
+
+<section id="verdicts">
+  <h2>Accept and reject</h2>
+  <p>Then you settle each item. <kbd>a</kbd> accepts the focused note, <kbd>r</kbd> rejects it, <kbd>u</kbd> undoes a verdict if you misfire. <strong>Accept all applied</strong> clears the straightforward ones in one go, and the outcome chips filter the list.</p>
+  <ul>
+    <li><strong>A rejection is never lost.</strong> It keeps its <code>rejected</code> status and reappears in your next draft with your reason attached.</li>
+    <li><strong>Rejecting can also undo the change.</strong> Reject offers <em>“…and undo that change”</em>, which puts just that section back to how it was before the review, leaving every other item the agent got right in place. If the section cannot be located in both documents, or the starting version has aged out of history, it refuses rather than half-writing.</li>
+    <li><strong>Re-point</strong> rescues an item whose anchor moved. It rarely needs you: anchors carry a content hash and word shingles, so an item survives the agent rewriting the very paragraph it points at. When a match is genuinely uncertain the item is flagged and offered ranked candidates to re-point to in one click.</li>
+  </ul>
+</section>
+
+<section id="lifecycle">
+  <h2>The lifecycle</h2>
+  <div class="flow">
+<pre>  ┌── you mark up ──┐                        the agent applies the set
+  │                 │                                    │
+  │   draft ────────┼──── you send ────▶ sent ───────────┼──▶ answered
+  │  (private)      │                                    │
+  └─────────────────┘                                    ▼
+                                            ┌── you accept ──▶ accepted
+                                            │
+                                            └── you reject ──▶ carried into
+                                                               your next review</pre>
+  </div>
+  <p><strong>Nothing is consumed on delivery.</strong> Polling twice returns the same review; it leaves the agent’s queue only when the agent responds. An answered question puts the review back in front of the agent, so a plain <code>watch</code> picks it up too.</p>
+</section>
+
+<section id="versions">
+  <h2>Versions and undo</h2>
+  <p>Every observed change to the artifact is snapshotted. <strong>History</strong> (<kbd>⌘H</kbd>) opens the version list.</p>
+  <ul>
+    <li><strong>Click a version</strong> to see it — the artifact morphs to that snapshot in place.</li>
+    <li><kbd>←</kbd> <kbd>→</kbd> scrub between versions; <strong>A</strong> and <strong>B</strong> pick any two to compare.</li>
+    <li><strong>Restore</strong> commits one, which is itself recorded, so undo is undoable.</li>
+    <li><strong>Undo</strong> (<kbd>⌘Z</kbd>) restores the previous version directly.</li>
+    <li><strong>Name and pin</strong> the ones that matter — <em>“sent to leadership”</em>. Pinned versions are exempt from the cap, because ageing out the one you deliberately named is the only drop that is never acceptable.</li>
+  </ul>
+  <p>Snapshots are whole files, capped at 40, oldest dropped. About 20KB each, so a full history is well under a megabyte. The diff is by element <code>id</code>, showing only the innermost changed element, with a word-level diff inside each section.</p>
+<pre><code>plan-editor undo plan.md
+plan-editor version plan.md --seq 12 --label "sent to leadership" --pin</code></pre>
+</section>
+
+<section id="churn">
+  <h2>Churn</h2>
+  <p>Which sections keep getting rewritten? A section rewritten six times is one you and the agent still disagree about, and it is usually not the one you would have guessed. The tool always had the snapshots to answer this and never asked.</p>
+<pre><code>plan-editor churn plan.md</code></pre>
+</section>
+
+<section id="diagrams">
+  <h2>Diagrams</h2>
+  <p>Mermaid diagrams render in the browser, in both <code>.html</code> and <code>.md</code> artifacts.</p>
+<pre><code>&lt;pre class="mermaid" id="retry-flow"&gt;
+flowchart LR
+  IN[Job arrives] --&gt; TRY[Attempt]
+&lt;/pre&gt;</code></pre>
+  <p>In markdown a <code>```mermaid</code> fence is enough — the renderer gives it a stable id for you.</p>
+  <p><strong>Click a node to pin a note to it.</strong> The note anchors to the node's identity and its label, never to a position on screen, and the anchor itself still points at the diagram's <em>source</em> — so the agent is told “the node labelled Classify” and edits the text that produced it.</p>
+  <p><strong>The source is authoritative.</strong> The diagram text stays in the document and keeps its id; the rendered SVG sits beside it as generated presentation. Nothing you do in the browser rewrites the file.</p>
+  <p>Three properties make this safe rather than a constant source of noise:</p>
+  <ul>
+    <li>Rendering is <strong>deterministic</strong> — identical source produces byte-identical SVG, so an untouched diagram produces no diff. Mermaid's default random ids would have made every diagram look rewritten on every patch.</li>
+    <li>The SVG is <strong>excluded from the diff</strong>, because it is generated in the browser and is not in the file.</li>
+    <li>Diagram identity is the <strong>container's <code>id</code></strong>, not its position in the document, so inserting a diagram above another does not re-point notes on it. <code>doctor</code> warns when a diagram has no id.</li>
+  </ul>
+  <div class="note">
+    <div class="note-title">Why it loads late</div>
+    <p>Mermaid is ~2.6MB against the SDK's 30kb, so it is vendored and fetched only once a diagram is actually present. Artifacts without one pay nothing, and artifacts with one still render offline.</p>
+  </div>
+</section>
+
+<section id="markdown">
+  <h2>Markdown artifacts</h2>
+  <p>Agents write <code>PLAN.md</code> far more often than <code>plan.html</code>, so <code>.md</code> is a first-class artifact.</p>
+  <p><strong>The markdown stays markdown.</strong> It is the source of truth on disk; the agent edits it exactly as it edits HTML; the browser only ever renders it. There is no HTML-back-to-Markdown path and there never will be — a lossy round trip is the one operation in this tool capable of quietly rewriting your prose, and it would run on every patch.</p>
+  <p>Two things follow, both free:</p>
+  <ul>
+    <li><strong>Every block gets a stable id</strong>, derived from the nearest heading. Section ids are the highest-value property an artifact can have, and here you do not write them.</li>
+    <li><strong>The agent is given source line ranges, not selectors.</strong> An item arrives as <code>plan.md:42-47</code>. A CSS selector is an artefact of the render and useless to an agent about to open the file.</li>
+  </ul>
+  <p>Version history stores the markdown, so undo and revert write markdown back. Export renders it to a standalone HTML page.</p>
+</section>
+
+<section id="sets">
+  <h2>Review sets</h2>
+  <p>A note like <em>“these three disagree about the retry budget”</em> is not expressible against a single file. Companions put several artifacts under one review so the agent is told the set.</p>
+<pre><code>plan-editor companions plan.md --with spec.md rfc.html</code></pre>
+  <p>Companion paths are resolved and checked server-side, so a client-supplied path never becomes a path the server trusts.</p>
+</section>
+
+<section id="packets">
+  <h2>Handing a review to someone else</h2>
+  <p>There is no multiplayer, no CRDT, and no identity model — that refusal is what keeps anchoring, threading, and undo tractable. But “let my colleague review this” is a real need, so it is handled by sequential handoff.</p>
+<pre><code>plan-editor packet export plan.md --review &lt;id&gt; --out review.packet.json
+# they open it against their own copy
+plan-editor packet import plan.md --in review.packet.json --from "Sam"</code></pre>
+  <p>An imported packet lands in <strong>your draft</strong>, never as a sent review: you still decide what crosses to your agent, exactly as with your own markup. A packet carries the hash of the document it was written against, so if your copy has moved on you are told — that is precisely the case where anchors resolve cleanly to the wrong element.</p>
+</section>
+
+<section id="record">
+  <h2>The record</h2>
+  <p><code>export</code> writes the artifact. The more useful artifact of a review cycle is the <strong>record</strong>: what was asked, what the agent said it did, what you accepted, and why you rejected the rest. That is the handoff document, the audit trail, and the thing that goes in a pull request description.</p>
+<pre><code>plan-editor transcript plan.md --out review-record.md
+plan-editor export plan.md --out share.html
+plan-editor commit plan.md --message "docs: apply review"</code></pre>
+  <p>Artifacts live in repos, so version history no longer has to be a parallel universe: <code>commit</code> stages and commits just that file, and the panel shows the artifact’s git status and its diff against <code>HEAD</code>. Every git operation degrades quietly when git is absent or the file is untracked.</p>
+</section>
+
+<section id="shortcuts">
+  <h2>Keyboard shortcuts</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Key</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><kbd>⌘I</kbd></td><td>Toggle annotate mode</td></tr>
+      <tr><td><kbd>⌘E</kbd></td><td>Suggest mode — type the exact replacement</td></tr>
+      <tr><td>Click</td><td>Anchor a note to an element</td></tr>
+      <tr><td>Select text, then click</td><td>Anchor to the selection instead</td></tr>
+      <tr><td><kbd>⇧</kbd>-click</td><td>Add another element to the same note (again to remove)</td></tr>
+      <tr><td>Click it again</td><td>Un-select an element you did not mean to pick</td></tr>
+      <tr><td><kbd>⌘Enter</kbd></td><td>Add the note you are typing</td></tr>
+      <tr><td><kbd>⇧⌘Enter</kbd></td><td>Send the review</td></tr>
+      <tr><td><kbd>⌘F</kbd></td><td>Filter notes</td></tr>
+      <tr><td><kbd>/</kbd></td><td>Find in the document</td></tr>
+      <tr><td><kbd>⌘Z</kbd></td><td>Undo the last change</td></tr>
+      <tr><td><kbd>⌘H</kbd></td><td>Version history</td></tr>
+      <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Scrub versions while history is open</td></tr>
+      <tr><td><kbd>⌘\</kbd></td><td>Hide or show the panel (focus mode)</td></tr>
+      <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Move through your notes — the document scrolls to follow</td></tr>
+      <tr><td><kbd>Enter</kbd></td><td>Jump the document to the focused note</td></tr>
+      <tr><td><kbd>a</kbd> / <kbd>r</kbd></td><td>Accept or reject the focused note</td></tr>
+      <tr><td><kbd>u</kbd></td><td>Undo a verdict on the focused note</td></tr>
+      <tr><td>Theme button</td><td>Cycle system → light → dark</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Close an overlay, disarm a gesture, cancel re-pointing, or clear the selection</td></tr>
+      <tr><td><kbd>?</kbd></td><td>Shortcut list</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="cli">
+  <h2>CLI reference</h2>
+  <h3>Reviewing</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>plan-editor &lt;file&gt;</code></td><td>Open for review. Reuses an existing tab if one is watching.</td></tr>
+      <tr><td><code>plan-editor watch &lt;file&gt;</code></td><td>Park until a review arrives. <code>--max-ms</code> bounds the wait.</td></tr>
+      <tr><td><code>plan-editor poll &lt;file&gt;</code></td><td>Long-poll for a review. <code>--timeout-ms</code>, <code>--reply</code>.</td></tr>
+      <tr><td><code>plan-editor respond &lt;file&gt; --summary "..."</code></td><td>Close the review with what you changed and why.</td></tr>
+      <tr><td><code>plan-editor answer &lt;file&gt; --id &lt;id&gt;</code></td><td>Flag one item: <code>--outcome caveat|needs-call|skipped --note "..."</code>.</td></tr>
+      <tr><td><code>plan-editor ask &lt;file&gt; --id &lt;id&gt; --question "..."</code></td><td>Ask about one item and park until answered.</td></tr>
+      <tr><td><code>plan-editor alternatives &lt;file&gt; --id &lt;id&gt; --json &lt;path&gt;</code></td><td>Offer two or more versions to pick from.</td></tr>
+      <tr><td><code>plan-editor end &lt;file&gt;</code></td><td>End a session.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3>Standing context</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>plan-editor contract &lt;file&gt;</code></td><td>List the rules injected into every review.</td></tr>
+      <tr><td><code>plan-editor contract &lt;file&gt; --add "rule"</code></td><td>Add one. <code>--retire &lt;id&gt;</code> retires it.</td></tr>
+      <tr><td><code>plan-editor promote &lt;file&gt; --id &lt;id&gt;</code></td><td>Turn a rejection’s reason into a standing rule.</td></tr>
+      <tr><td><code>plan-editor lock &lt;file&gt; --selector "#budget"</code></td><td>Mark a region do-not-touch. <code>--label</code>, <code>--remove &lt;id&gt;</code>.</td></tr>
+      <tr><td><code>plan-editor companions &lt;file&gt; --with a.md b.html</code></td><td>Review several artifacts as one set.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3>History and the record</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>plan-editor undo &lt;file&gt;</code></td><td>Restore the previous version.</td></tr>
+      <tr><td><code>plan-editor version &lt;file&gt; --seq &lt;n&gt;</code></td><td>Name or pin a version. <code>--label "..."</code>, <code>--pin</code>, <code>--unpin</code>.</td></tr>
+      <tr><td><code>plan-editor churn &lt;file&gt;</code></td><td>Which sections keep being rewritten.</td></tr>
+      <tr><td><code>plan-editor transcript &lt;file&gt;</code></td><td>The review record as Markdown. <code>--out &lt;path&gt;</code>.</td></tr>
+      <tr><td><code>plan-editor export &lt;file&gt;</code></td><td>Write a standalone copy. <code>--out &lt;path&gt;</code>.</td></tr>
+      <tr><td><code>plan-editor commit &lt;file&gt; --message "..."</code></td><td>Stage and commit just this artifact.</td></tr>
+      <tr><td><code>plan-editor packet export &lt;file&gt; --review &lt;id&gt;</code></td><td>Hand a review to another reviewer. <code>--out</code>.</td></tr>
+      <tr><td><code>plan-editor packet import &lt;file&gt; --in &lt;path&gt;</code></td><td>Take one back. <code>--from &lt;name&gt;</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3>Authoring and setup</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>plan-editor new &lt;file&gt;</code></td><td>Write a compliant starter artifact. <code>--template plan|spec|report</code>, <code>--title</code>, <code>--force</code>.</td></tr>
+      <tr><td><code>plan-editor doctor &lt;file&gt;</code></td><td>Lint an artifact for anchoring problems.</td></tr>
+      <tr><td><code>plan-editor setup hooks</code></td><td>Install the Claude Code hooks.</td></tr>
+      <tr><td><code>plan-editor setup mcp</code></td><td>Print the MCP client config. <code>--out &lt;path&gt;</code>.</td></tr>
+      <tr><td><code>plan-editor mcp</code></td><td>Run the MCP server on stdio.</td></tr>
+      <tr><td><code>plan-editor status</code></td><td>Server state, sessions, bound agents, review counts.</td></tr>
+      <tr><td><code>plan-editor stop</code></td><td>Shut the background server down.</td></tr>
+      <tr><td><code>plan-editor server [--verbose]</code></td><td>Run the server in the foreground.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Flags worth knowing: <code>--no-open</code> never launches a browser, <code>--force-open</code> launches even when a tab is already watching.</p>
+</section>
+
+<section id="mcp">
+  <h2>MCP tools</h2>
+  <p>Every tool takes <code>file</code> unless noted.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>open_artifact</code></td><td>Open an artifact for review. <code>open_browser</code> optional.</td></tr>
+      <tr><td><code>await_review</code></td><td>Block until a review is sent, with the rules and locks that apply.</td></tr>
+      <tr><td><code>respond_to_review</code></td><td>Close the review with a summary.</td></tr>
+      <tr><td><code>answer_item</code></td><td>Record an outcome on one item, with a reason.</td></tr>
+      <tr><td><code>ask_human</code></td><td>Ask about one item and block until answered.</td></tr>
+      <tr><td><code>offer_alternatives</code></td><td>Offer two or more versions to pick between.</td></tr>
+      <tr><td><code>list_standing_rules</code></td><td>The rules that apply to every review of this artifact.</td></tr>
+      <tr><td><code>inspect_artifact</code></td><td>Lint the artifact.</td></tr>
+      <tr><td><code>review_transcript</code></td><td>The full review record as Markdown.</td></tr>
+      <tr><td><code>undo_last_change</code></td><td>Restore the previous version.</td></tr>
+      <tr><td><code>session_status</code></td><td>Every open artifact and what is waiting on whom. Takes no arguments.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="authoring">
+  <h2>Writing artifacts that work well</h2>
+  <p><strong>Give top-level sections stable <code>id</code> attributes.</strong> This is the single highest-value thing you can do. Idiomorph matches on id first, so ids let it update a section in place instead of tearing it down — which is the difference between a note being marked <code>addressed</code> and being marked <code>orphaned</code>.</p>
+<pre><code>&lt;section id="risks"&gt;…&lt;/section&gt;   &lt;!-- survives a rewrite --&gt;
+&lt;section&gt;…&lt;/section&gt;              &lt;!-- matched structurally; more fragile --&gt;</code></pre>
+  <p><strong>Support the theme toggle.</strong> plan-editor can force light or dark regardless of the OS setting, and it tells the artifact by setting <code>data-theme</code> on its root. An artifact that only uses the media query will quietly keep following the OS. Write both selectors:</p>
+<pre><code>@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #131211; /* … */ }
+}
+:root[data-theme="dark"] { --bg: #131211; /* … */ }</code></pre>
+  <p><strong>Check it.</strong> <code>doctor</code> reports duplicate ids (which make a section invisible to the diff), sections with no id, missing theme support, an SDK tag committed into the file, slabs of text too large to diff usefully, and references that will not resolve in an export. On a <code>.md</code> file it lints the render, so it has nothing to complain about — the ids are generated for you.</p>
+  <p>Artifacts are otherwise ordinary HTML. Nothing is injected except a single <code>&lt;script src="/sdk.js"&gt;</code> before <code>&lt;/body&gt;</code>, so the file renders identically opened straight from disk. Local sibling assets resolve relative to the artifact.</p>
+</section>
+
+<section id="security">
+  <h2>Security model</h2>
+  <p>The session key is <code>sha256(realpath(file))</code> — guessable, so it is an <strong>identifier, not a credential</strong>. Every session-scoped route requires a random capability token minted at open time and handed only to the CLI that created the session.</p>
+  <ul>
+    <li><code>POST /api/sessions</code> validates extension and <code>stat</code> server-side, so a local process cannot register <code>/etc/passwd</code> and read it back through the artifact route.</li>
+    <li>Sibling assets are confined to the artifact directory lexically <strong>and</strong> by <code>realpath</code>, so a symlink planted next to an artifact cannot escape it.</li>
+    <li>A Host-header allowlist rejects DNS rebinding. An origin check alone does not: a rebound page sends its hostile hostname in <em>both</em> <code>Origin</code> and <code>Host</code>.</li>
+    <li>State-changing browser routes additionally require same-origin.</li>
+    <li>The artifact runs in an iframe sandboxed without <code>allow-same-origin</code>, so it has an opaque origin and <strong>never receives the session token</strong>.</li>
+    <li>Markdown is escaped on render; there is no raw HTML passthrough.</li>
+  </ul>
+  <div class="note">
+    <div class="note-title">Scope</div>
+    <p>This is a local single-user tool. It is not hardened for exposure to a network, and <code>PLAN_EDITOR_HOST=0.0.0.0</code> in particular gives anyone who can reach the port full access with a plain <code>curl</code>.</p>
+  </div>
+</section>
+
+<section id="environment">
+  <h2>Environment</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>PLAN_EDITOR_PORT</code></td><td><code>4471</code></td><td>Server port</td></tr>
+      <tr><td><code>PLAN_EDITOR_HOST</code></td><td><code>127.0.0.1</code></td><td>Bind address</td></tr>
+      <tr><td><code>PLAN_EDITOR_STATE_DIR</code></td><td><code>~/.plan-editor</code></td><td>Sessions, versions, logs</td></tr>
+      <tr><td><code>PLAN_EDITOR_ALLOWED_HOSTS</code></td><td>—</td><td>Extra allowed <code>Host</code> values</td></tr>
+      <tr><td><code>PLAN_EDITOR_NO_STOP_HOOK</code></td><td>—</td><td><code>1</code> disables the Stop guard</td></tr>
+      <tr><td><code>PLAN_EDITOR_DEBUG</code></td><td>—</td><td><code>1</code> logs server events to stderr</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <p>Three processes: the CLI, one detached HTTP server, and a browser holding a chrome page whose sandboxed iframe renders the artifact.</p>
+  <div class="flow">
+<pre>you click an element   ──▶  SDK (in iframe)  ──postMessage──▶  chrome page
+                                                                    │
+                                                              POST /api/…/items
+                                                                    ▼
+                                                            session record
+                                                          (~/.plan-editor)
+                                                                    │
+                                          hook injection │ watch │ poll │ MCP
+                                                                    ▼
+                                                             your agent
+                                                                    │
+                                                          edits the file
+                                                                    ▼
+                                       chokidar ──▶ snapshot ──▶ SSE "patch"
+                                                                    │
+                                              chrome fetches new HTML
+                                                                    ▼
+                                          SDK morphs the DOM in place
+                                                        │
+                                    ┌───────────────────┴───────────────────┐
+                                    ▼                                       ▼
+                    highlight only the changed words              item → addressed</pre>
+  </div>
+  <p>State lives in <code>~/.plan-editor</code>: one JSON file per session — never a single global document, which makes unrelated projects clobber each other — plus per-session version directories holding whole-file snapshots and a flat index. Writes go through a per-key promise chain and tmp-plus-rename.</p>
+  <p>Anchors are scored rather than matched: each carries a content hash and word shingles over the full text, so an item still resolves after the agent rewrites the paragraph it points at. Below the confidence threshold the tool reports ranked candidates instead of guessing.</p>
+</section>
+
+<section id="troubleshooting">
+  <h2>Troubleshooting</h2>
+  <h4>“No agent is bound” / a review sits unsent to anyone</h4>
+  <p>Nothing is listening. Run <code>plan-editor setup hooks</code> and restart Claude Code, or have the agent run <code>plan-editor watch &lt;file&gt;</code>.</p>
+  <h4>A review is picked up only when I message the agent</h4>
+  <p>That is hook delivery working as designed — it is pull-on-prompt. Use <code>watch</code> for instant pickup.</p>
+  <h4>The agent applied things but nothing shows as reviewable</h4>
+  <p>It edited without responding. <code>plan-editor respond</code> is what moves a review into the review phase.</p>
+  <h4>The artifact frame is blank</h4>
+  <p>Hard-refresh (<kbd>⌘⇧R</kbd>). If it persists, the morph failed — a toast will say so, and it falls back to a full reload.</p>
+  <h4>Nothing updates at all</h4>
+  <p>Look for the disconnection bar at the top of the window. <code>plan-editor status</code> reports whether the server is running.</p>
+  <h4>My change did not restart the server</h4>
+  <p>It should — server identity folds in a code signature over <code>src/</code> and <code>dist/</code>. If you edited something outside those, run <code>plan-editor stop</code> and reopen.</p>
+  <h4>Several tabs are competing</h4>
+  <p>Re-running <code>plan-editor &lt;file&gt;</code> reuses a tab that is already watching. Use <code>--no-open</code> when restarting mid-session; <code>--force-open</code> overrides.</p>
+</section>
+
+<section id="absent">
+  <h2>Deliberately absent</h2>
+  <p><strong>No multiplayer, no CRDT, no identity model.</strong> The artifact is agent-owned and humans propose changes to it. That single decision is what keeps the annotation layer a simple append-only record rather than a merge problem — and it is why anchoring, threading, and undo are all tractable. Packets give you a second reviewer without touching any of it.</p>
+  <p><strong>No AI in the tool itself.</strong> plan-editor never calls a model. It moves reviews to your agent and changes back to your browser; the intelligence is entirely in the conversation you were already having. Even the “these rejections look alike” hint is string comparison, and should stay that way.</p>
+  <p><strong>No HTML-to-Markdown conversion.</strong> Markdown artifacts render one way only. The round trip is the single operation here capable of quietly rewriting your prose, and it would run on every patch.</p>
+</section>
+
+<footer id="colophon">
+  <p>This page is itself a compliant artifact — stable section ids, both theme selectors, no external resources. Open it with <code>plan-editor README.html</code> and mark it up.</p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>
