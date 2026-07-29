@@ -1,10 +1,12 @@
 # plan-editor
 
-Click an element, say what you want changed, watch it change in place.
+Mark up a document the way you'd mark up a draft — freely, at your own pace — then
+send the whole review to your agent at once.
 
-No reload. No flash. No losing your scroll position. And the edit goes back to the
-agent you were already talking to — the one that holds the conversation the plan
-came out of — not a fresh one that has never seen it.
+It applies the set, the page patches itself in place, and you accept or reject its
+work item by item. No reload, no losing your scroll position, and the review goes
+back to the agent you were already talking to, not a fresh one that has never seen
+the document.
 
 ```sh
 bun install
@@ -19,10 +21,12 @@ bun run bin/plan-editor.js setup hooks     # once, then restart Claude Code
 
 - [The idea](#the-idea)
 - [Quick start](#quick-start)
-- [Making edits](#making-edits)
-- [The edit lifecycle](#the-edit-lifecycle)
+- [The two phases](#the-two-phases)
+- [Why batched, not live](#why-batched-not-live)
+- [The overall note](#the-overall-note)
+- [The lifecycle](#the-lifecycle)
 - [Versions, undo, and diff](#versions-undo-and-diff)
-- [How edits reach your agent](#how-edits-reach-your-agent)
+- [How a review reaches your agent](#how-a-review-reaches-your-agent)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [CLI reference](#cli-reference)
 - [Writing artifacts that work well](#writing-artifacts-that-work-well)
@@ -41,7 +45,11 @@ normally means describing changes in prose ("the third paragraph under Risks is
 too long"), which is slow and imprecise. plan-editor lets you point at the thing
 and say what you want.
 
-Two properties make it more than a comment box:
+Three properties make it more than a comment box:
+
+**You review in one pass, not a trickle.** Mark up the whole document while it
+holds still, then send it as one review. The agent sees how your notes relate
+before it changes anything.
 
 **It morphs, it does not reload.** A reload destroys DOM node identity, which is
 why comment anchors in tools like this normally orphan the instant the agent
@@ -50,8 +58,8 @@ element reference stays valid across the edit — and the morph tells you exactl
 which nodes changed, turning "did the agent address my note?" into a set
 membership check rather than a fuzzy match.
 
-**Edits route to the authoring agent.** The session records which Claude Code
-session opened it. Your edit lands in that conversation, with all the context
+**Reviews route to the authoring agent.** The session records which Claude Code
+session opened it. Your review lands in that conversation, with all the context
 behind why the plan reads the way it does.
 
 ---
@@ -63,74 +71,103 @@ plan-editor plan.html          # opens the artifact in your browser
 plan-editor setup hooks        # once — restart Claude Code afterwards
 ```
 
-Then, in the browser: turn on **Annotate** (`⌘I`), click something, describe the
-change, hit **Submit**.
+Then, in the browser:
 
-Your agent picks it up, edits the file, and the page patches itself. The card in
-the sidebar flips to **applied**, and you Accept or Reject.
+1. Turn on **Annotate** (`⌘I`) and work through the document, clicking things and
+   describing the changes you want. Nothing leaves your browser yet.
+2. Add an **overall note** if the review has a theme — *"cut this by a third"*.
+3. Hit **Send review**.
 
-For the fastest loop, have your agent end its turn with:
+Your agent applies the set, the page patches itself in place, and each item comes
+back for you to **Accept** or **Reject**.
 
-```sh
-plan-editor watch plan.html
-```
-
-That parks it until you submit — measured at ~40ms from Submit to the agent
-having the edit. Without it, delivery waits until you next send the agent a
-message, which is unbounded and feels broken.
+If you want the agent waiting rather than picking it up on your next message, have
+it end its turn with `plan-editor watch plan.html`.
 
 ---
 
-## Making edits
+## The two phases
+
+The whole design rests on these never blurring.
+
+### 1. Marking up
+
+The document stays still. Nothing you write reaches the agent. Add as many notes
+as you like, over as long as you like — the draft lives on the server, so a reload
+does not lose it.
 
 | Gesture | Result |
 | --- | --- |
-| **Click** an element | Anchors the edit to it |
-| **Select text**, then click | Anchors to the selection rather than the whole element |
-| **⇧-click** more elements | One instruction covering several — ⇧-click again to drop one |
-| **Click elsewhere** while typing | Stages the current edit and starts another |
-| Type with nothing selected | A freeform message to the agent, not tied to an element |
-
-Staged edits queue up and go together on Submit, so a set of related changes
-arrives as one coherent batch rather than racing.
+| **Click** an element | Pins the note to it |
+| **Select text**, then click | Pins to the selection rather than the whole element |
+| **⇧-click** more elements | One note covering several — ⇧-click again to drop one |
+| Type with nothing selected | A note about the page as a whole |
+| **Overall note** | Frames the entire review — see below |
 
 Native controls — buttons, inputs, links, `<summary>` — stay interactive in
 annotate mode, so an artifact with working UI keeps working while you review it.
 
+**Send review** is the one moment anything crosses to the agent.
+
+### 2. Reading the agent's work
+
+The agent applies the review as a set and responds with a summary of what it did
+and why. Each item comes back marked:
+
+| Outcome | Meaning |
+| --- | --- |
+| **applied** | Done as asked |
+| **applied with a caveat** | Done, but read the agent's note |
+| **needs your call** | Ambiguous — the agent wants a decision rather than guessing |
+| **not done** | Deliberately skipped, with a reason |
+
+Then you **Accept** or **Reject** each one. A rejection carries your reason into
+your next review automatically, so the agent always hears why.
+
+## Why batched, not live
+
+An earlier version sent every note the instant you wrote it. In this project's own
+history, three notes about one paragraph — *reword*, *too wordy*, *elaborate* —
+arrived separately and produced three rewrites that cancelled out. The agent was
+never wrong; it just never saw the shape of the intent.
+
+Batching also means the document holds still while you read it, which is the only
+way to review anything properly. And it removes a whole class of problem: nothing
+is waiting on anything, so latency stops mattering.
+
+## The overall note
+
+A review carries one note that frames all of it — *"cut this by a third"*, *"the
+tone is too hedged throughout"*. This is not another pinned comment. It leads every
+payload the agent receives and survives the compaction that drops repeated items,
+because it is the context that makes the individual notes interpretable.
+
 ---
 
-## The edit lifecycle
+## The lifecycle
 
 ```
-   you submit
-        │
-        ▼
-   ┌──────────┐   agent's edit touches      ┌────────────┐  you accept  ┌──────────┐
-   │ submitted│──────the anchor────────────▶│  addressed │─────────────▶│ resolved │
-   └──────────┘                             └────────────┘              └──────────┘
-        ▲                                          │
-        │              you reject, with a reason   │
-        └──────────────────────────────────────────┘
-        ▲
-        │  anchor vanished ──▶ orphaned ──▶ you re-point it
+  ┌── you mark up ──┐                        the agent applies the set
+  │                 │                                    │
+  │   draft ────────┼──── you send ────▶ sent ───────────┼──▶ answered
+  │  (private)      │                                    │
+  └─────────────────┘                                    ▼
+                                            ┌── you accept ──▶ accepted
+                                            │
+                                            └── you reject ──▶ carried into
+                                                               your next review
 ```
 
-**Edits are records, not messages.** They are not deleted on delivery. An edit
-stays `submitted` until the agent's change actually touches its anchor, so the
-sidebar always reflects what has and has not landed.
+**Nothing is consumed on delivery.** Polling twice returns the same review; it
+leaves the agent's queue only when the agent responds.
 
-**Reject reopens.** A rejection carries your reason into the edit's thread and
-puts it back in front of the agent — an edit the agent never hears was wrong is
-worse than one never applied.
+**A rejection is never lost.** It keeps its `rejected` status and reappears in
+your next draft with your reason attached.
 
-**Reply** on any edit for a follow-up without creating a new one. A human reply
-reopens a settled edit, so the agent sees it.
+**Re-point** rescues an item whose anchor vanished: click **Re-point…**, then
+click the element it should refer to.
 
-**Re-point** gives an orphaned edit a new anchor: click **Re-point…**, then click
-the element it should refer to.
-
-Filter the sidebar by **Open / Review / Done / All**, or `⌘F` to search across
-edit text and anchors.
+`⌘F` filters notes by text or anchor.
 
 ---
 
@@ -153,7 +190,7 @@ full history is well under a megabyte.
 
 ---
 
-## How edits reach your agent
+## How a review reaches your agent
 
 Three mechanisms, layered. You want all three.
 
@@ -164,30 +201,31 @@ preserving anything already there:
 
 | Hook | What it does |
 | --- | --- |
-| **UserPromptSubmit** | Injects open edits into the session you're already talking to |
+| **UserPromptSubmit** | Injects the pending review into the session you're already talking to |
 | **SessionStart** (`compact\|resume`) | Re-injects after a compaction, where this loop otherwise dies quietly |
 | **PostToolUse** | The browser shows "agent working" the moment it touches the file |
-| **Stop** | Blocks the agent from finishing with your edits unapplied |
+| **Stop** | Blocks the agent from finishing with your review unanswered |
 
-Full edit text is injected once, then compacted to a short reminder, and goes
-silent once applied.
+The overall note is injected every time; the individual items are injected once
+and then compacted to a count, because the note is what makes them interpretable
+and the items are already in the file the agent is looking at.
 
 The Stop hook is bounded three ways, because a runaway one is worse than the bug
 it fixes: it never stacks on an already-active stop hook, it gives up after two
 attempts per session, and `PLAN_EDITOR_NO_STOP_HOOK=1` disables it without
 uninstalling.
 
-### 2. `watch` — the responsive path
+### 2. `watch` — for when you are actively reviewing
 
 Hook delivery is *pull-on-prompt*: it only fires when you type. `plan-editor watch`
-parks the agent on a long-poll so a submitted edit reaches it immediately.
+parks the agent so a sent review reaches it immediately. It matters much less than
+it used to — with batching, nobody is waiting on a trickle.
 
-### 3. `poll` and `applied` — the fallbacks
+### 3. Responding
 
-`plan-editor poll` is the classic blocking call. `plan-editor applied --id <id>`
-lets the agent declare an edit done when the browser cannot confirm — a closed or
-stale tab produces no confirmation, and without this the edit sticks forever and
-a watching agent is handed its own work on every cycle.
+`plan-editor respond <file> --summary "..."` closes the review and puts the work
+in front of you. `plan-editor answer <file> --id <id> --outcome needs-call --note
+"..."` flags a single ambiguous item rather than guessing.
 
 ### Who gets the edit
 
@@ -208,8 +246,9 @@ The presence indicator shows which session is bound and when it was last seen.
 | Key | Action |
 | --- | --- |
 | `⌘I` | Toggle annotate mode |
-| `⌘Enter` | Submit staged edits |
-| `⌘F` | Filter edits |
+| `⌘Enter` | Add the note you are typing |
+| `⇧⌘Enter` | Send the review |
+| `⌘F` | Filter notes |
 | `⌘Z` | Undo the last change |
 | `⌘H` | Version history |
 | `← →` | Scrub versions (while history is open) |
@@ -224,9 +263,10 @@ The presence indicator shows which session is bound and when it was last seen.
 | Command | Description |
 | --- | --- |
 | `plan-editor <file.html>` | Open for review. Reuses an existing tab if one is watching. |
-| `plan-editor watch <file>` | Park until an edit arrives. `--max-ms` bounds the wait. |
-| `plan-editor poll <file>` | Long-poll for edits. `--reply "..."`, `--timeout-ms`. |
-| `plan-editor applied <file> --id <id>` | Declare an edit applied. `--note "..."`. |
+| `plan-editor watch <file>` | Park until a review arrives. `--max-ms` bounds the wait. |
+| `plan-editor poll <file>` | Long-poll for a review. `--timeout-ms`. |
+| `plan-editor respond <file> --summary "..."` | Close the review with what you changed and why. |
+| `plan-editor answer <file> --id <id>` | Flag one item: `--outcome caveat\|needs-call\|skipped --note "..."`. |
 | `plan-editor undo <file>` | Restore the previous version. |
 | `plan-editor export <file>` | Write a standalone copy. `--out <path>`. |
 | `plan-editor status` | Server state, sessions, bound agents, edit counts. |
@@ -340,16 +380,15 @@ server-side build step. `bun run build` produces only the two browser bundles.
 
 ## Troubleshooting
 
-**"No agent is bound" / edits sit unapplied.** Nothing is listening. Run
+**"No agent is bound" / a review sits unsent to anyone.** Nothing is listening. Run
 `plan-editor setup hooks` and restart Claude Code, or have the agent run
 `plan-editor watch <file>`.
 
-**Edits are picked up only when I message the agent.** That is hook delivery
+**A review is picked up only when I message the agent.** That is hook delivery
 working as designed — it is pull-on-prompt. Use `watch` for instant pickup.
 
-**The same edit keeps coming back.** The browser cannot confirm it (tab closed,
-stale, or on old code). Hard-refresh the tab; the agent can clear it with
-`plan-editor applied <file> --id <id>`.
+**The agent applied things but nothing shows as reviewable.** It edited without
+responding. `plan-editor respond` is what moves a review to the review phase.
 
 **The artifact frame is blank.** Hard-refresh (`⌘⇧R`). If it persists, the morph
 failed — a toast will say so, and it falls back to a full reload.
@@ -380,12 +419,13 @@ conversation you were already having.
 
 ```sh
 bun run check      # build + typecheck + test
-bun test           # 106 tests
+bun test           # 107 tests
 bun run build      # browser bundles only
 ```
 
-Tests cover store concurrency, morph semantics (including the multi-anchor and
-word-level-highlight rules), the diff engine, version history, auth and path
-confinement, and hook routing. `AGENTS.md` records the invariants and the bugs
+Tests cover store concurrency, the two-phase review lifecycle, morph semantics
+(including multi-anchor rules and the guarantee that the tool never highlights its
+own marker classes), the diff engine, version history, auth and path confinement,
+and hook routing. `AGENTS.md` records the invariants and the bugs
 that motivated them — including several that jsdom passed and a real browser did
 not.
