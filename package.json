@@ -14,9 +14,9 @@
   ],
   "scripts": {
     "build": "bun run scripts/build.ts",
-    "check": "bun run build && bun run typecheck && bun test",
+    "check": "bun run build && bun run typecheck && bun run test",
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
+    "test": "bun run scripts/test.ts",
     "start": "bun run bin/plan-editor.js"
   },
   "dependencies": {

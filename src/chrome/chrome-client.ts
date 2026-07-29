@@ -433,6 +433,63 @@ $("share").addEventListener("click", async () => {
   );
 });
 
+// --- theme ------------------------------------------------------------------
+
+type Theme = "system" | "light" | "dark";
+const THEME_ICON: Record<Theme, string> = { system: "◐", light: "☀", dark: "☾" };
+const THEME_LABEL: Record<Theme, string> = {
+  system: "Theme: following your system",
+  light: "Theme: light",
+  dark: "Theme: dark",
+};
+
+function readTheme(): Theme {
+  try {
+    const stored = localStorage.getItem("pe-theme");
+    return stored === "light" || stored === "dark" ? stored : "system";
+  } catch {
+    return "system";
+  }
+}
+
+/**
+ * Applies the theme to the chrome and forwards it to the artifact.
+ *
+ * The artifact is a separate document with its own stylesheet, so it cannot see
+ * this choice — the SDK sets a matching attribute inside the frame, and the
+ * design guidance asks artifact authors to honour `:root[data-theme]` alongside
+ * the media query.
+ */
+function applyTheme(theme: Theme): void {
+  if (theme === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+  try {
+    if (theme === "system") localStorage.removeItem("pe-theme");
+    else localStorage.setItem("pe-theme", theme);
+  } catch {
+    // Private browsing; the choice just will not persist.
+  }
+  const button = $<HTMLButtonElement>("theme");
+  button.textContent = THEME_ICON[theme];
+  button.title = `${THEME_LABEL[theme]} — click to change`;
+  toFrame({ type: "pe:theme", value: theme });
+}
+
+let theme = readTheme();
+applyTheme(theme);
+
+$("theme").addEventListener("click", () => {
+  const order: Theme[] = ["system", "light", "dark"];
+  theme = order[(order.indexOf(theme) + 1) % order.length]!;
+  applyTheme(theme);
+  toast(THEME_LABEL[theme]);
+});
+
+// The system option has to keep tracking the OS after the page has loaded.
+window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (theme === "system") applyTheme("system");
+});
+
 $("collapse").addEventListener("click", () => layout.classList.toggle("collapsed"));
 $("history").addEventListener("click", () => void openHistory());
 $("help").addEventListener("click", openHelp);
@@ -531,6 +588,7 @@ function openHelp(): void {
     ["⌘H", "Version history"],
     ["← →", "Scrub versions while history is open"],
     ["⌘\\", "Hide or show the panel"],
+    ["Theme button", "Cycle system → light → dark"],
     ["Esc", "Close an overlay or cancel re-pointing"],
     ["?", "This list"],
   ];
@@ -714,6 +772,7 @@ window.addEventListener("message", (event: MessageEvent) => {
   switch (data.type) {
     case "pe:ready":
       setMode(modeToggle.checked);
+      applyTheme(theme);
       trackedIds.clear();
       syncTracking();
       break;

@@ -286,6 +286,22 @@ window.addEventListener("message", (event: MessageEvent) => {
   if (!data || typeof data.type !== "string") return;
 
   switch (data.type) {
+    // The artifact is its own document, so it cannot see the chrome's choice.
+    // `color-scheme` fixes form controls and scrollbars for free; `data-theme`
+    // is what an artifact's own stylesheet can hook into.
+    case "pe:theme": {
+      const value = String(data.value ?? "system");
+      const root = document.documentElement;
+      if (value === "system") {
+        delete root.dataset.theme;
+        root.style.colorScheme = "";
+      } else {
+        root.dataset.theme = value;
+        root.style.colorScheme = value;
+      }
+      break;
+    }
+
     case "pe:setMode":
       setMode(Boolean(data.value));
       break;

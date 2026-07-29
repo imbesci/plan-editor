@@ -1,3 +1,7 @@
+/* Three states, not two: system (no attribute), light, dark. `data-theme` is set
+   on <html> by the toolbar toggle, and must beat the media query in BOTH
+   directions — forcing light on a dark OS is just as valid as the reverse, and a
+   plain `@media` block cannot express that on its own. */
 :root {
   --bg: #ffffff;
   --fg: #18181b;
@@ -7,15 +11,36 @@
   --pending: #f59e0b;
   --done: #22c55e;
   --panel: #fafafa;
+  color-scheme: light;
 }
+
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #0b0b0e;
     --fg: #f4f4f5;
     --muted: #a1a1aa;
     --line: #27272a;
     --panel: #131317;
+    color-scheme: dark;
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0b0b0e;
+  --fg: #f4f4f5;
+  --muted: #a1a1aa;
+  --line: #27272a;
+  --panel: #131317;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --fg: #18181b;
+  --muted: #71717a;
+  --line: #e4e4e7;
+  --panel: #fafafa;
+  color-scheme: light;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }

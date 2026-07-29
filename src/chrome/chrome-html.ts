@@ -25,6 +25,14 @@ export function renderChrome(session: Session): string {
 <title>${escapeHtml(name)} — plan-editor</title>
 <link rel="stylesheet" href="/chrome.css">
 <script id="pe-session" type="application/json">${escapeJson(bootstrap)}</script>
+<script>
+  // Inline and before the stylesheet: applying this from the module would let
+  // the wrong theme paint first.
+  try {
+    var t = localStorage.getItem("pe-theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  } catch (e) {}
+</script>
 </head>
 <body>
 <div class="status-bar" id="statusBar" hidden><span id="statusText"></span><button class="link" id="statusAction" hidden></button></div>
@@ -49,6 +57,7 @@ export function renderChrome(session: Session): string {
         <button id="history" class="icon" type="button" title="Version history and diff (⌘H)">History</button>
         <button id="share" class="icon" type="button" title="Copy the link to this session">Link</button>
         <button id="export" class="icon" type="button" title="Download a standalone copy">Export</button>
+        <button id="theme" class="icon" type="button" title="Theme: following your system">◐</button>
         <button id="help" class="icon" type="button" title="Keyboard shortcuts (?)">?</button>
         <button id="collapse" class="icon" type="button" title="Hide the panel (⌘\\)">⇥</button>
       </div>

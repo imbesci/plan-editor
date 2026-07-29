@@ -33,6 +33,13 @@ appearing not to work at all. This cost real debugging time once already.
 Tests are written against `node:test` + `node:assert`, which Bun's runner executes
 natively. Do not convert them to `bun:test` — the current form runs under both.
 
+**Run them with `bun run test` (scripts/test.ts), never bare `bun test`.** Bare
+`bun test` runs files concurrently, and its `node:test` compatibility layer keeps
+"am I inside a test" in global state, so a top-level `describe()` in one file can
+land mid-test in another and fail with "describe() inside another test()". The
+same command reported 107 pass, then 3 fail, then 107 pass on identical code. The
+runner spawns one process per file; that has never flaked.
+
 ## Architecture
 
 Three processes: the CLI, one detached HTTP server, and a browser holding a chrome

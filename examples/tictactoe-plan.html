@@ -20,8 +20,10 @@
     --warn: #a8730f;
     --radius: 10px;
   }
+  /* Follows the OS by default, but honours plan-editor's theme toggle when the
+     reader has made an explicit choice — hence both selectors. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #131211;
       --surface: #1b1a18;
       --fg: #f0ede8;
@@ -35,6 +37,20 @@
       --ok: #6bbd86;
       --warn: #d8a03f;
     }
+  }
+  :root[data-theme="dark"] {
+      --bg: #131211;
+      --surface: #1b1a18;
+      --fg: #f0ede8;
+      --muted: #a6a29b;
+      --faint: #7d7973;
+      --line: #2e2c29;
+      --accent: #e8785e;
+      --accent-soft: #2a1c18;
+      --x: #e8785e;
+      --o: #6bb2d4;
+      --ok: #6bbd86;
+      --warn: #d8a03f;
   }
   * { box-sizing: border-box; }
   body {

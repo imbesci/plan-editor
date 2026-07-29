@@ -253,6 +253,7 @@ The presence indicator shows which session is bound and when it was last seen.
 | `⌘H` | Version history |
 | `← →` | Scrub versions (while history is open) |
 | `⌘\` | Hide or show the panel (focus mode) |
+| Theme button | Cycle system → light → dark |
 | `Esc` | Close an overlay, or cancel re-pointing |
 | `?` | Shortcut list |
 
@@ -281,6 +282,18 @@ even when a tab is already watching).
 ---
 
 ## Writing artifacts that work well
+
+**Support the theme toggle.** plan-editor can force light or dark regardless of
+the OS setting, and it tells the artifact by setting `data-theme` on its root. An
+artifact that only uses the media query will quietly keep following the OS, which
+looks broken next to a chrome that just went dark. Write both:
+
+```css
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #131211; /* … */ }
+}
+:root[data-theme="dark"] { --bg: #131211; /* … */ }
+```
 
 **Give top-level sections stable `id` attributes.** This is the single highest-value
 thing you can do. Idiomorph matches on id first, so ids let it update a section in
