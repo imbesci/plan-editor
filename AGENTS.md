@@ -245,6 +245,29 @@ emit the JSON form so the same code path works everywhere.
   it accepted to stop it being carried forward twice showed the human the
   opposite of the verdict they gave.
 
+## Attribution: what the agent actually did
+
+`Review.baseVersion` is the artifact version at the moment the review was sent.
+That one field carries three capabilities, which is why it is set on the server
+(where the version store lives) rather than in the session store:
+
+- **Per-item diff** — `attributeChanges` diffs base-vs-current and credits each
+  changed section to the note whose anchor overlaps it, in *either* direction: a
+  note on a section owns edits inside it, and a note on a paragraph is owned by
+  the section reported around it.
+- **Unrequested changes** — anything no note claims. This is the trust question
+  for applying a whole review at once, so it renders above the items rather than
+  under them. A *removed* section can never be claimed by containment (it has no
+  element in the new document), so it always surfaces here.
+- **Revert the whole review** — the natural undo unit now that a review is the
+  unit of exchange. Writing the base snapshot back goes through the same watcher
+  as any edit, so it morphs in place and is itself recorded.
+
+**Anchors resolve through the old document as well as the new one.** The anchor
+text was captured before the agent touched it, so matching it only against the
+rewritten document fails on exactly the items that did change. Resolve in
+`after`, else in `before`, then map across by nearest id.
+
 ## Highlighting
 
 - **Only changed words are highlighted, and there is no whole-element fallback.**

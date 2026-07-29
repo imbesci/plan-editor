@@ -82,6 +82,14 @@ export interface Review {
   createdAt: string;
   sentAt?: string;
   answeredAt?: string;
+  /**
+   * The artifact version at the moment this review was sent.
+   *
+   * One field, three capabilities: diffing the agent's work per item, spotting
+   * changes it made that nobody asked for, and reverting the whole review as a
+   * unit — which is the natural undo now that a review is the unit of exchange.
+   */
+  baseVersion?: number;
   /** Agent sessions this review's text has already been injected into. */
   deliveredTo?: string[];
 }

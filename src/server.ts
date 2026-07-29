@@ -387,7 +387,11 @@ export async function serve(options: ServeOptions = {}) {
     try {
       const session = await loadAuthorized(req, res);
       if (!session) return;
-      const review = await store.sendReview(session.key);
+      // Anchoring to the current version here is what later lets the browser
+      // diff the agent's work per item, spot changes nobody asked for, and
+      // revert the whole review in one step.
+      const base = await versions.latest(session.key);
+      const review = await store.sendReview(session.key, base?.seq);
       if (!review) {
         res.status(400).json({ error: "nothing to send" });
         return;
@@ -608,6 +612,29 @@ export async function serve(options: ServeOptions = {}) {
       await writeFile(session.file, html);
       await versions.snapshot(session.key, html, "restore");
       res.json({ status: "restored", seq });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /** Puts the artifact back to how it looked before a review was sent. */
+  app.post("/api/:key/review/:id/revert", requireSameOrigin, async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const review = session.reviews.find((entry) => entry.id === String(req.params.id));
+      if (!review?.baseVersion) {
+        res.status(400).json({ error: "this review has no recorded starting point" });
+        return;
+      }
+      const html = await versions.read(session.key, review.baseVersion);
+      if (html === null) {
+        res.status(410).json({ error: "the starting version has aged out of history" });
+        return;
+      }
+      await writeFile(session.file, html);
+      await versions.snapshot(session.key, html, "restore");
+      res.json({ status: "reverted", seq: review.baseVersion });
     } catch (error) {
       next(error);
     }

@@ -3,7 +3,7 @@ import { describe, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 
-import { diffDocuments, diffWords } from "../src/sdk/diff.ts";
+import { attributeChanges, diffDocuments, diffWords } from "../src/sdk/diff.ts";
 
 // diffDocuments uses DOMParser, which only exists in a browser-ish global.
 const dom = new JSDOM("", { url: "http://127.0.0.1/" });
@@ -93,5 +93,75 @@ describe("diffWords", () => {
     const rebuiltAfter = ops.filter((op) => op.type !== "remove").map((op) => op.text).join("");
     assert.equal(rebuiltBefore, before);
     assert.equal(rebuiltAfter, after);
+  });
+});
+
+describe("attributeChanges", () => {
+  const PLAN = `<!doctype html><html><body>
+<section id="goals"><h2>Goals</h2><p id="g1">Ship the thing.</p></section>
+<section id="risks"><h2>Risks</h2><p id="r1">Might slip.</p></section>
+<section id="scope"><h2>Scope</h2><p id="s1">One week.</p></section>
+</body></html>`;
+
+  test("credits a change to the note whose anchor contains it", () => {
+    const after = PLAN.replace("Might slip.", "Slips past March 14.");
+    const result = attributeChanges(PLAN, after, [{ id: "note-1", selector: "#risks", text: "Risks" }]);
+
+    assert.deepEqual([...result.byItem.keys()], ["note-1"]);
+    assert.equal(result.byItem.get("note-1")?.[0]?.id, "r1", "a note on a section owns edits inside it");
+    assert.deepEqual(result.unrequested, []);
+  });
+
+  test("credits a change to a note anchored inside the changed element", () => {
+    // The note is on the paragraph; the diff reports the paragraph. Overlap has
+    // to work in both directions or precise notes lose their own changes.
+    const after = PLAN.replace("Might slip.", "Slips past March 14.");
+    const result = attributeChanges(PLAN, after, [{ id: "note-1", selector: "#r1", text: "Might slip." }]);
+
+    assert.equal(result.byItem.get("note-1")?.length, 1);
+    assert.deepEqual(result.unrequested, []);
+  });
+
+  test("flags a change nobody asked for", () => {
+    // The trust question for applying a whole review at once: what did it touch
+    // that I never mentioned?
+    const after = PLAN.replace("Might slip.", "Slips past March 14.").replace("One week.", "Three days.");
+    const result = attributeChanges(PLAN, after, [{ id: "note-1", selector: "#risks", text: "Risks" }]);
+
+    assert.equal(result.byItem.get("note-1")?.length, 1);
+    assert.equal(result.unrequested.length, 1);
+    assert.equal(result.unrequested[0]?.id, "s1");
+  });
+
+  test("a removed section is always surfaced as unrequested", () => {
+    // It has no element in the new document, so containment can never claim it.
+    const after = PLAN.replace('<section id="scope"><h2>Scope</h2><p id="s1">One week.</p></section>', "");
+    const result = attributeChanges(PLAN, after, [{ id: "note-1", selector: "#risks", text: "Risks" }]);
+
+    assert.ok(result.unrequested.some((section) => section.kind === "removed"));
+  });
+
+  test("falls back to the anchor text when the selector no longer resolves", () => {
+    // The anchor text is captured from textContent, which concatenates without
+    // separators — "RisksMight slip." is what the SDK actually stores. Matching
+    // has to run against the *old* document too, because the text the note was
+    // pinned to is precisely the text the agent just rewrote.
+    const after = PLAN.replace("Might slip.", "Slips past March 14.");
+    const result = attributeChanges(PLAN, after, [
+      { id: "note-1", selector: "#gone-in-a-rewrite", text: "RisksMight slip." },
+    ]);
+    assert.equal(result.byItem.get("note-1")?.length, 1);
+    assert.deepEqual(result.unrequested, [], "a resolved anchor means nothing is unattributed");
+  });
+
+  test("an unchanged document attributes nothing", () => {
+    const result = attributeChanges(PLAN, PLAN, [{ id: "note-1", selector: "#risks", text: "Risks" }]);
+    assert.equal(result.byItem.size, 0);
+    assert.deepEqual(result.unrequested, []);
+  });
+
+  test("a malformed selector does not throw", () => {
+    const after = PLAN.replace("Might slip.", "Slips.");
+    assert.doesNotThrow(() => attributeChanges(PLAN, after, [{ id: "n", selector: "###bad", text: "" }]));
   });
 });

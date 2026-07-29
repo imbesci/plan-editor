@@ -139,3 +139,100 @@ export function diffWords(before: string, after: string): WordOp[] {
 
   return ops;
 }
+
+// ---------------------------------------------------------------------------
+// Attributing changes to the notes that asked for them.
+//
+// A summary tells you what the agent says it did. This tells you what it
+// actually did, next to the note that asked for it — and, just as importantly,
+// what it changed that nobody asked about. Applying a whole review at once is
+// only trustworthy if unrequested changes are visible rather than buried.
+// ---------------------------------------------------------------------------
+
+export interface AttributionInput {
+  id: string;
+  selector: string;
+  text: string;
+}
+
+export interface Attribution {
+  /** Changed sections, keyed by the id of the item that asked for them. */
+  byItem: Map<string, SectionChange[]>;
+  /** Changes not covered by any item. */
+  unrequested: SectionChange[];
+}
+
+/**
+ * An item owns a change when its anchor and the changed element overlap in
+ * either direction: a note on a whole section owns edits inside it, and a note
+ * on one paragraph is owned by the section reported as changed around it.
+ */
+export function attributeChanges(
+  oldHtml: string,
+  newHtml: string,
+  items: AttributionInput[],
+): Attribution {
+  const diff = diffDocuments(oldHtml, newHtml);
+  const parser = new DOMParser();
+  const before = parser.parseFromString(oldHtml, "text/html");
+  const after = parser.parseFromString(newHtml, "text/html");
+
+  const find = (doc: Document, item: AttributionInput): Element | null => {
+    if (item.selector) {
+      try {
+        const found = doc.querySelector(item.selector);
+        if (found) return found;
+      } catch {
+        // Malformed stored selector; fall through to text.
+      }
+    }
+    const needle = item.text.replace(/\s+/g, " ").trim();
+    if (!needle) return null;
+    return (
+      [...doc.body.querySelectorAll("*")].find(
+        (candidate) => (candidate.textContent ?? "").replace(/\s+/g, " ").trim() === needle,
+      ) ?? null
+    );
+  };
+
+  /** Nearest id'd element, since ids are what the diff reports against. */
+  const idOf = (element: Element | null): string | null => {
+    for (let node: Element | null = element; node; node = node.parentElement) {
+      if (node.id) return node.id;
+    }
+    return null;
+  };
+
+  const anchors = items.map((item) => {
+    // Prefer the new document, but fall back through the *old* one: the anchor
+    // text was captured before the agent touched it, so matching it against the
+    // rewritten document fails on exactly the items that did change.
+    const element = find(after, item) ?? (idOf(find(before, item)) ? after.getElementById(idOf(find(before, item))!) : null);
+    return { id: item.id, element };
+  });
+
+  const byItem = new Map<string, SectionChange[]>();
+  const unrequested: SectionChange[] = [];
+
+  for (const section of diff.sections) {
+    const element = after.getElementById(section.id);
+    const owners = anchors.filter(
+      (anchor) =>
+        anchor.element &&
+        element &&
+        (anchor.element === element || anchor.element.contains(element) || element.contains(anchor.element)),
+    );
+
+    if (owners.length === 0) {
+      // A removed section has no element in the new document, so it can never be
+      // attributed by containment — but the human still needs to see it went.
+      unrequested.push(section);
+      continue;
+    }
+    for (const owner of owners) {
+      byItem.set(owner.id, [...(byItem.get(owner.id) ?? []), section]);
+    }
+  }
+
+  return { byItem, unrequested };
+}

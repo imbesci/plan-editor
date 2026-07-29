@@ -121,8 +121,16 @@ and why. Each item comes back marked:
 | **needs your call** | Ambiguous — the agent wants a decision rather than guessing |
 | **not done** | Deliberately skipped, with a reason |
 
+Each item shows **what actually changed** — a word-level diff of the section it
+touched, next to the note that asked for it. A summary tells you what the agent
+says it did; this shows you what it did.
+
+Anything it changed that **no note asked for** is called out above the list. That
+is the trust question for handing over a whole review at once, so it is not buried.
+
 Then you **Accept** or **Reject** each one. A rejection carries your reason into
-your next review automatically, so the agent always hears why.
+your next review automatically, so the agent always hears why. **Revert this whole
+review** puts the document back to exactly how it looked before you sent it.
 
 ## Why batched, not live
 
@@ -248,6 +256,8 @@ The presence indicator shows which session is bound and when it was last seen.
 | `⌘I` | Toggle annotate mode |
 | `⌘Enter` | Add the note you are typing |
 | `⇧⌘Enter` | Send the review |
+| `j` / `k` | Move through your notes — the document scrolls to follow |
+| `Enter` | Jump the document to the focused note |
 | `⌘F` | Filter notes |
 | `⌘Z` | Undo the last change |
 | `⌘H` | Version history |

@@ -2,7 +2,7 @@
 // `allow-same-origin`, so it has an opaque origin and cannot usefully call the
 // API — which is also why the session token never leaves this file.
 
-import { diffDocuments, diffWords, type SectionChange } from "../sdk/diff.ts";
+import { attributeChanges, diffDocuments, diffWords, type Attribution, type SectionChange } from "../sdk/diff.ts";
 import type {
   AgentIdentityView,
   AgentPresence,
@@ -60,6 +60,11 @@ let armed: Armed | null = null;
 let repointing: string | null = null;
 let query = "";
 let noteSaveTimer: number | undefined;
+/** What the agent actually changed, per item, for the review being read. */
+let attribution: Attribution | null = null;
+let attributedReviewId: string | null = null;
+/** Index of the keyboard-focused card, for j/k navigation. */
+let cursor = -1;
 const trackedIds = new Set<string>();
 
 const draftReview = () => reviews.find((review) => review.status === "drafting");
@@ -227,8 +232,19 @@ function render(): void {
     $("phaseHint").textContent = open
       ? `${open} change${open === 1 ? "" : "s"} to accept or reject.`
       : "All settled. Start marking up again whenever you like.";
+
+    const unrequested = attribution?.unrequested ?? [];
     list.innerHTML =
       (answered?.summary ? `<div class="summary"><b>Agent</b>${escapeHtml(answered.summary)}</div>` : "") +
+      (answered?.baseVersion
+        ? `<button class="link revert-review" data-revert="${answered.id}">Revert this whole review</button>`
+        : "") +
+      // Changes nobody asked for are the ones worth looking at hardest, so they
+      // go at the top rather than being buried under the items.
+      (unrequested.length
+        ? `<div class="unrequested"><b>${unrequested.length} change${unrequested.length === 1 ? "" : "s"} you did not ask for</b>
+             ${unrequested.map((section) => `<div class="dhead"><span class="dkind ${section.kind}">${section.kind}</span> ${escapeHtml(section.label)}</div>`).join("")}</div>`
+        : "") +
       (answered?.items ?? []).filter(matches).map(renderItem).join("");
     sendButton.textContent = "Send review";
     sendButton.disabled = (draftReview()?.items.length ?? 0) === 0;
@@ -290,10 +306,20 @@ function renderItem(item: ReviewItem): string {
       ? `<span class="outcome ${item.outcome}">${OUTCOME_LABEL[item.outcome]}</span>`
       : "";
 
+  // The summary says what the agent claims it did; this shows what it actually
+  // did, right next to the note that asked for it.
+  const changes = attribution?.byItem.get(item.id) ?? [];
+  const diff = changes.length
+    ? `<div class="item-diff">${changes.map(renderSectionDiff).join("")}</div>`
+    : item.status === "answered" && item.outcome === "applied"
+      ? `<div class="item-diff empty-diff">No text change detected for this note.</div>`
+      : "";
+
   return `<article class="card" data-status="${item.status}" data-outcome="${item.outcome ?? ""}" data-id="${escapeHtml(item.id)}">
     <div class="anchor">${anchorLabel(item)}</div>
     <div class="body">${escapeHtml(item.body)}</div>
     ${item.agentNote ? `<div class="note">${escapeHtml(item.agentNote)}</div>` : ""}
+    ${diff}
     ${thread ? `<div class="thread">${thread}</div>` : ""}
     <div class="meta">${outcome}<span class="status">${ITEM_LABEL[item.status]}</span><time>${ago(item.answeredAt ?? item.createdAt)}</time>${actions.join("")}</div>
   </article>`;
@@ -400,6 +426,19 @@ list.addEventListener("click", (event) => {
       void guard("Rejecting", async () => {
         await api(`/items/${reject}/reject`, { method: "POST", body: JSON.stringify({ text: reason.trim() }) });
         toast("Added back to your next review");
+      });
+    }
+    return;
+  }
+
+  const revert = action("revert");
+  if (revert) {
+    if (confirm("Put the document back to how it looked before you sent this review?")) {
+      void guard("Reverting", async () => {
+        const response = await api(`/review/${revert}/revert`, { method: "POST", body: "{}" });
+        if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `server said ${response.status}`);
+        attributedReviewId = null;
+        toast("Reverted to before the review");
       });
     }
     return;
@@ -539,6 +578,15 @@ document.addEventListener(
       }
       return;
     }
+    // j/k through the notes, Enter to jump the document to the focused one.
+    if (!isTyping(event) && overlay.hidden && (event.key === "j" || event.key === "k")) {
+      event.preventDefault();
+      return moveCursor(event.key === "j" ? 1 : -1);
+    }
+    if (!isTyping(event) && overlay.hidden && event.key === "Enter" && cursor >= 0) {
+      event.preventDefault();
+      return focusedCard()?.querySelector<HTMLButtonElement>("[data-jump]")?.click();
+    }
     if (event.key === "?" && !isTyping(event)) {
       event.preventDefault();
       return openHelp();
@@ -550,6 +598,30 @@ document.addEventListener(
   },
   true,
 );
+
+function cards(): HTMLElement[] {
+  return [...list.querySelectorAll<HTMLElement>(".card")];
+}
+
+function focusedCard(): HTMLElement | undefined {
+  return cards()[cursor];
+}
+
+function moveCursor(delta: number): void {
+  const all = cards();
+  if (all.length === 0) return;
+  cursor = Math.max(0, Math.min(all.length - 1, (cursor < 0 ? -1 : cursor) + delta));
+  for (const [index, card] of all.entries()) card.classList.toggle("focused", index === cursor);
+  const card = all[cursor];
+  card?.scrollIntoView({ block: "nearest" });
+  // Moving through notes should move the document too — reading a review means
+  // looking at the thing being reviewed, not the list.
+  const id = card?.dataset.id;
+  const item = reviews.flatMap((review) => review.items).find((entry) => entry.id === id);
+  if (item && item.tag !== "page") {
+    toFrame({ type: "pe:scrollTo", id: item.id, selector: item.selector, text: item.text });
+  }
+}
 
 // --- overlays ---------------------------------------------------------------
 
@@ -588,6 +660,8 @@ function openHelp(): void {
     ["⌘H", "Version history"],
     ["← →", "Scrub versions while history is open"],
     ["⌘\\", "Hide or show the panel"],
+    ["j / k", "Move through your notes (the document follows)"],
+    ["Enter", "Jump the document to the focused note"],
     ["Theme button", "Cycle system → light → dark"],
     ["Esc", "Close an overlay or cancel re-pointing"],
     ["?", "This list"],
@@ -624,6 +698,35 @@ async function openSwitcher(): Promise<void> {
       )
       .join("")}</div>`,
   );
+}
+
+/**
+ * Diffs the artifact against how it looked when the review was sent, and works
+ * out which note each change belongs to. Recomputed only when the review being
+ * read changes, since it costs two fetches and two parses.
+ */
+async function refreshAttribution(): Promise<void> {
+  const answered = answeredReview();
+  if (!answered?.baseVersion) {
+    attribution = null;
+    attributedReviewId = null;
+    return;
+  }
+  if (attributedReviewId === answered.id) return;
+
+  const [before, after] = await Promise.all([
+    fetchVersion(answered.baseVersion),
+    fetch(`/artifact/${key}/raw?t=${encodeURIComponent(token)}`).then((response) => (response.ok ? response.text() : "")),
+  ]);
+  if (!before || !after) return;
+
+  attribution = attributeChanges(
+    before,
+    after,
+    answered.items.map((item) => ({ id: item.id, selector: item.selector, text: item.text })),
+  );
+  attributedReviewId = answered.id;
+  render();
 }
 
 // --- versions ---------------------------------------------------------------
@@ -864,6 +967,7 @@ stream.addEventListener("message", (event) => {
     case "sync": {
       reviews = payload.reviews;
       chat = payload.chat;
+      void refreshAttribution();
       // The server owns the draft note; only adopt it when the field is idle so
       // it never overwrites what is being typed.
       const note = draftReview()?.note ?? "";

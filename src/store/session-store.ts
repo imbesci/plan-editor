@@ -198,13 +198,14 @@ export class SessionStore {
   }
 
   /** Hands the draft to the agent as one batch. */
-  async sendReview(key: string): Promise<Review | null> {
+  async sendReview(key: string, baseVersion?: number): Promise<Review | null> {
     return this.mutate(key, (session) => {
       const draft = session.reviews.find((review) => review.status === "drafting");
       if (!draft || (draft.items.length === 0 && !draft.note.trim())) return null;
       const now = new Date().toISOString();
       draft.status = "sent";
       draft.sentAt = now;
+      if (baseVersion !== undefined) draft.baseVersion = baseVersion;
       for (const item of draft.items) item.status = "sent";
       return draft;
     });
