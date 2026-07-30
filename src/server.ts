@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import chokidar, { type FSWatcher } from "chokidar";
 import express, { type NextFunction, type Request, type Response } from "express";
 
+import { inspectArtifactSource } from "./doctor.ts";
 import { canonicalDir } from "./hooks.ts";
 import { sectionsOf } from "./html-slice.ts";
 import { injectSdk } from "./html-transform.ts";
@@ -101,6 +102,8 @@ export async function serve(options: ServeOptions = {}) {
   events.setMaxListeners(0);
 
   const watchers = new Map<string, FSWatcher>();
+  /** The slow `stat` backstop per session. See `watch`. */
+  const reconcilers = new Map<string, NodeJS.Timeout>();
   const sseClients = new Map<string, Set<Response>>();
   const activePolls = new Set<string>();
   const workingSessions = new Set<string>();
@@ -216,47 +219,99 @@ export async function serve(options: ServeOptions = {}) {
     idleTimer.unref();
   }
 
+  /** The debounce timer per session, shared by the watcher and the reconciler. */
+  const patchTimers = new Map<string, NodeJS.Timeout>();
+
+  function schedulePatch(session: Session, why: string): void {
+    const existing = patchTimers.get(session.key);
+    if (existing) clearTimeout(existing);
+    // The agent's write lands semi-atomically; settle before morphing so we
+    // never patch against a half-written file.
+    const timer = setTimeout(() => {
+      patchTimers.delete(session.key);
+      void (async () => {
+        log(`artifact changed key=${session.key} via=${why}`);
+        const html = await readFile(session.file, "utf8").catch(() => null);
+        // Snapshot before telling the browser, so an undo issued the instant
+        // the patch lands already has the version it needs.
+        if (html !== null) await versions.snapshot(session.key, html, "edit");
+        workingSessions.delete(session.key);
+        broadcast(session.key, { type: "patch", reason: "file-changed" });
+        broadcast(session.key, { type: "versions", list: await versions.list(session.key) });
+        emitPresence(session.key);
+      })();
+    }, 120);
+    patchTimers.set(session.key, timer);
+  }
+
+  /**
+   * How often the watcher is checked against reality. See `watch`.
+   *
+   * Deliberately slow. This is a backstop, not the delivery path — an edit
+   * normally reaches the browser in ~144ms through the event, and nothing here
+   * should tempt anyone into shortening it to chase latency.
+   */
+  const RECONCILE_MS = 2_000;
+
   async function watch(session: Session): Promise<void> {
     if (watchers.has(session.key)) return;
     // Watch the file itself, not its directory: recursive watching of a parent
     // saturates the event loop when artifacts live inside large trees.
     const watcher = chokidar.watch(session.file, { ignoreInitial: true });
-    let debounce: NodeJS.Timeout | null = null;
-    // Registered before the first await, so an edit that lands during
-    // initialization is queued rather than dropped.
-    watcher.on("all", () => {
-      if (debounce) clearTimeout(debounce);
-      // The agent's write lands semi-atomically; settle before morphing so we
-      // never patch against a half-written file.
-      debounce = setTimeout(() => {
-        void (async () => {
-          log(`artifact changed key=${session.key}`);
-          const html = await readFile(session.file, "utf8").catch(() => null);
-          // Snapshot before telling the browser, so an undo issued the instant
-          // the patch lands already has the version it needs.
-          if (html !== null) await versions.snapshot(session.key, html, "edit");
-          workingSessions.delete(session.key);
-          broadcast(session.key, { type: "patch", reason: "file-changed" });
-          broadcast(session.key, { type: "versions", list: await versions.list(session.key) });
-          emitPresence(session.key);
-        })();
-      }, 120);
-    });
     watchers.set(session.key, watcher);
 
     /**
-     * Wait for the watcher to actually be watching.
+     * A watcher that cannot silently go deaf.
      *
-     * `chokidar.watch` returns before its initial scan finishes, so an edit made
-     * in the moments after a session opens could land while nothing was listening
-     * — and the failure is the worst shape this tool has: the file changes, the
-     * browser never patches, and there is no error anywhere. The window is
-     * milliseconds on an idle machine and long enough to be reproducible on a
-     * loaded one, which is why it read as a flake rather than a bug.
+     * Two things were wrong here, and both had the same symptom — the file
+     * changes, the browser never patches, and there is no error anywhere, which
+     * is the worst shape a failure can take in this tool.
      *
-     * Raced against a timeout so a platform that never emits `ready` costs a
-     * bounded pause instead of hanging the request that opened the session.
+     *   1. `chokidar.watch` returns before it is actually watching, so an edit in
+     *      the first moments after a session opens could land while nothing was
+     *      listening. That is what the `ready` wait below fixes.
+     *   2. A native filesystem event can be dropped outright. This is not
+     *      theoretical: it is what the test suite had been calling a flake for as
+     *      long as the suite has existed, reproducible about one run in three
+     *      under load and never once in isolation.
+     *
+     * So the event stays the delivery path and a slow `stat` is the safety net.
+     * One stat per open artifact every two seconds is not a cost worth measuring,
+     * and the alternative — `usePolling`, which chokidar offers — would put the
+     * whole pipeline on a 200ms floor to fix something that happens rarely.
      */
+    let seen = await stat(session.file).catch(() => null);
+    const reconcile = setInterval(() => {
+      void (async () => {
+        const now = await stat(session.file).catch(() => null);
+        if (!now) return;
+        // A missed event, by definition: the file differs from what the watcher
+        // last told us about it.
+        if (seen && now.mtimeMs === seen.mtimeMs && now.size === seen.size) return;
+        const first = seen === null;
+        seen = now;
+        // Nothing to do on the first observation — that is the file as opened.
+        if (!first) schedulePatch(session, "reconcile");
+      })();
+    }, RECONCILE_MS);
+    reconcile.unref();
+    reconcilers.set(session.key, reconcile);
+
+    // Registered after `seen` is initialised but before the `ready` wait below,
+    // so an edit landing during initialization is queued rather than dropped.
+    // Updating `seen` here is what keeps the reconciler quiet on the normal path:
+    // an event that has already been handled must not also be reported as a
+    // missed one. The debounce is per session, so if both do fire they collapse
+    // into a single patch.
+    watcher.on("all", () => {
+      schedulePatch(session, "watch");
+      void stat(session.file)
+        .then((info) => {
+          seen = info;
+        })
+        .catch(() => {});
+    });
+
     await new Promise<void>((resolve) => {
       const done = setTimeout(resolve, 2_000);
       done.unref();
@@ -906,6 +961,26 @@ export async function serve(options: ServeOptions = {}) {
   });
 
   /**
+   * The artifact's own lint findings, for the browser.
+   *
+   * `doctor` has existed as a command since anchoring did, which means the person
+   * who could actually act on "this document has no ids" — the human, who can ask
+   * their agent to fix it — was the only one never shown it. They found out
+   * instead when a note orphaned for no visible reason, hours later, in a session
+   * that had stopped thinking about markup.
+   */
+  app.get("/api/:key/doctor", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const findings = inspectArtifactSource(session.file, await readFile(session.file, "utf8"));
+      res.json({ findings });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
    * What changed between a version and the artifact as it stands.
    *
    * The browser has had this since attribution existed; the agent has not, so it
@@ -1466,6 +1541,10 @@ export async function serve(options: ServeOptions = {}) {
 
   async function shutdown(): Promise<void> {
     if (idleTimer) clearTimeout(idleTimer);
+    for (const timer of reconcilers.values()) clearInterval(timer);
+    reconcilers.clear();
+    for (const timer of patchTimers.values()) clearTimeout(timer);
+    patchTimers.clear();
     for (const watcher of watchers.values()) await watcher.close();
     watchers.clear();
     for (const clients of sseClients.values()) {
@@ -1481,6 +1560,12 @@ export async function serve(options: ServeOptions = {}) {
     store,
     shutdown,
     closed,
+    /**
+     * Test seam. Closing a watcher is the most complete form of "the platform
+     * will never tell us about this change", and nothing a client can do
+     * simulates it — which is the one case the reconciler above exists for.
+     */
+    watchersForTest: watchers,
   };
 }
 

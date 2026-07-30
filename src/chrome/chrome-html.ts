@@ -74,10 +74,17 @@ export function renderChrome(session: Session): string {
         </select>
       </div>
 
+      <!-- Length is what most review notes are actually about — "cut this by a
+           third" is the commonest overall note there is — and the tool held
+           every number needed to answer it while showing none of them. -->
+      <span class="metrics" id="metrics" hidden></span>
+
       <span class="presence" id="presence" data-state="waiting">no agent</span>
 
       <div class="tools">
+        <button id="commands" class="icon" type="button" title="Everything you can do here (⌘K)">⌘K</button>
         <button id="undo" class="icon" type="button" title="Undo the last change (⌘Z)" disabled>Undo</button>
+        <button id="redo" class="icon" type="button" title="Redo (⇧⌘Z)" hidden>Redo</button>
         <button id="history" class="icon" type="button" title="Version history and diff (⌘H)">History</button>
         <button id="record" class="icon" type="button" title="Transcript, packets, git, notifications">⋯</button>
         <button id="theme" class="icon" type="button" title="Theme: following your system">◐</button>
@@ -93,9 +100,21 @@ export function renderChrome(session: Session): string {
   </main>
 
   <aside class="panel" id="panel">
+    <!-- 340px was a guess, and the panel is where the reading happens: a note
+         about a paragraph is easier to write next to the paragraph than under a
+         column of clipped text. Out of flow, so the two-column grid is untouched. -->
+    <div class="panel-grip" id="panelGrip" role="separator" aria-orientation="vertical"
+         tabindex="0" aria-label="Resize the panel — arrow keys, or double-click to reset"
+         title="Drag to resize · double-click to reset"></div>
     <div class="panel-head">
       <h2 id="phaseTitle">Your review</h2>
       <p class="phase-hint" id="phaseHint">Mark up the whole document, then send it as one review.</p>
+      <!-- The one lint finding that breaks anchoring rather than merely
+           degrading it. Reported here because the human is the one who can ask
+           for it to be fixed, and the symptom otherwise surfaces hours later as
+           a note that mysteriously lost its place. -->
+      <div class="advice" id="advice" hidden></div>
+      <div class="progress" id="progress" hidden></div>
       <div class="filters" id="filters" hidden></div>
       <input id="search" class="search" type="search" placeholder="Filter notes…  ⌘F" autocomplete="off">
     </div>

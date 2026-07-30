@@ -69,6 +69,10 @@ const contractList = $("contractList");
 const ruleInput = $<HTMLTextAreaElement>("ruleInput");
 const locksPanel = $<HTMLDetailsElement>("locksPanel");
 const lockList = $("lockList");
+const metrics = $("metrics");
+const advice = $("advice");
+const progress = $("progress");
+const redoButton = $<HTMLButtonElement>("redo");
 
 /** The element(s) the next note will be pinned to. */
 interface Armed {
@@ -113,6 +117,30 @@ const anchorScores = new Map<string, number>();
 const weakCandidates = new Map<string, Array<{ selector: string; text: string; score: number }>>();
 /** The document's headings, as last reported by the SDK. */
 let sections: Array<{ id: string; level: number; text: string }> = [];
+/**
+ * Where each id'd block lives in the markdown source.
+ *
+ * Only ever populated for a `.md` artifact, and only to *show* the human — a
+ * selector is an artefact of the render, so "plan.md:42-47" is the only form of
+ * "where is this" that means anything for a markdown plan. It is exactly what the
+ * agent is given, and showing the same thing to both ends a class of confusion
+ * where the two were talking about different coordinates.
+ */
+let sourceLines = new Map<string, { line: number; endLine: number }>();
+/** Lint findings for the artifact itself. Anchoring rests on the ids. */
+let findings: Array<{ severity: string; rule: string; message: string; fix?: string }> = [];
+/** Word count of the document, and of the version the open review started from. */
+let wordCount: number | null = null;
+let baseWordCount: number | null = null;
+/**
+ * A version undone, so it can be put back.
+ *
+ * Undo has always been reachable and redo never was, even though the mechanism
+ * makes it free: restoring writes a snapshot too, so the version you undid *from*
+ * is still in history. Without this, one stray ⌘Z on a document you have been
+ * editing for an hour is a loss with no way back inside the tool.
+ */
+let redoSeq: number | null = null;
 /** Which armed gesture the artifact is in, so the toolbar can show it. */
 let gesture: "suggest" | StructuralKind | null = null;
 
@@ -528,14 +556,20 @@ function render(): void {
   }
 
   renderFilters(review);
+  renderProgress(review);
   renderOutline();
   renderContract();
   renderLocks();
   renderChat();
   renderGestures();
+  renderMetrics();
+  renderAdvice();
   restorePanel(kept);
 
   undoButton.disabled = versions.length < 2;
+  // Only offered when there is something to put back, because a permanently
+  // disabled control is a question the human has to answer on every glance.
+  redoButton.hidden = redoSeq === null;
   addNote.disabled = !input.value.trim();
   targetActions.hidden = !armed;
   targetHint.textContent = armed
@@ -638,6 +672,80 @@ function renderFilters(review: Review | undefined): void {
         `<button class="chip${filter === name ? " active" : ""}" type="button" data-filter="${name}">${label}<b>${count}</b></button>`,
     )
     .join("");
+}
+
+/**
+ * How much document there is, and how much of it the open review has moved.
+ *
+ * "Cut this by a third" is the commonest overall note this tool sees, and the
+ * only way to know whether it happened was to read the whole thing again. Both
+ * numbers are already in hand — the current document is parsed on every patch and
+ * the review's starting snapshot is fetched for attribution — so this costs
+ * nothing but the arithmetic.
+ */
+function renderMetrics(): void {
+  if (wordCount === null) {
+    metrics.hidden = true;
+    return;
+  }
+  metrics.hidden = false;
+  const shaped = wordCount.toLocaleString();
+  if (baseWordCount === null || baseWordCount === 0 || baseWordCount === wordCount) {
+    metrics.textContent = `${shaped} words`;
+    metrics.dataset.direction = "flat";
+    metrics.title = "Words in the document";
+    return;
+  }
+  const delta = wordCount - baseWordCount;
+  const percent = Math.round((delta / baseWordCount) * 100);
+  metrics.dataset.direction = delta < 0 ? "down" : "up";
+  // The sign is spelled out rather than left to a minus glyph: "18% shorter" is
+  // read correctly at a glance and "-18%" is read as an error code.
+  metrics.textContent = `${shaped} words · ${Math.abs(percent)}% ${delta < 0 ? "shorter" : "longer"}`;
+  metrics.title = `${baseWordCount.toLocaleString()} words when this review was sent, ${shaped} now`;
+}
+
+/**
+ * The artifact's own lint findings, where the person who can act on them is.
+ *
+ * Only the ones that break anchoring outright are surfaced: a document with no
+ * ids loses notes, and losing a note is the failure this tool exists to prevent.
+ * Style findings would train the human to dismiss the banner.
+ */
+function renderAdvice(): void {
+  const structural = findings.filter(
+    (finding) => finding.rule === "no-ids-at-all" || finding.rule === "duplicate-ids" || finding.rule === "missing-section-ids",
+  );
+  if (structural.length === 0 || dismissedAdvice) {
+    advice.hidden = true;
+    return;
+  }
+  const worst = structural[0]!;
+  advice.hidden = false;
+  advice.innerHTML = `<b>${escapeHtml(worst.message)}</b>
+    <span class="alt">Notes anchored in this document may lose their place when the agent rewrites it. Ask your agent to run
+      <code>plan-editor doctor ${escapeHtml(fileName)} --fix</code>, which adds the missing ids and changes nothing else.</span>
+    <button class="link" type="button" data-dismiss-advice>Dismiss</button>`;
+}
+
+let dismissedAdvice = false;
+
+/**
+ * Triage progress, because a list of cards does not say how far through it you are.
+ *
+ * Shown only while reading the agent's work: during markup there is no
+ * denominator — a review is however many notes you decide to write.
+ */
+function renderProgress(review: Review | undefined): void {
+  const items = review?.items ?? [];
+  const settled = items.filter((item) => item.status === "accepted" || item.status === "rejected").length;
+  if (phase() !== "reviewing" || items.length === 0) {
+    progress.hidden = true;
+    return;
+  }
+  progress.hidden = false;
+  progress.innerHTML = `<span class="bar-track"><span class="bar-fill" style="width:${Math.round((settled / items.length) * 100)}%"></span></span>
+    <span class="bar-text">${settled} of ${items.length} settled</span>`;
 }
 
 function renderOutline(): void {
@@ -775,6 +883,26 @@ function renderTriage(_appliedCount: number, revertable: boolean, reviewId: stri
 }
 
 // --- one card ---------------------------------------------------------------
+
+/** The id an anchor's selector points at, when it points at one at all. */
+function idFromSelector(selector: string): string | null {
+  return /#([A-Za-z0-9_-]+)\s*$/.exec(selector)?.[1] ?? null;
+}
+
+/**
+ * Where a note lives in the markdown source.
+ *
+ * The agent is handed `plan.md:42-47` and the human was handed a CSS selector for
+ * a `<section>` the renderer invented — so the two ends of the same conversation
+ * were describing the same paragraph in two coordinate systems, and neither could
+ * check the other.
+ */
+function sourceBadge(item: ReviewItem): string {
+  const id = idFromSelector(item.selector);
+  const span = id ? sourceLines.get(id) : undefined;
+  if (!span) return "";
+  return `<span class="srcline" title="the lines your agent was told to edit">${escapeHtml(fileName)}:${span.line}-${span.endLine}</span>`;
+}
 
 function anchorLabel(item: ReviewItem): string {
   const anchors = item.anchors ?? [{ selector: item.selector, text: item.text }];
@@ -958,7 +1086,7 @@ function renderItem(item: ReviewItem): string {
     item.awaitingHuman ? " data-awaiting" : ""
   } data-id="${escapeHtml(item.id)}">
     ${item.awaitingHuman ? `<div class="awaiting">The agent is waiting on your answer</div>` : ""}
-    <div class="anchor">${anchorLabel(item)}</div>
+    <div class="anchor">${anchorLabel(item)}${sourceBadge(item)}</div>
     <div class="body">${escapeHtml(item.body)}</div>
     ${renderVerbatim(item)}
     ${renderStructural(item)}
@@ -1075,7 +1203,10 @@ structuralSelect.addEventListener("change", () => {
   armGesture((structuralSelect.value || null) as StructuralKind | null);
 });
 
-input.addEventListener("input", () => render());
+input.addEventListener("input", () => {
+  saveDraftText();
+  render();
+});
 search.addEventListener("input", () => {
   query = search.value.trim().toLowerCase();
   render();
@@ -1148,6 +1279,9 @@ async function commitNote(): Promise<boolean> {
   if (pinned) toFrame({ type: "pe:bind", clientId: pinned.clientId, id: created.id });
   if (armed === pinned) armed = null;
   input.value = "";
+  // Only once the server has it. Clearing the saved copy alongside a failed POST
+  // is how the text would be lost by the very mechanism meant to keep it.
+  saveDraftText();
   render();
   return true;
 }
@@ -1362,6 +1496,13 @@ document.addEventListener("click", (event) => {
   const unlock = value("unlock");
   if (unlock) {
     void guard("Unlocking", () => send(`/locks/${unlock}`, { method: "DELETE" }));
+    return;
+  }
+  if (target.closest("[data-dismiss-advice]")) {
+    // For this tab only. The finding is about the document, so it comes back on
+    // the next load — which is right: it is still true.
+    dismissedAdvice = true;
+    render();
   }
 });
 
@@ -1621,6 +1762,40 @@ function openRevertSheet(reviewId: string): void {
   });
 }
 
+// --- pointing at a note points at the document ------------------------------
+//
+// Reading a review means looking at the thing being reviewed. `j`/`k` already
+// moved the document with the cursor and the mouse did not, so a human working by
+// hand had to find a "Show" button on every card — which is why the panel and the
+// page so often ended up looking at different paragraphs.
+//
+// Delayed, because a pointer crossing the list on its way somewhere else must not
+// drag the document behind it.
+
+let peekTimer: number | undefined;
+let peeked: string | null = null;
+
+list.addEventListener("mouseover", (event) => {
+  const card = (event.target as HTMLElement).closest<HTMLElement>(".card");
+  const id = card?.dataset.id;
+  if (!id || id === peeked) return;
+  // Never while a version or an alternative is on screen: those show a document
+  // the file does not contain, and scrolling it would look like the live one.
+  if (previewing !== null || altPreview !== null) return;
+  clearTimeout(peekTimer);
+  peekTimer = setTimeout(() => {
+    const item = allItems().find((entry) => entry.id === id);
+    if (!item || item.tag === "page") return;
+    peeked = id;
+    toFrame({ type: "pe:scrollTo", id: item.id, selector: item.selector, text: item.text });
+  }, 320) as unknown as number;
+});
+
+list.addEventListener("mouseleave", () => {
+  clearTimeout(peekTimer);
+  peeked = null;
+});
+
 // --- previewing an alternative in the document ------------------------------
 
 let altPreview: string | null = null;
@@ -1675,9 +1850,37 @@ function restoreLive(): void {
 
 undoButton.addEventListener("click", async () => {
   undoButton.disabled = true;
+  // Captured before the restore, because the restore appends a version and this
+  // is the one we are stepping away from.
+  const leaving = versions[versions.length - 1]?.seq ?? null;
   const done = await guard("Undo", () => send("/restore", body({})));
-  if (done) toast("Restored the previous version");
+  if (done) {
+    redoSeq = leaving;
+    toast("Restored the previous version — ⇧⌘Z puts it back");
+    render();
+  }
 });
+
+/**
+ * Puts back what undo took away.
+ *
+ * Free, because of how undo is built: restoring writes a *new* snapshot rather
+ * than rewinding, so the version undone from is still in history and redo is just
+ * a restore of it. Without this, one stray ⌘Z on an hour's work had no route back
+ * that did not involve opening the history sheet and guessing.
+ */
+redoButton.addEventListener("click", () => void redo());
+
+async function redo(): Promise<void> {
+  if (redoSeq === null) return;
+  const target = redoSeq;
+  const done = await guard("Redo", () => send("/restore", body({ seq: target })));
+  if (done) {
+    redoSeq = null;
+    toast(`Put v${target} back`);
+    render();
+  }
+}
 
 // --- theme ------------------------------------------------------------------
 
@@ -1796,6 +1999,128 @@ function restoreComposerHeight(): void {
   restoreComposerHeight();
 }
 
+// --- resizing the panel itself ----------------------------------------------
+//
+// 340px was a guess, and it is the wrong guess in both directions: a note about a
+// paragraph is easier to write beside the paragraph than under a column of
+// clipped text, and on a small screen the artifact wants every pixel. `⌘\` only
+// offers all-or-nothing.
+
+const WIDTH_KEY = "pe-panel-w";
+const MIN_PANEL = 260;
+/** The artifact is the thing being reviewed; it never gets less than this. */
+const STAGE_FLOOR = 320;
+
+function maxPanel(): number {
+  return Math.max(MIN_PANEL, window.innerWidth - STAGE_FLOOR);
+}
+
+function applyPanelWidth(width: number | null): void {
+  if (width === null) {
+    layout.style.removeProperty("--panel-w");
+    try {
+      localStorage.removeItem(WIDTH_KEY);
+    } catch {
+      // Private browsing; it just will not persist.
+    }
+    return;
+  }
+  const clamped = Math.round(Math.min(maxPanel(), Math.max(MIN_PANEL, width)));
+  layout.style.setProperty("--panel-w", `${clamped}px`);
+  try {
+    localStorage.setItem(WIDTH_KEY, String(clamped));
+  } catch {
+    // Ignored, as above.
+  }
+}
+
+{
+  const grip = $("panelGrip");
+  let startX = 0;
+  let startWidth = 0;
+
+  grip.addEventListener("pointerdown", (event) => {
+    const pointer = event as PointerEvent;
+    startX = pointer.clientX;
+    startWidth = $("panel").getBoundingClientRect().width;
+    grip.setPointerCapture(pointer.pointerId);
+    document.body.classList.add("pe-resizing-x");
+    event.preventDefault();
+  });
+
+  grip.addEventListener("pointermove", (event) => {
+    const pointer = event as PointerEvent;
+    if (!grip.hasPointerCapture(pointer.pointerId)) return;
+    // The panel is on the right, so dragging left widens it.
+    applyPanelWidth(startWidth + (startX - pointer.clientX));
+  });
+
+  const end = (event: Event) => {
+    const pointer = event as PointerEvent;
+    if (grip.hasPointerCapture(pointer.pointerId)) grip.releasePointerCapture(pointer.pointerId);
+    document.body.classList.remove("pe-resizing-x");
+  };
+  grip.addEventListener("pointerup", end);
+  grip.addEventListener("pointercancel", end);
+  grip.addEventListener("dblclick", () => {
+    applyPanelWidth(null);
+    toast("Panel width reset");
+  });
+  grip.addEventListener("keydown", (event) => {
+    const step = event.shiftKey ? 64 : 24;
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const current = $("panel").getBoundingClientRect().width;
+      applyPanelWidth(current + (event.key === "ArrowLeft" ? step : -step));
+    }
+    if (event.key === "Escape" || event.key === "Home") {
+      event.preventDefault();
+      applyPanelWidth(null);
+    }
+  });
+
+  try {
+    const stored = Number(localStorage.getItem(WIDTH_KEY));
+    if (Number.isFinite(stored) && stored > 0) applyPanelWidth(stored);
+  } catch {
+    // Ignored.
+  }
+}
+
+// --- the half-written note survives a reload --------------------------------
+//
+// Everything else the human types is saved as they type: the overall note goes to
+// the server on a debounce, replies and answers survive a re-render. The note
+// composer — the field they spend the most time in — was the one thing a stray
+// reload ate, because it is the only one whose contents do not exist anywhere yet.
+// Kept in localStorage rather than on the server: an uncommitted note is not part
+// of the review, and syncing it would put a half-formed thought in front of the
+// agent's own record.
+
+const DRAFT_KEY = `pe-draft:${key}`;
+
+function saveDraftText(): void {
+  try {
+    if (input.value.trim()) localStorage.setItem(DRAFT_KEY, input.value);
+    else localStorage.removeItem(DRAFT_KEY);
+  } catch {
+    // Private browsing; the draft just will not survive.
+  }
+}
+
+function restoreDraftText(): void {
+  try {
+    const stored = localStorage.getItem(DRAFT_KEY);
+    if (!stored || input.value) return;
+    input.value = stored;
+    // Said out loud, because text reappearing in a box with no explanation reads
+    // as the tool having sent something.
+    toast("Restored the note you were writing — it was never sent");
+  } catch {
+    // Ignored.
+  }
+}
+
 function readTheme(): Theme {
   try {
     const stored = localStorage.getItem("pe-theme");
@@ -1843,7 +2168,8 @@ window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener("change", (
   if (theme === "system") applyTheme("system");
 });
 
-$("collapse").addEventListener("click", () => layout.classList.toggle("collapsed"));
+$("collapse").addEventListener("click", toggleCollapsed);
+$("commands").addEventListener("click", openPalette);
 $("history").addEventListener("click", () => void openHistory());
 $("record").addEventListener("click", () => void openRecord());
 $("help").addEventListener("click", openHelp);
@@ -1894,6 +2220,13 @@ document.addEventListener(
 
 function handleKey(event: Keystroke): void {
   const meta = event.meta;
+  // First, and allowed while typing: the palette is the way out of not knowing
+  // what to do, so it must not be gated on already knowing where to stand.
+  if (meta && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    if (!overlay.hidden) closeOverlay();
+    return openPalette();
+  }
   if (meta && event.key.toLowerCase() === "i") {
     event.preventDefault();
     return setMode(!modeToggle.checked);
@@ -1912,7 +2245,7 @@ function handleKey(event: Keystroke): void {
   }
   if (meta && event.key.toLowerCase() === "z") {
     event.preventDefault();
-    return undoButton.click();
+    return event.shift ? void redo() : undoButton.click();
   }
   if (meta && event.key.toLowerCase() === "h") {
     event.preventDefault();
@@ -1920,8 +2253,7 @@ function handleKey(event: Keystroke): void {
   }
   if (meta && event.key === "\\") {
     event.preventDefault();
-    layout.classList.toggle("collapsed");
-    return;
+    return toggleCollapsed();
   }
   if (event.key === "Escape") {
     if (!overlay.hidden) return closeOverlay();
@@ -1979,9 +2311,46 @@ function handleKey(event: Keystroke): void {
     navigator_.open = true;
     return findBox.focus();
   }
+  // The composer is where every note starts and reaching it meant a mouse trip
+  // past four drawers.
+  if (event.key === "n") {
+    event.preventDefault();
+    return input.focus();
+  }
+  // The one move triage actually wants: whatever is still waiting on you, next.
+  // `j` walks everything including the forty items already settled.
+  if (event.key === ".") {
+    event.preventDefault();
+    return focusNextNeedingYou();
+  }
   if (event.key === "?") {
     event.preventDefault();
     return openHelp();
+  }
+}
+
+/**
+ * Moves to the next item that is actually waiting on the human.
+ *
+ * An unanswered question first, because that is the only state where the agent
+ * can do nothing at all until someone acts; then anything undecided. Wraps, so
+ * the key never becomes a no-op with work still on screen.
+ */
+function focusNextNeedingYou(): void {
+  const all = cards();
+  const needs = (card: HTMLElement) =>
+    card.hasAttribute("data-awaiting") || card.dataset.status === "answered" || card.dataset.status === "orphaned";
+  const candidates = all.filter(needs);
+  if (candidates.length === 0) return void toast("Nothing is waiting on you");
+  const at = candidates.findIndex((card) => card.dataset.id === cursorId);
+  const next = candidates[(at + 1) % candidates.length]!;
+  cursorId = next.dataset.id ?? null;
+  for (const card of all) card.classList.toggle("focused", card === next);
+  next.scrollIntoView({ block: "nearest" });
+  next.focus({ preventScroll: true });
+  const item = allItems().find((entry) => entry.id === cursorId);
+  if (item && item.tag !== "page") {
+    toFrame({ type: "pe:scrollTo", id: item.id, selector: item.selector, text: item.text });
   }
 }
 
@@ -2081,8 +2450,174 @@ function openSheet(title: string, inner: string): void {
   (overlay.querySelector<HTMLElement>("textarea, input") ?? sheetFocusables()[0])?.focus();
 }
 
+// --- the command palette ----------------------------------------------------
+//
+// There are twenty-odd shortcuts, four drawers, two document gestures and a
+// version scrubber in here, and the only inventory of any of it was a help sheet
+// that lists keys without doing anything. A palette is the one control that is
+// both the index and the entry point: everything reachable is typeable, including
+// jumping to a section, which is otherwise a scroll through an outline.
+//
+// It reuses `openSheet`, so it inherits the focus trap, Escape, and the scrim
+// rather than re-deriving three things that were each a bug once.
+
+interface Command {
+  label: string;
+  hint?: string;
+  keys?: string;
+  run: () => void;
+}
+
+function commands(): Command[] {
+  const list: Command[] = [
+    {
+      label: modeToggle.checked ? "Turn off annotate mode" : "Annotate — click an element to attach a note",
+      keys: "⌘I",
+      run: () => setMode(!modeToggle.checked),
+    },
+    {
+      label: "Suggest — type the exact replacement into the document",
+      keys: "⌘E",
+      run: () => armGesture(gesture === "suggest" ? null : "suggest"),
+    },
+    ...(["delete", "move-before", "move-after", "split", "merge"] as StructuralKind[]).map((kind) => ({
+      label: `Structure: ${OP_LABEL[kind]}`,
+      hint: "then click in the document",
+      run: () => armGesture(kind),
+    })),
+    { label: "Send the review", keys: "⇧⌘Enter", run: () => void sendReview() },
+    { label: "Find in the document", keys: "/", run: () => {
+      navigator_.open = true;
+      findBox.focus();
+    } },
+    { label: "Filter your notes", keys: "⌘F", run: () => search.focus() },
+    { label: "Version history and diff", keys: "⌘H", run: () => void openHistory() },
+    { label: "Undo the last change", keys: "⌘Z", run: () => undoButton.click() },
+    ...(redoSeq !== null ? [{ label: "Redo", keys: "⇧⌘Z", run: () => void redo() }] : []),
+    { label: "Transcript, packets, git, notifications", run: () => void openRecord() },
+    { label: "Open a different artifact", run: () => void openSwitcher() },
+    { label: "Add a standing rule", hint: "sent ahead of every review", run: () => openRuleSheet("") },
+    { label: layout.classList.contains("collapsed") ? "Show the panel" : "Hide the panel", keys: "⌘\\", run: toggleCollapsed },
+    { label: `Theme: ${theme} — switch`, run: () => $("theme").click() },
+    { label: "Keyboard shortcuts", keys: "?", run: openHelp },
+  ];
+
+  if (openItems().length) {
+    list.unshift({ label: `Accept all ${openItems().length} open changes`, run: () => void acceptAll() });
+  }
+  // Jumping to a section is the palette's best trick: it is the only way to move
+  // around a long document without reading the outline first.
+  for (const [position, section] of sections.entries()) {
+    list.push({
+      label: `Go to “${section.text}”`,
+      hint: "section",
+      run: () =>
+        toFrame({
+          type: "pe:scrollTo",
+          id: "",
+          selector: section.id ? `#${CSS.escape(section.id)}` : "",
+          text: section.id ? "" : section.text,
+        }),
+    });
+  }
+  return list;
+}
+
+/** Subsequence match, so "gorisk" finds "Go to Risks". */
+function fuzzy(needle: string, haystack: string): boolean {
+  if (!needle) return true;
+  const target = haystack.toLowerCase();
+  let at = 0;
+  for (const char of needle.toLowerCase()) {
+    if (char === " ") continue;
+    at = target.indexOf(char, at);
+    if (at === -1) return false;
+    at += 1;
+  }
+  return true;
+}
+
+function openPalette(): void {
+  const all = commands();
+  openSheet(
+    "What would you like to do?",
+    `<div class="palette">
+       <input id="paletteInput" class="search" type="search" placeholder="Type to filter — Enter runs the first match" autocomplete="off">
+       <div class="palette-list" id="paletteList"></div>
+     </div>`,
+  );
+
+  const field = $<HTMLInputElement>("paletteInput");
+  const listBox = $("paletteList");
+  let cursor = 0;
+  let shown = all;
+
+  const paint = () => {
+    shown = all.filter((command) => fuzzy(field.value.trim(), `${command.label} ${command.hint ?? ""}`));
+    cursor = Math.max(0, Math.min(cursor, shown.length - 1));
+    listBox.innerHTML = shown.length
+      ? shown
+          .map(
+            (command, index) =>
+              `<button class="palette-row${index === cursor ? " active" : ""}" type="button" data-run="${index}">
+                 <span class="prow-label">${escapeHtml(command.label)}</span>
+                 ${command.hint ? `<span class="prow-hint">${escapeHtml(command.hint)}</span>` : ""}
+                 ${command.keys ? `<kbd>${escapeHtml(command.keys)}</kbd>` : ""}
+               </button>`,
+          )
+          .join("")
+      : `<p class="empty">Nothing here matches that.</p>`;
+  };
+
+  const run = (index: number) => {
+    const command = shown[index];
+    if (!command) return;
+    // Closed first: several of these open a sheet of their own, and leaving the
+    // palette up would have two dialogs fighting over the same overlay node.
+    closeOverlay();
+    command.run();
+  };
+
+  field.addEventListener("input", () => {
+    cursor = 0;
+    paint();
+  });
+  field.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      cursor = Math.max(0, Math.min(shown.length - 1, cursor + (event.key === "ArrowDown" ? 1 : -1)));
+      paint();
+      listBox.querySelector(".palette-row.active")?.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      run(cursor);
+    }
+  });
+  listBox.addEventListener("click", (event) => {
+    const index = (event.target as HTMLElement).closest<HTMLElement>("[data-run]")?.dataset.run;
+    if (index !== undefined) run(Number(index));
+  });
+
+  paint();
+  field.focus();
+}
+
+function toggleCollapsed(): void {
+  const collapsed = layout.classList.toggle("collapsed");
+  try {
+    // Remembered, because focus mode is a working posture rather than a one-off:
+    // someone who wants the document full-width wants it again next time.
+    localStorage.setItem("pe-collapsed", collapsed ? "1" : "0");
+  } catch {
+    // Private browsing; it just will not persist.
+  }
+}
+
 function openHelp(): void {
   const rows: Array<[string, string]> = [
+    ["⌘K", "Everything you can do here, by name"],
     ["⌘I", "Toggle annotate mode"],
     ["⌘E", "Suggest mode — type the exact replacement"],
     ["Click", "Anchor an edit to an element"],
@@ -2093,10 +2628,13 @@ function openHelp(): void {
     ["⌘F", "Filter notes"],
     ["/", "Find in the document"],
     ["⌘Z", "Undo the last change"],
+    ["⇧⌘Z", "Put it back"],
     ["⌘H", "Version history"],
     ["← →", "Scrub versions while history is open"],
     ["⌘\\", "Hide or show the panel"],
     ["j / k", "Move through your notes (the document follows)"],
+    [".", "Jump to the next note that is waiting on you"],
+    ["n", "Start writing a note"],
     ["Enter", "Jump the document to the focused note"],
     ["a / r", "Accept or reject the focused note"],
     ["u", "Undo a verdict on the focused note"],
@@ -2144,11 +2682,21 @@ async function openSwitcher(): Promise<void> {
  * out which note each change belongs to. Recomputed only when the review being
  * read changes, since it costs two fetches and two parses.
  */
+/** Words of prose in a document, ignoring its markup. */
+function wordsOf(html: string): number {
+  const text = new DOMParser().parseFromString(html, "text/html").body.textContent ?? "";
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  return collapsed ? collapsed.split(" ").length : 0;
+}
+
 async function refreshAttribution(): Promise<void> {
   const answered = answeredReview();
   if (!answered?.baseVersion) {
     attribution = null;
     attributedReviewId = null;
+    // The count itself is still worth showing; there is just nothing to compare
+    // it against until a review has a recorded starting point.
+    baseWordCount = null;
     return;
   }
   if (attributedReviewId === answered.id) return;
@@ -2158,6 +2706,11 @@ async function refreshAttribution(): Promise<void> {
     fetch(`/artifact/${key}/raw?t=${encodeURIComponent(token)}`).then((response) => (response.ok ? response.text() : "")),
   ]);
   if (!before || !after) return;
+
+  // Free: both documents are already here, and "did it actually get a third
+  // shorter" is the question the commonest overall note in this tool asks.
+  baseWordCount = wordsOf(before);
+  wordCount = wordsOf(after);
 
   attribution = attributeChanges(
     before,
@@ -2427,7 +2980,12 @@ async function openRecord(): Promise<void> {
        <section>
          <h3>The paper trail</h3>
          <p class="drawer-hint">Every note, verdict, answer and version, as markdown you can keep.</p>
-         <div class="row"><button type="button" data-transcript>Download the transcript</button></div>
+         <div class="row">
+           <button type="button" data-transcript>Download the transcript</button>
+           <!-- A download is the wrong shape for the commonest use of this, which
+                is pasting the record into a message or a ticket. -->
+           <button type="button" data-copy-transcript>Copy it to the clipboard</button>
+         </div>
        </section>
        <section>
          <h3>Packets</h3>
@@ -2481,6 +3039,16 @@ async function openRecord(): Promise<void> {
   });
   overlay.querySelector("[data-transcript]")?.addEventListener("click", () => {
     window.open(`/api/${key}/transcript?t=${encodeURIComponent(token)}`, "_blank");
+  });
+  overlay.querySelector("[data-copy-transcript]")?.addEventListener("click", (event) => {
+    const button = event.currentTarget as HTMLButtonElement;
+    void guard("Copying the transcript", async () => {
+      const response = await fetch(`/api/${key}/transcript?t=${encodeURIComponent(token)}`);
+      if (!response.ok) throw new Error(`server said ${response.status}`);
+      await navigator.clipboard.writeText(await response.text());
+      button.textContent = "Copied";
+      toast("The whole record is on your clipboard");
+    });
   });
   overlay.querySelector("[data-packet]")?.addEventListener("click", () => {
     const id = $<HTMLSelectElement>("packetReview").value;
@@ -2626,7 +3194,40 @@ function updateTitle(): void {
 
 // --- ending -----------------------------------------------------------------
 
-endButton.addEventListener("click", async () => {
+/**
+ * Ending with notes still in the draft asks first.
+ *
+ * The notes are not destroyed — the draft lives on the server and survives — but
+ * the agent is told to stop, so work the human believes they are about to send
+ * simply never goes anywhere, and the tab they would have sent it from is gone.
+ * One unlabelled ghost button next to Send was all that stood between "I marked
+ * up the whole document" and nobody ever seeing it.
+ */
+endButton.addEventListener("click", () => {
+  const unsent = draftReview()?.items.length ?? 0;
+  if (unsent === 0 && !input.value.trim() && !overall.value.trim()) return void endSession();
+  openSheet(
+    "End the session?",
+    `<div class="form">
+       <p class="drawer-hint">You have ${unsent === 0 ? "an unfinished note" : `${unsent} note${unsent === 1 ? "" : "s"}`} that ${unsent === 1 || unsent === 0 ? "has" : "have"} not been sent. Ending stops your agent listening — the draft is kept, but nobody will see it until you reopen this artifact and send.</p>
+       <div class="form-actions">
+         <button class="ghost" type="button" data-close>Keep working</button>
+         <button type="button" data-send-then-end>Send the review, then end</button>
+         <button class="ghost" type="button" data-end-anyway>End without sending</button>
+       </div>
+     </div>`,
+  );
+  overlay.querySelector("[data-send-then-end]")?.addEventListener("click", () => {
+    closeOverlay();
+    void sendReview().then(() => endSession());
+  });
+  overlay.querySelector("[data-end-anyway]")?.addEventListener("click", () => {
+    closeOverlay();
+    void endSession();
+  });
+});
+
+async function endSession(): Promise<void> {
   endButton.disabled = true;
   endButton.textContent = "Ending…";
   await guard("Ending the session", () => send("/end", body({})));
@@ -2634,7 +3235,7 @@ endButton.addEventListener("click", async () => {
   setMode(false);
   window.close();
   setTimeout(showEndedScreen, 120);
-});
+}
 
 function showEndedScreen(): void {
   if (document.querySelector(".ended-screen")) return;
@@ -2659,9 +3260,44 @@ function pushLocks(): void {
 async function primeDocument(): Promise<void> {
   const response = await fetch(`/artifact/${key}/raw?t=${encodeURIComponent(token)}`);
   if (response.ok) {
-    setCurrentHtml(await response.text());
+    const html = await response.text();
+    setCurrentHtml(html);
+    wordCount = wordsOf(html);
     scheduleRender();
   }
+}
+
+/**
+ * Where each block of a markdown artifact lives in its source.
+ *
+ * Fetched only for a `.md`, and only so the panel can show the human the same
+ * coordinates the agent was given. Recomputed on every patch for the reason the
+ * server computes it at poll time: the file moves under the review, so a line
+ * recorded when the note was written points somewhere else by the time it is read.
+ */
+async function primeSourceLines(): Promise<void> {
+  if (!/\.(md|markdown|mdx)$/i.test(bootstrap.file)) return;
+  const data = await guard("Reading the markdown source", async () => {
+    const response = await fetch(`/artifact/${key}/source?t=${encodeURIComponent(token)}`);
+    if (!response.ok) throw new Error(`server said ${response.status}`);
+    return (await response.json()) as { blocks: Array<{ id: string; line: number; endLine: number }> };
+  });
+  if (!data) return;
+  sourceLines = new Map(data.blocks.map((block) => [block.id, { line: block.line, endLine: block.endLine }]));
+  scheduleRender();
+}
+
+/**
+ * The artifact's lint findings, so the human hears about a document that cannot
+ * hold an anchor from the tool rather than from a note that quietly orphans.
+ */
+async function primeFindings(): Promise<void> {
+  const data = await guard("Checking the artifact", () =>
+    send<{ findings: typeof findings }>("/doctor"),
+  );
+  if (!data) return;
+  findings = data.findings ?? [];
+  scheduleRender();
 }
 
 /**
@@ -2722,6 +3358,9 @@ window.addEventListener("message", (event: MessageEvent) => {
       pushLocks();
       toFrame({ type: "pe:outline" });
       void primeDocument();
+      void primeSourceLines();
+      void primeFindings();
+      restoreDraftText();
       break;
 
     case "pe:toggleMode":
@@ -2962,8 +3601,12 @@ async function applyPatch(): Promise<void> {
   }
   const html = await response.text();
   setCurrentHtml(html);
+  wordCount = wordsOf(html);
   previewing = null;
   altPreview = null;
+  // The document moved, so both of these describe the file as it was.
+  void primeSourceLines();
+  void primeFindings();
   // The document moved, so what the agent did to it has to be recomputed —
   // otherwise the per-item diffs keep describing an edit two revisions old.
   attributedReviewId = null;
@@ -2984,6 +3627,14 @@ if (bootstrap.status === "ended") {
   showEndedScreen();
 } else {
   connect();
+}
+
+// Focus mode is a working posture, not a one-off: someone who wants the document
+// full-width wants it again the next time they open this artifact.
+try {
+  if (localStorage.getItem("pe-collapsed") === "1") layout.classList.add("collapsed");
+} catch {
+  // Private browsing; it just will not persist.
 }
 
 render();

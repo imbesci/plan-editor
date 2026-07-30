@@ -1278,10 +1278,17 @@ document.addEventListener(
   true,
 );
 
-/** Chrome shortcuts that take a modifier. */
-const META_KEYS = new Set(["e", "f", "z", "h", "\\"]);
+/**
+ * Chrome shortcuts that take a modifier.
+ *
+ * Adding a chrome shortcut means adding it here too. There is no way for the
+ * chrome alone to notice it is missing: the binding simply does nothing from the
+ * moment focus enters the artifact, which is immediately, because clicking the
+ * document is the primary interaction.
+ */
+const META_KEYS = new Set(["e", "f", "k", "z", "h", "\\"]);
 /** Chrome shortcuts that are a bare key, and so must never fire mid-typing. */
-const PLAIN_KEYS = new Set(["j", "k", "a", "r", "u", "/", "?", "Enter", "ArrowLeft", "ArrowRight"]);
+const PLAIN_KEYS = new Set(["j", "k", "a", "r", "u", "n", ".", "/", "?", "Enter", "ArrowLeft", "ArrowRight"]);
 
 /**
  * True when the keystroke belongs to a field in the artifact rather than to the

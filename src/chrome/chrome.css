@@ -65,7 +65,11 @@ body {
   color: var(--fg);
   background: var(--bg);
 }
-.layout { display: grid; grid-template-columns: 1fr 340px; height: 100%; }
+/* The panel width is a variable so the grip can move it, and 340px is only the
+   default. It was a guess, and it is the wrong guess in both directions: a note
+   about a paragraph is easier to write beside the paragraph, and on a narrow
+   window the artifact wants every pixel. */
+.layout { display: grid; grid-template-columns: 1fr var(--panel-w, 340px); height: 100%; }
 .stage { display: flex; flex-direction: column; min-width: 0; }
 /* `min-width: 0` and the wrap are what stop the toolbar dictating the width of
  * the whole app. A flex row defaults to its min-content width, so as the window
@@ -782,12 +786,15 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
  * takes the rest with its own scroll. `⌘\` still collapses the panel entirely
  * when the document is what matters. */
 @media (max-width: 1180px) {
-  .layout { grid-template-columns: 1fr 300px; }
+  .layout { grid-template-columns: 1fr var(--panel-w, 300px); }
   .drawer { margin: 6px 10px; }
 }
 
 @media (max-width: 860px) {
+  /* Stacked, a stored width would apply to a column that no longer exists
+     beside anything — the grip is hidden with it. */
   .layout { grid-template-columns: 1fr; grid-template-rows: minmax(220px, 42%) 1fr; }
+  .panel-grip { display: none; }
   .panel { border-left: 0; border-top: 1px solid var(--line); overflow-y: auto; }
   /* Stacked, the panel is short and every section competes for it. Rather than
      nesting a scroller inside a scroller, the whole panel becomes one column
@@ -824,3 +831,80 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
   .toggle-text { font-size: 12px; }
   .drawer { margin: 6px 8px; }
 }
+
+/* --- the panel's own width handle -------------------------------------------
+ *
+ * Absolutely positioned on the panel's left edge rather than added as a third
+ * grid column: the two-column template is load-bearing for the collapse state
+ * and every breakpoint below, and a third track would have to be threaded
+ * through all of them. Out of flow, it costs the panel's layout nothing. */
+.panel { position: relative; }
+.panel-grip {
+  position: absolute; left: -4px; top: 0; bottom: 0; width: 9px;
+  cursor: col-resize; z-index: 5; background: transparent;
+}
+.panel-grip::after {
+  content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 3px;
+  background: transparent; transition: background .15s ease;
+}
+.panel-grip:hover::after, .panel-grip:focus-visible::after { background: var(--accent); }
+.panel-grip:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* While dragging horizontally the pointer owns the page, for the same reason the
+   row grip claims it: without this every text node it crosses gets selected. */
+body.pe-resizing-x, body.pe-resizing-x * { user-select: none !important; cursor: col-resize !important; }
+
+/* --- how much document there is ---------------------------------------------
+ *
+ * "Cut this by a third" is the commonest overall note this tool sees, and the
+ * numbers to answer it were all in hand and none of them on screen. */
+.metrics {
+  font: 11px ui-monospace, monospace; color: var(--muted);
+  white-space: nowrap; flex: 0 0 auto;
+}
+.metrics[data-direction="down"] { color: var(--done); }
+.metrics[data-direction="up"] { color: var(--pending); }
+
+/* --- the artifact cannot hold an anchor -------------------------------------
+ *
+ * Styled as advice rather than as an error: the document still works, it just
+ * cannot promise a note will keep its place, and the human is the one who can
+ * ask for that to be fixed. */
+.advice {
+  border: 1px solid var(--pending); border-left-width: 3px; border-radius: 8px;
+  padding: 8px 10px; margin: 0 4px 8px; background: var(--bg);
+  display: flex; flex-direction: column; gap: 4px; font-size: 12px;
+}
+.advice b { font-size: 12px; }
+.advice code { font: 11px ui-monospace, monospace; overflow-wrap: anywhere; }
+.advice .link { align-self: flex-start; }
+
+/* --- how far through triage you are ----------------------------------------- */
+.progress { display: flex; align-items: center; gap: 8px; margin: 0 4px 8px; }
+.bar-track { flex: 1; height: 4px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.bar-fill { display: block; height: 100%; background: var(--done); transition: width .25s ease; }
+.bar-text { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* Where a note lives in the markdown source — the same coordinates the agent
+   was given, so the two ends of the conversation stop using different ones. */
+.srcline {
+  font: 10px ui-monospace, monospace; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; margin-left: 6px;
+  flex: 0 0 auto;
+}
+.card .anchor { display: flex; align-items: center; }
+
+/* --- the command palette ---------------------------------------------------- */
+.palette { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.palette-list { max-height: 46vh; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.palette-row {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  border: 0; border-radius: 6px; padding: 7px 8px; background: transparent;
+  color: var(--fg); font: inherit; font-size: 13px; cursor: pointer;
+}
+.palette-row:hover { background: var(--panel); }
+/* The keyboard cursor, which is the primary way this is driven — it must read as
+   selected without depending on focus, because focus stays in the input. */
+.palette-row.active { background: var(--accent); color: #fff; }
+.palette-row.active .prow-hint, .palette-row.active kbd { color: #fff; opacity: .8; }
+.prow-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prow-hint { font-size: 11px; color: var(--muted); white-space: nowrap; }
