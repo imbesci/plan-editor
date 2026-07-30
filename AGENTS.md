@@ -91,6 +91,67 @@ Consequences that are easy to get wrong:
 - The renderer assigns every block a stable id derived from the nearest heading
   slug, because that is what the whole anchoring model rests on.
 
+## The document is addressable, so a read does not have to be a whole file
+
+Every anchor, churn count and markdown source range keys on the same section
+ids, and for a long time nothing let an agent use that. The tool's own advice —
+"apply them by editing the file directly" — therefore had an unpriced cost: to
+change forty words of a 50KB plan, an agent opened 50KB, on every round of every
+review.
+
+`src/outline.ts` answers the two questions that make a targeted read possible:
+what sections exist (`outlineOf`) and what is in this one (`sectionSource`).
+Three rules:
+
+- **`sectionSource` returns markdown source for a `.md`, never the render.**
+  Handing an agent the HTML of a markdown block invites it to write HTML back,
+  which is the one operation this codebase refuses everywhere.
+- **An unknown id is refused, and the caller lists what does exist.** An
+  approximate slice is a targeted read that quietly returned the wrong target;
+  the id was usually copied from an item whose anchor has since moved, and "no
+  such id" alone leaves nowhere to go but a full read.
+- **No DOM**, for the reason `html-slice.ts` has none: this runs in the CLI,
+  jsdom is a devDependency, and a malformed artifact is exactly when you want an
+  answer rather than a thrown parser.
+
+`diffSections` lives here too. `diffDocuments` does the same job better and only
+ever runs in the browser, so until now an agent had no way to check its own work
+— it applied a review, wrote a summary from memory, and found out whether it had
+changed more than it meant to when a human noticed.
+
+## What a review costs the agent, in characters
+
+Measured on a twelve-item review: 17,995 characters, of which 14,400 was
+untruncated anchor text. That is paid on every `watch` cycle, and `watch` is
+documented as the thing you run at the end of every turn.
+
+The snippet runs to 1200 characters because **re-anchoring scores against it**
+(`src/sdk/anchor.ts`) and a truncated needle cannot match an untruncated
+haystack. None of that applies to the agent, which is about to open the file and
+needs only enough text to find the passage. Excerpted head-and-tail it is 6,847
+characters; 5,945 on a repeat delivery.
+
+Two rules keep the saving from costing correctness:
+
+- **A verbatim item's `replace_this` and `with_exactly` are never truncated, and
+  it carries no `anchor_text` at all.** The agent is told to apply that text
+  literally, so clipping either side turns a precise instruction back into the
+  ambiguity the gesture was invented to remove — and the same passage was being
+  billed twice.
+- **Only prose is compacted on a repeat, never an item.** This is the exact
+  inverse of the hook rule, and deliberately: a hook injection is unsolicited and
+  fires on every prompt, so compacting its items is right; a `watch`/`poll` is the
+  agent *asking*, and it may be asking precisely because a compaction took the
+  items away. Standing rules are likewise always repeated — only the paragraph
+  explaining what a standing rule *is* drops out.
+
+Repeat delivery is tracked **per agent session** (`?agent=` on `/api/poll`, from
+`CLAUDE_CODE_SESSION_ID`), for the same reason `deliveredTo` is a list: with one
+global stamp, whichever agent polled first would consume the full text and every
+other session — including the one that wrote the plan — would be handed the
+compacted form of a review it had never seen. A caller with no id to send is
+always treated as a first delivery: costlier, never wrong.
+
 ## The standing contract outlives the review
 
 `Session.contract` is the fourth primitive, after pointing, batching, and
@@ -243,6 +304,19 @@ queueing, not racing.
 - **Undoing a verdict does not hunt down the requeued copy.** A rejection that
   already requeued leaves its copy in the draft; that copy is the human's to
   delete, because by then they may have edited it.
+- **The watcher must not be able to go deaf.** Two failures shared one symptom:
+  the file changes, the browser never patches, and there is no error anywhere.
+  First, `chokidar.watch` returns before it is actually watching, so an edit in
+  the first moments after a session opens could land while nothing was listening
+  — `watch()` now awaits `ready` (raced against a timeout, so a platform that
+  never emits it costs a bounded pause rather than hanging the open). Second, a
+  native filesystem event can simply be dropped. That is not theoretical: it is
+  what this suite had been calling a flake for as long as it has existed, about
+  one full-suite run in three and never once in isolation. The event stays the
+  delivery path and a `stat` every two seconds is the safety net. Do not replace
+  it with chokidar's `usePolling`, which would put the whole pipeline on a 200ms
+  floor to fix something rare — and do not shorten `RECONCILE_MS` to chase
+  latency, which is what `## Latency` is about.
 - **The detached server must exit, not merely stop listening.** `serve()` returns
   a `closed` promise and `serverCommand` awaits it before `process.exit(0)`. It
   used to park on `new Promise<never>(() => {})`, so `shutdown()` closed the
@@ -556,6 +630,57 @@ same `handleKey` as a real event. Two rules:
 
 Adding a chrome shortcut means adding it to `META_KEYS` or `PLAIN_KEYS` in
 `sdk.ts` too. There is no way for the chrome alone to notice it is missing.
+`⌘K`, `n` and `.` are in those sets for exactly that reason, and `⌘K` is
+additionally the one binding allowed to fire while the human is typing — the
+palette is the way out of not knowing what to do, so it must not be gated on
+already knowing where to stand.
+
+## Discoverability is a feature, not documentation
+
+There are twenty-odd shortcuts, four drawers, two document gestures and a version
+scrubber in the panel, and for a long time the only inventory of any of it was a
+help sheet that lists keys and does nothing. `⌘K` is both the index and the entry
+point: everything reachable is typeable, including jumping to a section, which is
+otherwise a scroll through the outline.
+
+- **It reuses `openSheet`.** That inherits the focus trap, Escape, and the scrim
+  rather than re-deriving three things each of which was a bug once.
+- **A command closes the palette before it runs.** Several of them open a sheet of
+  their own, and two dialogs fighting over the same `#overlay` node is not a state
+  worth having.
+- **Matching is a subsequence**, so a half-remembered name still finds the thing.
+
+The same principle covers the rest of the panel's affordances. Each one existed as
+a capability the tool already had and never offered:
+
+- **Redo (`⇧⌘Z`)** was free the whole time. Undo is implemented by *writing an old
+  snapshot back*, which snapshots too — so the version undone from is still in
+  history and redo is a restore of it. Without it, one stray `⌘Z` on an hour's work
+  had no route back that did not involve opening history and guessing.
+- **The panel width is a variable, not 340px.** Held in `--panel-w` on `.layout`
+  and set by an absolutely-positioned grip on the panel's left edge — out of flow
+  deliberately, because the two-column template is load-bearing for the collapse
+  state and every breakpoint below it. The stacked layout hides the grip and
+  ignores the stored width.
+- **The composer draft is the one thing a reload ate.** Everything else the human
+  types exists somewhere already: the overall note is debounced to the server,
+  replies and answers survive a re-render. An uncommitted note exists nowhere, so
+  it goes to `localStorage` — not to the server, because a half-formed thought is
+  not part of the review. It is cleared only once the server has the note, and the
+  restore says so out loud: text reappearing in a box with no explanation reads as
+  the tool having sent something.
+- **Lint findings belong in front of the human.** `doctor` has existed as a command
+  since anchoring did, which means the only person never shown "this document has
+  no ids" was the one who could ask for it to be fixed. Only findings that break
+  anchoring are surfaced (`no-ids-at-all`, `duplicate-ids`, `missing-section-ids`);
+  style findings would train the human to dismiss the banner.
+- **`End` asks when notes are unsent.** The notes are not destroyed — the draft is
+  on the server — but the agent is told to stop, so work the human believes they
+  are about to send goes nowhere, and the tab they would have sent it from is gone.
+- **Word count and its delta are shown because that is what most reviews are
+  about.** "Cut this by a third" is the commonest overall note there is, and both
+  numbers were already in hand: the current document is parsed on every patch and
+  the review's base snapshot is fetched for attribution.
 
 ## A selection must be releasable
 

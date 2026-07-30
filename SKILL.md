@@ -135,6 +135,30 @@ rather than that paragraph, offer to promote it:
 
 ---
 
+## Read a section, not a document
+
+An artifact is addressable. Every anchor, every churn count and every markdown
+source range keys on the same section ids — so to change forty words you do not
+need to open fifty kilobytes.
+
+```sh
+plan-editor outline plan.md              # sections, ids, word counts, line ranges
+plan-editor section plan.md --id risks   # just that section's source
+plan-editor diff plan.md                 # what changed, by section
+```
+
+`outline` is a few hundred tokens against a whole document's several thousand,
+and the ids it returns are the ones review items anchor to — so an item on
+`#risks` is a two-line read. `section` hands back exactly what is in the file:
+markdown for a `.md`, markup for an `.html`. Both refuse rather than guess when
+an id is unknown, and list what does exist.
+
+`diff` is how you check your own work before reporting it. Anything in it that no
+review item asked for is what the human is shown as *a change nobody asked for*,
+which is the trust question for accepting a whole review at once.
+
+---
+
 ## Writing artifacts they can actually anchor to
 
 **Give top-level sections stable `id` attributes.** This is the single
@@ -161,7 +185,13 @@ following the OS while the chrome goes dark:
 ```sh
 plan-editor new plan.html --template plan|spec|report   # starts compliant
 plan-editor doctor plan.html                            # duplicate ids, missing ids, theme, oversized blocks
+plan-editor doctor plan.html --fix                      # adds the missing ids and changes nothing else
 ```
+
+`--fix` inserts `id` attributes into the opening tags that need them and touches
+nothing else in the document — no reformatting, no reordering. It is safe to run
+on a file the human is in the middle of reviewing; the browser patches itself in
+place, so do not tell them to reload.
 
 Markdown needs none of this — the renderer derives ids for you. A ` ```mermaid `
 fence renders as a diagram, and the human can pin a note to a node in it.
@@ -177,19 +207,25 @@ fence renders as a diagram, and the human can pin a note to a node in it.
 | `plan-editor poll <file>` | Long-poll. `--timeout-ms` |
 | `plan-editor respond <file> --summary "…"` | Close the review |
 | `plan-editor answer <file> --id <id>` | Flag one item |
+| `plan-editor applied <file> --id <id>` | Declare one item done when the browser never confirmed it |
 | `plan-editor ask <file> --id <id> --question "…"` | Ask and park |
 | `plan-editor alternatives <file> --id <id> --json f.json` | Offer options |
 | `plan-editor contract <file>` | Standing rules. `--add`, `--retire` |
 | `plan-editor promote <file> --id <id>` | Rejection reason → standing rule |
 | `plan-editor lock <file> --selector "…"` | Mark a region do-not-touch |
 | `plan-editor companions <file> --with a.md` | Review several artifacts as a set |
+| `plan-editor outline <file>` | Sections, ids, word counts, line ranges |
+| `plan-editor section <file> --id <id>` | One section's source |
+| `plan-editor diff <file>` | What changed by section. `--since <seq>` |
 | `plan-editor undo <file>` | Restore the previous version |
 | `plan-editor version <file> --seq n --label "…" --pin` | Name a version |
 | `plan-editor churn <file>` | Which sections keep being rewritten |
 | `plan-editor transcript <file>` | The review record as Markdown |
 | `plan-editor export <file>` | Standalone copy |
 | `plan-editor commit <file> --message "…"` | Commit just the artifact |
-| `plan-editor doctor <file>` / `new <file>` | Lint / scaffold |
+| `plan-editor doctor <file> [--fix]` | Lint / add the missing ids |
+| `plan-editor new <file>` | Scaffold a compliant artifact |
+| `plan-editor prune [--days 7]` | Drop ended sessions and their snapshots |
 | `plan-editor status` | Sessions, bound agents, what is waiting on whom |
 | `plan-editor end <file>` | End the session |
 
@@ -210,7 +246,8 @@ review unanswered. `watch` is still worth it while they are actively reviewing �
 it is the difference between 40ms and whenever they next type.
 
 Under MCP the same loop is `open_artifact` → `await_review` →
-`respond_to_review`, with `ask_human` and `offer_alternatives` alongside.
+`respond_to_review`, with `ask_human` and `offer_alternatives` alongside, plus
+`outline_artifact`, `read_section`, `artifact_diff` and `mark_item_applied`.
 
 ---
 
@@ -221,7 +258,11 @@ hit Send, and silence is the normal state. `plan-editor status` shows whether a
 review is waiting and who is bound.
 
 **The same item keeps coming back.** You applied it but never responded, or the
-browser never confirmed it. `plan-editor respond` closes the review.
+browser never confirmed it — which it cannot do if the tab is closed or stale.
+`plan-editor respond` closes the review; `plan-editor applied <file> --id <id>`
+settles a single item you have already done. Do that rather than applying it
+twice: a review that keeps returning after the work is finished is a loop, and
+the escape hatch is declaring it.
 
 **A note says its anchor is gone.** The element it pointed at no longer exists.
 Apply what you can from `anchor_text` and flag it `needs-call` rather than

@@ -515,6 +515,7 @@ The presence indicator shows which session is bound and when it was last seen.
 
 | Key | Action |
 | --- | --- |
+| `⌘K` | Everything you can do here, by name — the fastest way to find anything |
 | `⌘I` | Toggle annotate mode |
 | `⌘E` | Suggest mode — type the exact replacement |
 | Click | Anchor a note to an element |
@@ -526,14 +527,19 @@ The presence indicator shows which session is bound and when it was last seen.
 | `⌘F` | Filter notes |
 | `/` | Find in the document |
 | `⌘Z` | Undo the last change |
+| `⇧⌘Z` | Put it back |
 | `⌘H` | Version history |
 | `← →` | Scrub versions (while history is open) |
 | `⌘\` | Hide or show the panel (focus mode) |
 | `j` / `k` | Move through your notes — the document scrolls to follow |
+| `.` | Jump to the next note that is waiting on you |
+| `n` | Start writing a note |
 | `Enter` | Jump the document to the focused note |
 | `a` / `r` | Accept or reject the focused note |
 | `u` | Undo a verdict on the focused note |
+| Hover a note | The document scrolls to what it points at |
 | Drag the grip above the note box | Resize the entry area — it remembers, double-click resets |
+| Drag the panel's left edge | Resize the panel — it remembers, double-click resets |
 | Theme button | Cycle system → light → dark |
 | `Esc` | Close an overlay, disarm a gesture, cancel re-pointing, or clear the selection |
 | `?` | Shortcut list |
@@ -551,6 +557,7 @@ The presence indicator shows which session is bound and when it was last seen.
 | `plan-editor poll <file>` | Long-poll for a review. `--timeout-ms`. |
 | `plan-editor respond <file> --summary "..."` | Close the review with what you changed and why. |
 | `plan-editor answer <file> --id <id>` | Flag one item: `--outcome caveat\|needs-call\|skipped --note "..."`. |
+| `plan-editor applied <file> --id <id>` | Declare one item done, when the browser never confirmed it. |
 | `plan-editor ask <file> --id <id> --question "..."` | Ask about one item and **park until answered**. |
 | `plan-editor alternatives <file> --id <id> --json alts.json` | Offer two or more versions to pick from. |
 | `plan-editor end <file>` | End a session. |
@@ -564,6 +571,14 @@ The presence indicator shows which session is bound and when it was last seen.
 | `plan-editor promote <file> --id <id>` | Turn a rejection's reason into a standing rule. |
 | `plan-editor lock <file> --selector "#budget"` | Mark a region do-not-touch. `--label`, `--remove <id>`. |
 | `plan-editor companions <file> --with a.md b.html` | Review several artifacts as one set. |
+
+**Reading an artifact without reading all of it** — an agent should not open 50KB to change forty words
+
+| Command | Description |
+| --- | --- |
+| `plan-editor outline <file>` | Sections, their anchor ids, word counts and source line ranges. |
+| `plan-editor section <file> --id <id>` | One section's source, exactly as it is on disk. |
+| `plan-editor diff <file>` | What changed, by section. `--since <seq>`. |
 
 **History and the record**
 
@@ -583,7 +598,8 @@ The presence indicator shows which session is bound and when it was last seen.
 | Command | Description |
 | --- | --- |
 | `plan-editor new <file>` | Write a compliant starter artifact. `--template plan\|spec\|report`, `--title`. |
-| `plan-editor doctor <file>` | Lint an artifact for anchoring problems. |
+| `plan-editor doctor <file>` | Lint an artifact for anchoring problems. `--fix` adds the missing ids. |
+| `plan-editor prune [--days 7]` | Drop ended sessions and their version history. |
 | `plan-editor setup hooks` | Install the Claude Code hooks. |
 | `plan-editor setup mcp` | Print the MCP client config. `--out <path>`. |
 | `plan-editor mcp` | Run the MCP server on stdio. |
