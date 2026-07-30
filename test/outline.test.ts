@@ -181,3 +181,40 @@ describe("diffSections", () => {
     assert.deepEqual(diffSections(HTML, HTML), []);
   });
 });
+
+describe("diffSections reports only the innermost change", () => {
+  // The same rule `diffDocuments` follows. Without it a markdown artifact
+  // answered a one-paragraph edit with four entries — the paragraph, its
+  // section, the document — and the outermost was present for *every* edit,
+  // which is the "flag body on everything" failure the rule exists to prevent.
+  const NESTED = `<html><body><div id="doc">
+<section id="risks"><h2>Risks</h2><p id="risks-p">One hundred rps per tenant.</p></section>
+<section id="plan"><h2>Plan</h2><p id="plan-p">Ship it.</p></section>
+</div></body></html>`;
+
+  test("an ancestor of a changed section is not also reported", () => {
+    const after = NESTED.replace("One hundred rps per tenant.", "100 rps per tenant.");
+    assert.deepEqual(
+      diffSections(NESTED, after).map((change) => change.id),
+      ["risks-p"],
+    );
+  });
+
+  test("two changes in different branches are both reported", () => {
+    const after = NESTED.replace("One hundred rps per tenant.", "100 rps.").replace("Ship it.", "Ship the classifier.");
+    assert.deepEqual(
+      diffSections(NESTED, after).map((change) => change.id).sort(),
+      ["plan-p", "risks-p"],
+    );
+  });
+
+  test("a change with no inner id is attributed to the innermost id there is", () => {
+    // Nothing to blame it on but the section itself, which is honest — the
+    // alternative is reporting the whole document for a heading edit.
+    const after = NESTED.replace("<h2>Risks</h2>", "<h2>Risks and questions</h2>");
+    assert.deepEqual(
+      diffSections(NESTED, after).map((change) => change.id),
+      ["risks"],
+    );
+  });
+});

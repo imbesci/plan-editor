@@ -119,6 +119,14 @@ ever runs in the browser, so until now an agent had no way to check its own work
 — it applied a review, wrote a summary from memory, and found out whether it had
 changed more than it meant to when a human noticed.
 
+It inherits `diffDocuments`'s hardest rule: **report only the innermost changed
+section.** Without it, every ancestor of an edit is reported too, so a markdown
+artifact answers a one-paragraph change with four entries — the paragraph, its
+section, the document — and the outermost is present for *every* edit, which is
+exactly the "flag `body` on everything" failure that rule exists to prevent.
+Containment is a substring test, which is sound because `sectionsOf` guarantees a
+child's markup is a literal substring of its parent's.
+
 ## What a review costs the agent, in characters
 
 Measured on a twelve-item review: 17,995 characters, of which 14,400 was

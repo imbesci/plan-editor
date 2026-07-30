@@ -226,18 +226,18 @@ export interface SectionChangeSummary {
 export function diffSections(before: string, after: string): SectionChangeSummary[] {
   const old = sectionsOf(before);
   const now = sectionsOf(after);
-  const changes: SectionChangeSummary[] = [];
+  const changes: Array<SectionChangeSummary & { markup: string }> = [];
 
   for (const [id, markup] of now) {
     const previous = old.get(id);
     if (previous === markup) continue;
-    const heading = headingOf(markup)?.text ?? null;
     changes.push({
       id,
       kind: previous === undefined ? "added" : "changed",
-      heading,
+      heading: headingOf(markup)?.text ?? null,
       wordsBefore: previous === undefined ? 0 : words(stripTags(previous)),
       wordsAfter: words(stripTags(markup)),
+      markup,
     });
   }
   for (const [id, markup] of old) {
@@ -250,9 +250,31 @@ export function diffSections(before: string, after: string): SectionChangeSummar
       heading: headingOf(markup)?.text ?? null,
       wordsBefore: words(stripTags(markup)),
       wordsAfter: 0,
+      markup,
     });
   }
-  return changes;
+
+  /**
+   * Only the innermost changed section, the same rule `diffDocuments` follows.
+   *
+   * Without it every ancestor of an edit is reported too, so a markdown artifact
+   * answered a one-paragraph change with four entries — the paragraph, its
+   * section, the document — and the outermost is present for *every* edit, which
+   * is precisely the "flag `body` on everything" failure that rule exists to
+   * prevent. Containment is a substring test because a child's markup is a
+   * literal substring of its parent's, which is what `sectionsOf` guarantees.
+   */
+  const kept = changes.filter(
+    (candidate) =>
+      !changes.some(
+        (other) =>
+          other !== candidate &&
+          other.kind === candidate.kind &&
+          other.markup.length < candidate.markup.length &&
+          candidate.markup.includes(other.markup),
+      ),
+  );
+  return kept.map(({ markup: _markup, ...summary }) => summary);
 }
 
 /** How a targeted read is reported to an agent. */
