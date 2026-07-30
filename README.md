@@ -291,6 +291,12 @@ the agent got right in place.
 **A verdict is undoable.** Accept and Reject are one keystroke each (`a` and
 `r`); `u` puts an item back if you misfire.
 
+**Accept all** settles the whole review in one click. When some items were
+flagged for you rather than simply applied, it names them first and offers to
+take only the straightforward ones — those are precisely the items the agent
+refused to guess at, and sweeping them up silently is the failure the review
+phase exists to prevent.
+
 **Re-point** rescues an item whose anchor moved. It rarely needs you now: anchors
 carry a content hash and word shingles, so an item survives the agent rewriting
 the very paragraph it points at. When a match is genuinely uncertain the item is

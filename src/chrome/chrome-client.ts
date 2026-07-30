@@ -749,10 +749,27 @@ function renderRepointBanner(): string {
   </div>`;
 }
 
-function renderTriage(appliedCount: number, revertable: boolean, reviewId: string | undefined): string {
-  if (!appliedCount && !revertable) return "";
+/** Items still awaiting a verdict from the human. */
+function openItems(): ReviewItem[] {
+  return (answeredReview() ?? closedReview())?.items.filter((item) => item.status === "answered") ?? [];
+}
+
+/**
+ * The ones that can be waved through without reading.
+ *
+ * Everything else the agent has explicitly put in front of you: a caveat to
+ * read, a decision it refused to guess at, something it did not do. Sweeping
+ * those up silently is the failure this whole panel exists to prevent.
+ */
+function straightforwardItems(): ReviewItem[] {
+  return openItems().filter((item) => item.outcome === "applied" && !item.awaitingHuman);
+}
+
+function renderTriage(_appliedCount: number, revertable: boolean, reviewId: string | undefined): string {
+  const open = openItems().length;
+  if (!open && !revertable) return "";
   return `<div class="triage">
-    ${appliedCount ? `<button class="link" type="button" data-accept-all>Accept all ${appliedCount} applied</button>` : ""}
+    ${open ? `<button class="accept-all" type="button" data-accept-all>Accept all <b>${open}</b></button>` : ""}
     ${revertable && reviewId ? `<button class="link revert-review" type="button" data-revert="${escapeHtml(reviewId)}">Revert this whole review</button>` : ""}
   </div>`;
 }
@@ -1241,7 +1258,7 @@ list.addEventListener("click", (event) => {
     return;
   }
 
-  if (target.closest("[data-accept-all]")) return void acceptAllApplied();
+  if (target.closest("[data-accept-all]")) return void acceptAll();
 
   const revert = action("revert");
   if (revert) return openRevertSheet(revert);
@@ -1376,10 +1393,7 @@ async function acceptItem(id: string): Promise<void> {
   await guard("Accepting", () => send(`/items/${id}/accept`, body({})));
 }
 
-async function acceptAllApplied(): Promise<void> {
-  const targets = (answeredReview()?.items ?? []).filter(
-    (item) => item.status === "answered" && item.outcome === "applied" && !item.awaitingHuman,
-  );
+async function acceptItems(targets: ReviewItem[], what: string): Promise<void> {
   if (!targets.length) return;
   const done = await guard("Accepting", async () => {
     // Sequential rather than parallel: every one of these mutates the same
@@ -1387,7 +1401,68 @@ async function acceptAllApplied(): Promise<void> {
     for (const item of targets) await send(`/items/${item.id}/accept`, body({}));
     return true;
   });
-  if (done) toast(`Accepted ${targets.length} change${targets.length === 1 ? "" : "s"} the agent applied as asked`);
+  if (done) {
+    toast(`Accepted ${targets.length} ${what}${targets.length === 1 ? "" : "s"} — press u on a note to take one back`);
+  }
+}
+
+/** How the agent described an item, for the confirmation list. */
+function outcomeWord(item: ReviewItem): string {
+  if (item.awaitingHuman) return "waiting on your answer";
+  if (item.outcome === "caveat") return "applied with a caveat";
+  if (item.outcome === "needs-call") return "needs your call";
+  if (item.outcome === "skipped") return "not done";
+  return "applied";
+}
+
+/**
+ * Accept everything, but never quietly.
+ *
+ * A single button that swept up `needs-call` and `skipped` items alongside the
+ * straightforward ones would settle the exact items the agent deliberately put
+ * in front of a human — the ones it refused to guess at, and the ones it chose
+ * not to do. So when the open set is all plain applies this just runs; when it
+ * is not, it says what it is about to include and offers the narrower option
+ * first.
+ */
+async function acceptAll(): Promise<void> {
+  const open = openItems();
+  const straightforward = straightforwardItems();
+  const flagged = open.filter((item) => !straightforward.includes(item));
+
+  if (!open.length) return;
+  if (!flagged.length) return acceptItems(straightforward, "change");
+
+  openSheet(
+    "Accept all",
+    `<div class="form">
+       <p class="drawer-hint">${flagged.length} of these ${flagged.length === 1 ? "is" : "are"} flagged for you rather than simply applied:</p>
+       <div class="flagged">
+         ${flagged
+           .map(
+             (item) => `<div class="flagged-row">
+               <span class="dkind ${escapeHtml(item.outcome ?? "applied")}">${escapeHtml(outcomeWord(item))}</span>
+               <span class="flagged-body">${escapeHtml(item.body.slice(0, 90))}</span>
+             </div>`,
+           )
+           .join("")}
+       </div>
+       <div class="form-actions">
+         <button class="ghost" type="button" data-close>Cancel</button>
+         ${straightforward.length ? `<button class="ghost" type="button" data-accept-safe>Accept only the ${straightforward.length} applied</button>` : ""}
+         <button type="button" data-accept-every>Accept all ${open.length}</button>
+       </div>
+     </div>`,
+  );
+
+  overlay.querySelector("[data-accept-safe]")?.addEventListener("click", () => {
+    closeOverlay();
+    void acceptItems(straightforward, "change");
+  });
+  overlay.querySelector("[data-accept-every]")?.addEventListener("click", () => {
+    closeOverlay();
+    void acceptItems(open, "item");
+  });
 }
 
 /**

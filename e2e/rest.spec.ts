@@ -91,10 +91,15 @@ test.describe("bulk triage and filters", () => {
     await expect(page.locator(".card")).toHaveCount(3);
   });
 
-  test("accept all applied settles the straightforward ones only", async ({ page }) => {
+  test("accept all confirms before sweeping up a flagged item", async ({ page }) => {
     await page.goto(h.url);
     await waitForArtifact(page);
     await page.locator("[data-accept-all]").click();
+
+    // One of the three was deliberately skipped, so this must not settle
+    // silently — it names what it would include.
+    await expect(page.locator("#overlay")).toContainText("not done");
+    await page.locator("[data-accept-safe]").click();
     await page.waitForTimeout(1500);
 
     const items = (await h.session()).reviews.flatMap((r: any) => r.items);

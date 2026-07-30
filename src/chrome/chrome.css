@@ -643,8 +643,31 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
 }
 
 /* --- bulk triage --- */
-.triage { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+.triage { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .triage .link { font-size: 12px; }
+
+/* A real button, not a text link.
+ *
+ * Settling a review is the panel's second job and it was a 12px link sitting
+ * among other 12px links, shown only when at least one item happened to be a
+ * plain apply — so on a review the agent had flagged, there was no way to
+ * accept in bulk at all and no sign there ever had been. */
+.accept-all {
+  flex: 0 0 auto; font-size: 12.5px; font-weight: 550;
+  padding: 6px 12px; border-radius: 8px;
+  border: 1px solid var(--accent); background: transparent; color: var(--accent);
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+}
+.accept-all:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.accept-all b {
+  font-size: 11px; line-height: 1; padding: 2px 6px; border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+/* The confirmation list, when some of what you are accepting was flagged. */
+.flagged { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+.flagged-row { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; }
+.flagged-body { color: var(--muted); overflow-wrap: anywhere; }
 .reverted, .requeued {
   font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
   padding: 1px 7px; border-radius: 999px; background: var(--line); color: var(--muted);
