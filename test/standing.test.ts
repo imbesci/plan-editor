@@ -450,3 +450,104 @@ describe("the record", () => {
     assert.equal(response.status, 400);
   });
 });
+
+// ---------------------------------------------------------------------------
+// What the agent is charged for, on the wire.
+//
+// The formatter's side of this is `test/budget.test.ts`; this is the wiring,
+// which is where a saving can be recorded correctly and never actually applied.
+// ---------------------------------------------------------------------------
+
+describe("a repeat delivery is recognised per agent", () => {
+  let repeatFile: string;
+  let repeatSession: { key: string; token: string };
+
+  before(async () => {
+    repeatFile = path.join(dir, "repeat.html");
+    await writeFile(repeatFile, HTML);
+    repeatSession = (await (
+      await fetch(`${origin}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: repeatFile }),
+      })
+    ).json()) as typeof repeatSession;
+
+    await fetch(`${origin}/api/${repeatSession.key}/items?t=${repeatSession.token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin },
+      body: JSON.stringify({ items: [{ body: "Trim this", selector: "#body", text: "Body text." }] }),
+    });
+    await fetch(`${origin}/api/${repeatSession.key}/review/send?t=${repeatSession.token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin },
+      body: "{}",
+    });
+  });
+
+  const poll = async (agent?: string): Promise<PollResult> => {
+    const query =
+      `file=${encodeURIComponent(repeatFile)}&t=${repeatSession.token}&timeoutMs=0` +
+      (agent ? `&agent=${encodeURIComponent(agent)}` : "");
+    return (await (await fetch(`${origin}/api/poll?${query}`)).json()) as PollResult;
+  };
+
+  test("the first poll is not a repeat and the second is", async () => {
+    const first = await poll("agent-a");
+    assert.equal(first.status, "review");
+    assert.equal(first.status === "review" ? first.repeat : true, undefined);
+
+    const second = await poll("agent-a");
+    assert.equal(second.status === "review" ? second.repeat : false, true);
+  });
+
+  test("a different agent session still gets a first delivery", async () => {
+    // Tracked per agent for the same reason hook delivery is: with one global
+    // stamp, whichever agent polled first would consume the full text and every
+    // other session — including the one that wrote the plan — would be handed the
+    // compacted form of a review it had never seen.
+    const other = await poll("agent-b");
+    assert.equal(other.status === "review" ? other.repeat : true, undefined);
+  });
+
+  test("an unidentified caller is always treated as a first delivery", async () => {
+    // A CLI outside a Claude Code session has no id to send. Costlier, never wrong.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await poll();
+      assert.equal(result.status === "review" ? result.repeat : true, undefined);
+    }
+  });
+
+  test("a repeat still carries every item — a poll is the agent asking", async () => {
+    const result = await poll("agent-a");
+    assert.equal(result.status, "review");
+    assert.equal(result.status === "review" ? result.review.items.length : 0, 1);
+  });
+});
+
+describe("the agent can diff its own work", () => {
+  test("a section the agent rewrote comes back as changed", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const current = await readFile(artifact, "utf8");
+    const versionList = (await (await fetch(url(`/api/${session.key}/versions`))).json()) as {
+      versions: Array<{ seq: number }>;
+    };
+    const first = versionList.versions[0]!.seq;
+
+    const response = await fetch(url(`/api/${session.key}/diff?from=${first}`));
+    assert.equal(response.status, 200);
+    const { from, changes } = (await response.json()) as {
+      from: number;
+      changes: Array<{ id: string; kind: string }>;
+    };
+    assert.equal(from, first);
+    // Earlier tests in this file rewrote #body through the browser-computed write.
+    assert.ok(changes.some((change) => change.id === "body"), JSON.stringify(changes));
+    assert.ok(current.length > 0);
+  });
+
+  test("a version that has aged out is refused, not approximated", async () => {
+    const response = await fetch(url(`/api/${session.key}/diff?from=9999`));
+    assert.equal(response.status, 404);
+  });
+});

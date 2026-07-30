@@ -11,6 +11,7 @@ import { canonicalDir } from "./hooks.ts";
 import { sectionsOf } from "./html-slice.ts";
 import { injectSdk } from "./html-transform.ts";
 import { isMarkdownPath, renderMarkdown } from "./markdown.ts";
+import { diffSections } from "./outline.ts";
 import { allowedHostnames, bindHost, defaultPort, hostnameFromHeader, stateDir } from "./paths.ts";
 import type { AgentIdentityView, SectionChurn } from "./protocol.ts";
 import {
@@ -221,6 +222,8 @@ export async function serve(options: ServeOptions = {}) {
     // saturates the event loop when artifacts live inside large trees.
     const watcher = chokidar.watch(session.file, { ignoreInitial: true });
     let debounce: NodeJS.Timeout | null = null;
+    // Registered before the first await, so an edit that lands during
+    // initialization is queued rather than dropped.
     watcher.on("all", () => {
       if (debounce) clearTimeout(debounce);
       // The agent's write lands semi-atomically; settle before morphing so we
@@ -240,6 +243,28 @@ export async function serve(options: ServeOptions = {}) {
       }, 120);
     });
     watchers.set(session.key, watcher);
+
+    /**
+     * Wait for the watcher to actually be watching.
+     *
+     * `chokidar.watch` returns before its initial scan finishes, so an edit made
+     * in the moments after a session opens could land while nothing was listening
+     * — and the failure is the worst shape this tool has: the file changes, the
+     * browser never patches, and there is no error anywhere. The window is
+     * milliseconds on an idle machine and long enough to be reproducible on a
+     * loaded one, which is why it read as a flake rather than a bug.
+     *
+     * Raced against a timeout so a platform that never emits `ready` costs a
+     * bounded pause instead of hanging the request that opened the session.
+     */
+    await new Promise<void>((resolve) => {
+      const done = setTimeout(resolve, 2_000);
+      done.unref();
+      watcher.once("ready", () => {
+        clearTimeout(done);
+        resolve();
+      });
+    });
   }
 
   // --- routes ---------------------------------------------------------------
@@ -881,6 +906,43 @@ export async function serve(options: ServeOptions = {}) {
   });
 
   /**
+   * What changed between a version and the artifact as it stands.
+   *
+   * The browser has had this since attribution existed; the agent has not, so it
+   * applies a review, reports a summary, and never finds out whether it changed
+   * more than it meant to. Computed here because this is where the version store
+   * lives, and by id rather than by line for the reason `diffDocuments` is: one
+   * reflowed paragraph rewrites a 400-character line.
+   */
+  app.get("/api/:key/diff", async (req, res, next) => {
+    try {
+      const session = await loadAuthorized(req, res);
+      if (!session) return;
+      const list = await versions.list(session.key);
+      const fallback = list[list.length - 2]?.seq ?? list[list.length - 1]?.seq;
+      const from = req.query.from === undefined ? fallback : Number(req.query.from);
+      if (from === undefined || !Number.isFinite(from)) {
+        res.status(400).json({ error: "no earlier version to compare against" });
+        return;
+      }
+      const before = await versions.read(session.key, from);
+      if (before === null) {
+        res.status(404).json({ error: `version ${from} is not in history` });
+        return;
+      }
+      const after = await readFile(session.file, "utf8");
+      // Rendered on both sides for a markdown artifact, exactly as churn does:
+      // the ids the agent and the human both talk about are the renderer's.
+      res.json({
+        from,
+        changes: diffSections(renderArtifact(session.file, before), renderArtifact(session.file, after)),
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
    * How often each section has been rewritten. A section rewritten six times is
    * one the human and the agent still disagree about — the tool held every
    * snapshot needed to say so and never said it.
@@ -1237,7 +1299,12 @@ export async function serve(options: ServeOptions = {}) {
         return;
       }
 
-      const immediate = await takeFeedback(key);
+      // Optional: a CLI outside a Claude Code session has no id to send. Absent
+      // it, nothing is stamped and every delivery is treated as a first one —
+      // costlier, never wrong.
+      const agentKey = String(req.query.agent ?? "").slice(0, 64) || undefined;
+
+      const immediate = await takeFeedback(key, agentKey);
       if (immediate.status !== "waiting") {
         res.json(immediate);
         refreshIdle();
@@ -1254,7 +1321,7 @@ export async function serve(options: ServeOptions = {}) {
         if (settled || res.writableEnded) return;
         settled = true;
         cleanup();
-        res.json(await takeFeedback(key));
+        res.json(await takeFeedback(key, agentKey));
       };
       const onEvent = (changed: string) => {
         if (changed === key) void finish();
@@ -1298,7 +1365,15 @@ export async function serve(options: ServeOptions = {}) {
     return map;
   }
 
-  async function takeFeedback(key: string): Promise<PollResult> {
+  /**
+   * `agentKey` is how a repeat delivery is recognised.
+   *
+   * Tracked per agent session for the same reason hook delivery is: with one
+   * global stamp, whichever agent polled first would consume the full text and
+   * every other session — including the one that wrote the plan — would get the
+   * compacted form of a review it had never seen.
+   */
+  async function takeFeedback(key: string, agentKey?: string): Promise<PollResult> {
     const session = await store.read(key);
     if (!session) return { status: "waiting" };
     // Only a *sent* review crosses to the agent. A draft is the human's private
@@ -1307,10 +1382,13 @@ export async function serve(options: ServeOptions = {}) {
     if (!review) {
       return session.status === "ended" ? { status: "ended", endedBy: session.endedBy ?? "agent" } : { status: "waiting" };
     }
+    const repeat = Boolean(agentKey && (review.deliveredTo ?? []).includes(agentKey));
+    if (agentKey && !repeat) await store.markDelivered(key, review.id, agentKey);
     const sourceLines = await sourceLinesFor(session);
     return {
       status: "review",
       review,
+      ...(repeat ? { repeat: true } : {}),
       // The standing contract rides along with every review, never instead of
       // one. The rules are what stop round four repeating round one's
       // correction, and an agent that only ever sees this review cannot know

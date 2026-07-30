@@ -299,6 +299,14 @@ export type PollResult =
        * something it can act on directly.
        */
       sourceLines?: Record<string, { line: number; endLine: number }>;
+      /**
+       * True when this agent has already been handed this review.
+       *
+       * Set so the formatter can stop re-teaching the workflow on a repeat
+       * delivery. It never causes an *item* to be dropped: a poll is the agent
+       * asking, and it may be asking because it lost the items to a compaction.
+       */
+      repeat?: boolean;
       sessionEnded?: boolean;
       endedBy?: "user" | "agent";
     };

@@ -392,6 +392,153 @@ function checkSectionIds(scanned: ScanResult, findings: Finding[]): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fixing the one finding that matters most.
+//
+// `missing-section-ids` is the only warning in this file whose fix is mechanical
+// *and* whose absence breaks the tool rather than merely degrading it: idiomorph
+// matches on id first, so an id-less section is torn down and rebuilt on every
+// patch, and every note anchored inside it orphans. Reporting it and leaving the
+// author to hand-edit thirty opening tags is advice they will skip — and the
+// symptom then surfaces hours later as a note that mysteriously lost its place.
+//
+// The edit is deliberately the narrowest one that fixes it: an `id` attribute is
+// inserted into an existing opening tag and nothing else in the document moves.
+// No reformatting, no wrapping, no reordering — this runs against a file someone
+// is in the middle of reviewing, and a fixer that reflows their markup would be
+// indistinguishable from an agent rewriting it behind their back.
+// ---------------------------------------------------------------------------
+
+export interface AddedId {
+  id: string;
+  /** The element the id was added to, as the author would recognise it. */
+  element: string;
+  line: number;
+}
+
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+}
+
+/** Every id already in the document, so a generated one can never collide. */
+function existingIds(nodes: ElementNode[]): Set<string> {
+  const ids = new Set<string>();
+  for (const node of nodes) {
+    const id = node.attrs["id"]?.trim();
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+
+function claim(taken: Set<string>, base: string): string {
+  const stem = base || "section";
+  if (!taken.has(stem)) {
+    taken.add(stem);
+    return stem;
+  }
+  for (let n = 2; n < 1000; n += 1) {
+    const candidate = `${stem}-${n}`;
+    if (taken.has(candidate)) continue;
+    taken.add(candidate);
+    return candidate;
+  }
+  return `${stem}-${taken.size}`;
+}
+
+/**
+ * The elements `checkSectionIds` would warn about, in one place.
+ *
+ * Shared with the linter on purpose: a fixer that disagreed with the check about
+ * which elements need ids would either leave a reported warning standing or add
+ * ids nobody asked for, and both read as the tool being wrong about its own rule.
+ */
+function unanchoredElements(scanned: ScanResult): number[] {
+  const { nodes } = scanned;
+  const flagged = new Set<number>();
+
+  for (const [index, node] of nodes.entries()) {
+    if (node.name !== "section" && node.name !== "article") continue;
+    const nested = ancestors(nodes, index).some((a) => {
+      const name = nodes[a]?.name;
+      return name === "section" || name === "article";
+    });
+    if (nested) continue;
+    if (node.attrs["id"]?.trim()) continue;
+    flagged.add(index);
+  }
+
+  const headings = new Set<number>();
+  for (const [index, node] of nodes.entries()) {
+    if (!HEADING_ELEMENTS.has(node.name)) continue;
+    if (node.attrs["id"]?.trim()) continue;
+    const holders = ancestors(nodes, index).filter((a) => SECTIONING_ELEMENTS.has(nodes[a]?.name ?? ""));
+    if (holders.some((h) => nodes[h]?.attrs["id"]?.trim())) continue;
+    if (holders.some((h) => flagged.has(h))) continue;
+    headings.add(index);
+  }
+  return [...flagged, ...headings].sort((a, b) => a - b);
+}
+
+/**
+ * Adds a stable id to every section the linter would flag.
+ *
+ * Returns the original string unchanged when there is nothing to do, so a caller
+ * can compare by identity and skip the write — rewriting a file with identical
+ * content still bumps its mtime, which restarts the detached server (the code
+ * signature) and wakes every watcher for no reason.
+ */
+export function addSectionIds(html: string): { html: string; added: AddedId[] } {
+  let scanned: ScanResult;
+  try {
+    scanned = scan(html ?? "");
+  } catch {
+    return { html, added: [] };
+  }
+  const { nodes, masked } = scanned;
+  const targets = unanchoredElements(scanned);
+  if (targets.length === 0) return { html, added: [] };
+
+  const taken = existingIds(nodes);
+  const edits: Array<{ at: number; text: string; added: AddedId }> = [];
+
+  for (const index of targets) {
+    const node = nodes[index]!;
+    // `textStart` is the offset just past the opening tag, so the `>` that ends
+    // it sits at textStart - 1. Anything else means the scanner and the source
+    // disagree about where this tag ended, and guessing an offset in someone's
+    // document is not a risk worth taking to save them a keystroke.
+    const close = node.textStart - 1;
+    if (html[close] !== ">") continue;
+    // A self-closing tag would put the id after the slash. Sections and headings
+    // are never self-closing, so skipping is free and stays correct if that ever
+    // changes.
+    if (html[close - 1] === "/") continue;
+
+    const label = /^h[1-6]$/.test(node.name)
+      ? textBetween(masked, node.textStart, node.textEnd)
+      : labelFor(nodes, masked, index);
+    const id = claim(taken, slugify(label));
+    edits.push({
+      at: close,
+      text: ` id="${id}"`,
+      added: { id, element: named(node, label.slice(0, 48)), line: node.line },
+    });
+  }
+
+  if (edits.length === 0) return { html, added: [] };
+
+  // Applied back to front so every offset stays valid against the original.
+  let output = html;
+  for (const edit of [...edits].sort((a, b) => b.at - a.at)) {
+    output = output.slice(0, edit.at) + edit.text + output.slice(edit.at);
+  }
+  return { html: output, added: edits.map((edit) => edit.added).sort((a, b) => a.line - b.line) };
+}
+
 const COLOUR_RE =
   /#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(|\boklch\(|\bcolor-mix\(|(?:^|[\s;{])(?:color|background|background-color|border-color|fill|stroke)\s*:/;
 

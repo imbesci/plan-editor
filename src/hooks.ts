@@ -254,10 +254,13 @@ export function buildContextInjection(entries: InjectionEntry[]): Injection | nu
 
   const lines: string[] = [];
   const deliver: string[] = [];
+  /** True once anything in this injection is new to this agent. */
+  let anythingNew = false;
 
   for (const entry of pending) {
     const review = entry.review!;
     const seen = (review.deliveredTo ?? []).includes(entry.agentKey);
+    if (!seen) anythingNew = true;
     lines.push(
       entry.ownership === "same-project"
         ? `A review is waiting on ${entry.file} (sent from a different agent session — read the file first, you may not have the context behind it):`
@@ -301,12 +304,23 @@ export function buildContextInjection(entries: InjectionEntry[]): Injection | nu
     }
   }
 
+  // The footer is repeated on every single prompt while a review is open, so it
+  // shrinks the moment there is nothing new to explain. The items were already
+  // compacted for a seen review; leaving four lines of unchanging workflow prose
+  // behind them made the injection read as nagging and cost more than the
+  // compaction saved.
   lines.push(
     "",
-    "Read the overall note and every item before changing anything — they were written as one pass and can pull against each other.",
-    "Apply them by editing the file directly; the open browser patches itself in place, so never tell the user to reload.",
-    'If an item is ambiguous, run `plan-editor ask <file> --id <id> --question "..."` and wait rather than guessing.',
-    "When you are done, run `plan-editor respond <file> --summary \"<what you changed and why>\"` to put your work in front of them.",
+    ...(anythingNew
+      ? [
+          "Read the overall note and every item before changing anything — they were written as one pass and can pull against each other.",
+          "Apply them by editing the file directly; the open browser patches itself in place, so never tell the user to reload.",
+          'If an item is ambiguous, run `plan-editor ask <file> --id <id> --question "..."` and wait rather than guessing.',
+          'When you are done, run `plan-editor respond <file> --summary "<what you changed and why>"` to put your work in front of them.',
+        ]
+      : [
+          'Still open. Close it with `plan-editor respond <file> --summary "..."`, or `plan-editor applied <file> --id <id>` if an item is already done.',
+        ]),
   );
 
   return { text: lines.join("\n"), deliver };

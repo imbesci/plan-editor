@@ -527,25 +527,176 @@ async function lockCommand(args: string[]): Promise<unknown> {
 
 /** Lints an artifact against the contract that makes anchoring work. */
 async function doctorCommand(args: string[]): Promise<unknown> {
-  const file = fileArg(args, "Run `plan-editor doctor <file.html>`");
+  const file = fileArg(args, "Run `plan-editor doctor <file.html> [--fix]`");
   const canonical = await canonicalFile(file);
-  const { readFile } = await import("node:fs/promises");
-  const { inspectArtifactSource } = await import("./doctor.ts");
+  const { readFile, writeFile } = await import("node:fs/promises");
+  const { addSectionIds, inspectArtifactSource } = await import("./doctor.ts");
   const { isMarkdownPath } = await import("./markdown.ts");
-  const findings = inspectArtifactSource(canonical, await readFile(canonical, "utf8"));
+
+  const source = await readFile(canonical, "utf8");
+  const markdown = isMarkdownPath(canonical);
+
+  // --fix touches one rule, `missing-section-ids`: the only finding here whose
+  // repair is mechanical and whose absence breaks anchoring outright.
+  let fixed: { added: Array<{ id: string; element: string; line: number }> } | null = null;
+  if (args.includes("--fix")) {
+    if (markdown) {
+      return {
+        file: canonical,
+        fixed: false,
+        // Adding markup to a `.md` to give it ids would be the tool writing HTML
+        // into someone's prose, which is the one edit it refuses everywhere else.
+        help: ["Markdown artifacts get their ids from the renderer — there is nothing to add, and nothing was changed."],
+      };
+    }
+    const result = addSectionIds(source);
+    if (result.html !== source) await writeFile(canonical, result.html);
+    fixed = { added: result.added };
+  }
+
+  const findings = inspectArtifactSource(canonical, fixed ? await readFile(canonical, "utf8") : source);
   const errors = findings.filter((finding) => finding.severity === "error");
   return {
     file: canonical,
     ok: errors.length === 0,
+    ...(fixed
+      ? {
+          added_ids: fixed.added,
+          fixed: fixed.added.length > 0,
+        }
+      : {}),
     findings,
-    help: findings.length
-      ? [
-          "Stable section ids are the highest-value fix: idiomorph matches on id first, so ids are the difference " +
-            "between a note being marked addressed and being marked orphaned.",
-        ]
-      : isMarkdownPath(canonical)
-        ? ["Markdown artifacts get their ids from the renderer, so there is nothing to fix by hand."]
-        : ["This artifact follows the contract."],
+    help: fixed
+      ? fixed.added.length
+        ? [
+            `Added ${fixed.added.length} id${fixed.added.length === 1 ? "" : "s"}. Only \`id\` attributes were inserted — nothing else in the document moved.`,
+            "If a browser has this artifact open it has already patched itself in place; do not tell the user to reload.",
+          ]
+        : ["Every section that needs an id already has one; the file was not written."]
+      : findings.length
+        ? [
+            "Stable section ids are the highest-value fix: idiomorph matches on id first, so ids are the difference " +
+              "between a note being marked addressed and being marked orphaned.",
+            "`plan-editor doctor <file> --fix` adds the missing ones for you.",
+          ]
+        : markdown
+          ? ["Markdown artifacts get their ids from the renderer, so there is nothing to fix by hand."]
+          : ["This artifact follows the contract."],
+  };
+}
+
+/**
+ * The document's shape, so a targeted read is possible at all.
+ *
+ * The alternative is what the tool implicitly asked for until now: open the whole
+ * artifact to change one paragraph, on every round of every review. A 50KB plan
+ * is ~13,000 tokens; this is a few hundred, and it hands back the same ids that
+ * review items anchor to — so "the note on #risks" becomes a two-line read.
+ */
+async function outlineCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor outline <file>`");
+  const canonical = await canonicalFile(file);
+  const { readFile } = await import("node:fs/promises");
+  const { describeOutline, outlineOf } = await import("./outline.ts");
+  const source = await readFile(canonical, "utf8");
+  return describeOutline(canonical, outlineOf(canonical, source));
+}
+
+/** One section, as it exists in the file. Refuses rather than guessing. */
+async function sectionCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor section <file> --id <section-id>`");
+  const id = valueOf(args, "--id");
+  if (!id) throw new CliError("--id is required", ["`plan-editor outline <file>` lists the ids."]);
+  const canonical = await canonicalFile(file);
+  const { readFile } = await import("node:fs/promises");
+  const { outlineOf, sectionSource } = await import("./outline.ts");
+  const source = await readFile(canonical, "utf8");
+
+  const section = sectionSource(canonical, source, id);
+  if (!section) {
+    // Listing what does exist rather than failing blank: the id was almost
+    // certainly copied from a review item whose anchor has since moved, and
+    // "no such id" alone leaves nowhere to go but a full read of the file.
+    const available = outlineOf(canonical, source)
+      .entries.slice(0, 40)
+      .map((entry) => entry.id);
+    throw new CliError(`No section with id "${id}" in ${path.basename(canonical)}`, [
+      available.length ? `Ids in this document: ${available.join(", ")}` : "This document has no id'd sections.",
+      `\`plan-editor doctor ${canonical} --fix\` adds stable ids where they are missing.`,
+    ]);
+  }
+  return {
+    file: canonical,
+    id: section.id,
+    heading: section.heading,
+    source_lines: `${path.basename(canonical)}:${section.line}-${section.endLine}`,
+    source: section.source,
+    next_step:
+      `Edit these lines in place. Nothing outside this range needs to be read or rewritten, and changing more than the ` +
+      `review asked for is reported to the human as a change they did not ask for.`,
+  };
+}
+
+/**
+ * What changed, by section, since a version.
+ *
+ * The browser has had this since attribution existed and the agent never has, so
+ * the agent's only account of its own work was the summary it wrote from memory.
+ */
+async function diffCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor diff <file> [--since <seq>]`");
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const since = valueOf(args, "--since");
+  const result = (await call(canonical, `/diff${since ? `?from=${encodeURIComponent(since)}` : ""}`)) as {
+    from?: number;
+    changes?: Array<{ id: string; kind: string; heading: string | null; wordsBefore: number; wordsAfter: number }>;
+  };
+  const changes = result.changes ?? [];
+  return {
+    file: canonical,
+    since_version: result.from ?? null,
+    changed_sections: changes.map((change) => ({
+      id: change.id,
+      kind: change.kind,
+      heading: change.heading,
+      words: `${change.wordsBefore} → ${change.wordsAfter}`,
+    })),
+    note: changes.length
+      ? "Anything here that no review item asked for is what the human is shown as a change nobody requested."
+      : "No id'd section differs from that version.",
+  };
+}
+
+/**
+ * Declares an item done when the browser never said so.
+ *
+ * An item leaves `sent` when the browser reports that the agent's change touched
+ * its anchor — which never happens if the tab is closed, stale, or was blanked by
+ * an earlier bug. The item then sticks forever and a watching agent is handed its
+ * own just-applied work on every cycle, which is exactly the loop it looks like.
+ * This is the escape hatch: if the same item comes back after you applied it, say
+ * so and move on.
+ */
+async function appliedCommand(args: string[]): Promise<unknown> {
+  const file = fileArg(args, "Run `plan-editor applied <file> --id <item-id>`");
+  const id = valueOf(args, "--id");
+  if (!id) throw new CliError("--id is required", ["Use the item id from the review you were given."]);
+  const canonical = await canonicalFile(file);
+  await ensureServer();
+  const result = (await call(canonical, `/items/${id}/answer`, {
+    method: "POST",
+    body: { outcome: "applied", ...(valueOf(args, "--note") ? { note: valueOf(args, "--note") } : {}) },
+  })) as { status?: string };
+  if (result.status === "not-found") {
+    throw new CliError(`No item ${id} on this artifact`, ["`plan-editor status` shows what is open."]);
+  }
+  return {
+    status: "applied",
+    item_id: id,
+    next_step:
+      `Recorded, so this item will not be handed back to you again. Close the review with ` +
+      `\`plan-editor respond ${canonical} --summary "..."\` once you have dealt with the rest.`,
   };
 }
 
@@ -715,6 +866,38 @@ async function statusCommand(): Promise<unknown> {
   };
 }
 
+/**
+ * Drops ended sessions and their snapshots.
+ *
+ * `SessionStore.prune` has existed since the store did and nothing ever called
+ * it, so an ended session sat in the state directory forever — along with up to
+ * forty whole-file snapshots apiece, which is the only part of this tool that
+ * grows without bound.
+ */
+async function pruneCommand(args: string[]): Promise<unknown> {
+  const days = Number(valueOf(args, "--days") ?? 7);
+  if (!Number.isFinite(days) || days < 0) throw new CliError("--days must be a number of days");
+  const store = new SessionStore(stateDir());
+  const { VersionStore } = await import("./store/version-store.ts");
+  const versions = new VersionStore(stateDir());
+
+  const doomed = (await store.list()).filter(
+    (session) => session.status === "ended" && Date.now() - Date.parse(session.updatedAt) >= days * 86_400_000,
+  );
+  // Snapshots go with the session, not on their own schedule: a version history
+  // for a session that no longer exists is unreachable by every command here.
+  for (const session of doomed) await versions.removeAll(session.key);
+  const removed = await store.prune(days * 86_400_000);
+  return {
+    removed,
+    files: doomed.map((session) => session.file),
+    note:
+      removed === 0
+        ? `Nothing ended more than ${days} day${days === 1 ? "" : "s"} ago. Open sessions are never pruned.`
+        : "Their version history went with them.",
+  };
+}
+
 async function stopCommand(): Promise<unknown> {
   await fetch(`${baseUrl()}/shutdown`, { method: "POST" }).catch(() => {});
   return { status: "stopped" };
@@ -746,6 +929,7 @@ Reviewing (.html, .htm, .md):
   plan-editor watch <file>              Park until the human sends a review (the responsive path)
   plan-editor respond <file> --summary  Close the review with what you changed and why
   plan-editor answer <file> --id <id>   Flag one item: --outcome caveat|needs-call|skipped --note ".."
+  plan-editor applied <file> --id <id>  Declare one item done, when the browser never confirmed it
   plan-editor ask <file> --id <id>      Ask about one item and park until answered
       --question "..." [--max-ms n]
   plan-editor alternatives <file>       Offer two or more versions to pick from
@@ -763,6 +947,11 @@ Standing context (outlives any one review):
   plan-editor companions <file>         Review several artifacts as one set
       --with a.md b.html
 
+Reading an artifact without reading all of it:
+  plan-editor outline <file>            Sections, ids, word counts and line ranges
+  plan-editor section <file> --id <id>  One section's source, so you edit forty words not fifty kilobytes
+  plan-editor diff <file>               What changed by section [--since <seq>]
+
 History and the record:
   plan-editor undo <file>               Restore the previous version
   plan-editor version <file> --seq n    Name or pin a version [--label ".."] [--pin]
@@ -777,10 +966,11 @@ History and the record:
 Authoring and setup:
   plan-editor new <file>                Write a compliant starter artifact
       [--template plan|spec|report] [--title ".."]
-  plan-editor doctor <file>             Lint an artifact for anchoring problems
+  plan-editor doctor <file> [--fix]     Lint an artifact for anchoring problems, or add the missing ids
   plan-editor setup hooks               Install the Claude Code hooks
   plan-editor mcp                       Run the MCP server on stdio
   plan-editor status                    List sessions and open review counts
+  plan-editor prune [--days 7]          Drop ended sessions and their snapshots
   plan-editor stop                      Shut the background server down
   plan-editor server [--verbose]        Run the server in the foreground
 
@@ -807,6 +997,11 @@ async function main(): Promise<void> {
     promote: promoteCommand,
     lock: lockCommand,
     doctor: doctorCommand,
+    outline: outlineCommand,
+    section: sectionCommand,
+    diff: diffCommand,
+    applied: appliedCommand,
+    prune: pruneCommand,
     new: newCommand,
     transcript: transcriptCommand,
     packet: packetCommand,

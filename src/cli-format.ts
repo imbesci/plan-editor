@@ -11,6 +11,30 @@ import type { ContractRule, Lock, PollResult, Review } from "./protocol.ts";
 
 const MARKDOWN = /\.(md|markdown|mdx)$/i;
 
+/**
+ * How much of an anchored passage the agent is shown.
+ *
+ * The stored snippet runs to 1200 characters, because re-anchoring scores
+ * against it (`src/sdk/anchor.ts`) and a truncated needle cannot match an
+ * untruncated haystack. None of that applies to the *agent*, which is about to
+ * open the file: it needs only enough text to find the passage, and it has the
+ * document to find it in. Measured on a twelve-item review, the untruncated
+ * snippets were 14,400 of 18,000 characters — four fifths of a payload that is
+ * re-sent on every `watch` cycle.
+ *
+ * Head and tail rather than head alone: the end of a paragraph is what
+ * disambiguates two passages that open the same way, which is the case where a
+ * truncated excerpt would otherwise send the agent to the wrong one.
+ */
+const EXCERPT_HEAD = 160;
+const EXCERPT_TAIL = 60;
+
+function excerpt(text: string): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= EXCERPT_HEAD + EXCERPT_TAIL + 5) return collapsed;
+  return `${collapsed.slice(0, EXCERPT_HEAD)} … ${collapsed.slice(-EXCERPT_TAIL)}`;
+}
+
 export function formatPollResult(file: string, result: PollResult): unknown {
   if (result.status === "waiting") {
     return {
@@ -33,6 +57,17 @@ interface StandingContext {
   locks?: Lock[];
   companions?: string[];
   sourceLines?: Record<string, { line: number; endLine: number }>;
+  /**
+   * True when this agent has already been handed this review once.
+   *
+   * Only the standing *prose* shrinks — never an item. The distinction matters:
+   * a hook injection is unsolicited and fires on every prompt, so compacting the
+   * items themselves is right there; an explicit `watch`/`poll` is the agent
+   * asking, and it may be asking precisely because it was compacted and lost
+   * them. So a repeat poll still carries every item in full and simply stops
+   * re-teaching the workflow it has already been told.
+   */
+  repeat?: boolean;
 }
 
 /** The id an anchor selector points at, when it points at one at all. */
@@ -61,7 +96,9 @@ function describeItem(
   const base: Record<string, unknown> = {
     id: item.id,
     request: item.body,
-    anchor_text: item.text,
+    // A verbatim item repeats this text under `replace_this`, where it must stay
+    // exact — printing both is paying twice for the same passage.
+    ...(item.tag === "verbatim" ? {} : { anchor_text: excerpt(item.text) }),
     ...(node
       ? {
           diagram_node: node.label ? `${node.label} (${node.id})` : node.id,
@@ -100,6 +137,53 @@ function describeItem(
 }
 
 /**
+ * How to work a review, in full — sent once per review per agent.
+ *
+ * It is long because every sentence in it was earned by a specific failure:
+ * items applied one at a time in isolation, an ambiguity guessed at, work done
+ * and never reported, a user told to reload a page that patches itself. But it
+ * is also ~1,100 characters, and `watch` is documented as the thing you run at
+ * the end of *every* turn — so re-teaching it to an agent that has already been
+ * told is a per-turn tax on nothing.
+ */
+function fullGuidance(file: string): string {
+  return (
+    `This is one review, not a stream — read the overall note first, then every item, and work out how they fit together ` +
+    `before changing anything. Two items can pull in opposite directions, and the note usually says which wins. ` +
+    `Apply them all by editing ${file} directly; the open browser patches itself in place, so never ask the user to reload. ` +
+    (MARKDOWN.test(file)
+      ? // The renderer already derives an id per block, so the HTML advice
+        // would be nonsense here — there is no markup for the agent to add.
+        `Each item carries the source line range it refers to; edit those lines. Keep heading text stable where you ` +
+        `can, because the anchors are derived from it. `
+      : `Give top-level sections stable \`id\` attributes so items can be matched precisely. `) +
+    `When you are done, run \`plan-editor respond ${file} --summary "<what you changed and why>"\` — that closes the review ` +
+    `and is what puts your work in front of the human to accept or reject. ` +
+    `If an item is ambiguous, do not guess and do not silently skip it: run ` +
+    `\`plan-editor ask ${file} --id <id> --question "<what you need to know>"\`, which parks until the human answers in ` +
+    `the browser. If you would rather show two options than ask, use \`plan-editor alternatives\`. ` +
+    `Use \`plan-editor answer ${file} --id <id> --outcome needs-call|caveat|skipped --note "<why>"\` for anything you ` +
+    `deliberately did not do.`
+  );
+}
+
+/**
+ * The same review, handed back to an agent that already has it.
+ *
+ * Names only the two commands it cannot infer, and says the one thing a repeat
+ * delivery actually means: this is still open, so either it was not applied or
+ * it was applied and never reported. `applied` is in here because a review that
+ * keeps returning after the work is done is the loop that reads as a bug.
+ */
+function briefGuidance(file: string): string {
+  return (
+    `You have been given this review before and it is still open — either it is not applied, or it is applied and you ` +
+    `never closed it. Close it with \`plan-editor respond ${file} --summary "..."\`. If an individual item is already ` +
+    `done, \`plan-editor applied ${file} --id <id>\`. Ask rather than guess: \`plan-editor ask ${file} --id <id> --question "..."\`.`
+  );
+}
+
+/**
  * The overall note leads, because it is the context that makes the individual
  * items interpretable — "cut this by a third" changes what every item means.
  * The standing contract leads even that: it is what makes round four stop
@@ -120,9 +204,16 @@ export function formatReview(
     ...(rules.length
       ? {
           standing_rules: rules.map((rule) => rule.text),
-          standing_rules_note:
-            "These apply to every review of this document, not just this one. The human set them because the same " +
-            "correction kept coming back. Honour them even where this review says nothing about them.",
+          // The rules themselves are never compacted — a rule stated once and
+          // then dropped is a rule broken three turns later — but the paragraph
+          // explaining what a standing rule *is* only has to land once.
+          ...(standing.repeat
+            ? {}
+            : {
+                standing_rules_note:
+                  "These apply to every review of this document, not just this one. The human set them because the same " +
+                  "correction kept coming back. Honour them even where this review says nothing about them.",
+              }),
         }
       : {}),
     ...(locks.length
@@ -137,22 +228,7 @@ export function formatReview(
     overall_note: review.note || null,
     items: items.map((item) => describeItem(item, file, standing.sourceLines)),
     next_step:
-      `This is one review, not a stream — read the overall note first, then every item, and work out how they fit together ` +
-      `before changing anything. Two items can pull in opposite directions, and the note usually says which wins. ` +
-      `Apply them all by editing ${file} directly; the open browser patches itself in place, so never ask the user to reload. ` +
-      (MARKDOWN.test(file)
-        ? // The renderer already derives an id per block, so the HTML advice
-          // would be nonsense here — there is no markup for the agent to add.
-          `Each item carries the source line range it refers to; edit those lines. Keep heading text stable where you ` +
-          `can, because the anchors are derived from it. `
-        : `Give top-level sections stable \`id\` attributes so items can be matched precisely. `) +
-      `When you are done, run \`plan-editor respond ${file} --summary "<what you changed and why>"\` — that closes the review ` +
-      `and is what puts your work in front of the human to accept or reject. ` +
-      `If an item is ambiguous, do not guess and do not silently skip it: run ` +
-      `\`plan-editor ask ${file} --id <id> --question "<what you need to know>"\`, which parks until the human answers in ` +
-      `the browser. If you would rather show two options than ask, use \`plan-editor alternatives\`. ` +
-      `Use \`plan-editor answer ${file} --id <id> --outcome needs-call|caveat|skipped --note "<why>"\` for anything you ` +
-      `deliberately did not do.` +
+      (standing.repeat ? briefGuidance(file) : fullGuidance(file)) +
       (sessionEnded ? " Note: the human ended the session with this review, so do not wait for another." : ""),
   };
 }

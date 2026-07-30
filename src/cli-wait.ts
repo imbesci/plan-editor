@@ -16,13 +16,28 @@ import type { PollResult, ReviewItem } from "./protocol.ts";
  */
 export const POLL_SLICE_MS = 45_000;
 
+/**
+ * Who is polling, so the server can tell a first delivery from a repeat and stop
+ * re-sending guidance this agent already has. Claude Code exposes the session id
+ * to Bash; outside one there is nothing to send, and every delivery is then
+ * treated as a first — which costs tokens but never loses anything.
+ */
+export function agentKey(env = process.env): string | undefined {
+  return env.CLAUDE_CODE_SESSION_ID?.slice(0, 64) || undefined;
+}
+
+function agentParam(): string {
+  const key = agentKey();
+  return key ? `&agent=${encodeURIComponent(key)}` : "";
+}
+
 /** Waits for the human to send a review. */
 export async function longPoll(canonical: string, token: string, deadline: number): Promise<PollResult> {
   while (Date.now() < deadline) {
     const slice = Math.max(1_000, Math.min(POLL_SLICE_MS, deadline - Date.now()));
     const url =
       `${baseUrl()}/api/poll?file=${encodeURIComponent(canonical)}&t=${encodeURIComponent(token)}` +
-      `&timeoutMs=${slice}`;
+      `&timeoutMs=${slice}${agentParam()}`;
     let result: PollResult | null = null;
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(slice + 15_000) });

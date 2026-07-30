@@ -19,6 +19,7 @@ import { awaitAnswer, longPoll } from "./cli-wait.ts";
 import { baseUrl, call, CliError, ensureServer, PACKAGE_VERSION, tokenFor } from "./client.ts";
 import { formatPollResult } from "./cli-format.ts";
 import { inspectArtifactSource } from "./doctor.ts";
+import { describeOutline, outlineOf, sectionSource } from "./outline.ts";
 import type { PollResult } from "./protocol.ts";
 import { canonicalFile, SessionStore } from "./store/session-store.ts";
 import { stateDir } from "./paths.ts";
@@ -203,6 +204,80 @@ const TOOLS: Tool[] = [
       const canonical = await fileParam(args);
       await ensureServer();
       return call(canonical, "/contract");
+    },
+  },
+  {
+    name: "mark_item_applied",
+    description:
+      "Declare one item done when the browser never confirmed it. An item leaves the agent's queue when the browser " +
+      "reports that your change touched its anchor; if the tab is closed or stale that never happens, and the same item " +
+      "is handed back to you on every cycle. Use this when an item you have already applied comes back.",
+    inputSchema: {
+      type: "object",
+      properties: { file: { type: "string" }, item_id: { type: "string" }, note: { type: "string" } },
+      required: ["file", "item_id"],
+    },
+    async run(args) {
+      const canonical = await fileParam(args);
+      await ensureServer();
+      return call(canonical, `/items/${String(args.item_id)}/answer`, {
+        method: "POST",
+        body: { outcome: "applied", ...(args.note ? { note: args.note } : {}) },
+      });
+    },
+  },
+  {
+    name: "outline_artifact",
+    description:
+      "The artifact's sections, with the id each one anchors by, its word count and its source line range. Read this " +
+      "before reading the file: it is a few hundred tokens against the whole document's several thousand, and it tells " +
+      "you which single section a review item is actually about.",
+    inputSchema: { type: "object", properties: { file: { type: "string" } }, required: ["file"] },
+    async run(args) {
+      const canonical = await fileParam(args);
+      return describeOutline(canonical, outlineOf(canonical, await readFile(canonical, "utf8")));
+    },
+  },
+  {
+    name: "read_section",
+    description:
+      "One section's source exactly as it exists in the file — markdown for a .md, markup for an .html. Use it instead " +
+      "of opening the whole artifact to change one paragraph. Fails rather than guessing when the id is unknown.",
+    inputSchema: {
+      type: "object",
+      properties: { file: { type: "string" }, section_id: { type: "string" } },
+      required: ["file", "section_id"],
+    },
+    async run(args) {
+      const canonical = await fileParam(args);
+      const source = await readFile(canonical, "utf8");
+      const id = String(args.section_id);
+      const section = sectionSource(canonical, source, id);
+      if (!section) {
+        const ids = outlineOf(canonical, source).entries.slice(0, 40).map((entry) => entry.id);
+        throw new CliError(
+          `No section with id "${id}".`,
+          ids.length ? [`Ids in this document: ${ids.join(", ")}`] : ["This document has no id'd sections."],
+        );
+      }
+      return section;
+    },
+  },
+  {
+    name: "artifact_diff",
+    description:
+      "What changed by section since a version, so you can check your own work before reporting it. Anything here that " +
+      "no review item asked for is what the human is shown as a change nobody requested.",
+    inputSchema: {
+      type: "object",
+      properties: { file: { type: "string" }, since_version: { type: "number" } },
+      required: ["file"],
+    },
+    async run(args) {
+      const canonical = await fileParam(args);
+      await ensureServer();
+      const from = args.since_version === undefined ? "" : `?from=${encodeURIComponent(String(args.since_version))}`;
+      return call(canonical, `/diff${from}`);
     },
   },
   {

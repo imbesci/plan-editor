@@ -57,6 +57,28 @@ after(async () => {
 
 const withToken = (pathname: string) => `${origin}${pathname}${pathname.includes("?") ? "&" : "?"}t=${session.token}`;
 
+/**
+ * Waits for the watcher to have recorded an edit, rather than sleeping and hoping.
+ *
+ * Sleeping was a real flake and a subtle one: `VersionStore.snapshot` skips
+ * content identical to the previous version, so if the watcher's snapshot had not
+ * landed yet, a restore *back to that same content* was deduped away — and the
+ * test failed claiming undo was not recorded, on a run where nothing was wrong.
+ */
+async function versionCount(): Promise<number> {
+  const response = await fetch(withToken(`/api/${session.key}/versions`));
+  const { versions } = (await response.json()) as { versions: unknown[] };
+  return versions.length;
+}
+
+async function waitForVersions(atLeast: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await versionCount()) >= atLeast) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`the watcher never recorded version ${atLeast}`);
+}
+
 describe("shutdown", () => {
   test("the server reports when it has actually stopped", async () => {
     // Without this the detached process has no way to know it is done: the CLI
@@ -316,7 +338,9 @@ describe("versions, undo, and export", () => {
     const original = await (await fetch(withToken(`/api/${session.key}/versions/${firstSeq}`))).text();
 
     await writeFile(artifact, ARTIFACT_HTML.replace("Original title", "Changed for restore"));
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    // The restore below only records a version because the content it writes
+    // differs from the newest one, so the edit has to be in history first.
+    await waitForVersions(before.versions.length + 1);
 
     const restore = await fetch(withToken(`/api/${session.key}/restore`), {
       method: "POST",

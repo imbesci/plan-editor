@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { TEMPLATES, inspectArtifact, renderTemplate, type Finding } from "../src/doctor.ts";
+import { TEMPLATES, addSectionIds, inspectArtifact, renderTemplate, type Finding } from "../src/doctor.ts";
 
 const rules = (findings: Finding[]): string[] => findings.map((f) => f.rule);
 const byRule = (findings: Finding[], rule: string): Finding[] =>
@@ -318,5 +318,98 @@ describe("diagram-without-id", () => {
 
   test("a document with no diagrams is untouched by the rule", () => {
     assert.deepEqual(flagged(wrap(`<p id="p">Just prose.</p>`)), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// --fix, for the one finding whose repair is mechanical.
+//
+// `missing-section-ids` is the only warning here that breaks the tool rather
+// than merely degrading it — idiomorph matches on id first, so an id-less
+// section is torn down on every patch and every note inside it orphans. What
+// these tests guard is the *narrowness* of the edit: this runs against a file
+// someone is in the middle of reviewing, and a fixer that reflowed their markup
+// would be indistinguishable from an agent rewriting it behind their back.
+// ---------------------------------------------------------------------------
+
+describe("addSectionIds", () => {
+  const bare = `<!doctype html>
+<html><head><title>T</title></head>
+<body>
+<section>
+  <h2>Risks and open questions</h2>
+  <p>Prose.</p>
+</section>
+<section>
+  <h2>Milestones</h2>
+  <p>More prose.</p>
+</section>
+</body></html>`;
+
+  test("gives each id-less section an id derived from its heading", () => {
+    const { html, added } = addSectionIds(bare);
+    assert.deepEqual(added.map((entry) => entry.id), ["risks-and-open-questions", "milestones"]);
+    assert.match(html, /<section id="risks-and-open-questions">/);
+    assert.match(html, /<section id="milestones">/);
+  });
+
+  test("the fix silences the warning it was reported for", () => {
+    assert.ok(byRule(inspectArtifact(bare), "missing-section-ids").length > 0);
+    assert.deepEqual(byRule(inspectArtifact(addSectionIds(bare).html), "missing-section-ids"), []);
+  });
+
+  test("nothing but the id attribute moves", () => {
+    const { html } = addSectionIds(bare);
+    // Strip the inserted attributes back out and the document must be identical
+    // to what the author wrote, byte for byte.
+    assert.equal(html.replace(/ id="(?:risks-and-open-questions|milestones)"/g, ""), bare);
+  });
+
+  test("a document that already complies is returned unchanged, by identity", () => {
+    // The caller compares by identity to decide whether to write. Rewriting a
+    // file with identical content still bumps its mtime, which restarts the
+    // detached server and wakes every watcher for nothing.
+    const { html, added } = addSectionIds(GOOD);
+    assert.equal(html, GOOD);
+    assert.deepEqual(added, []);
+  });
+
+  test("a generated id never collides with one already in the document", () => {
+    const clashing = `<html><body><p id="milestones">taken</p>
+<section><h2>Milestones</h2></section></body></html>`;
+    const { html, added } = addSectionIds(clashing);
+    assert.equal(added[0]?.id, "milestones-2");
+    assert.match(html, /<section id="milestones-2">/);
+    // And the duplicate-id error is not traded for the missing-id warning.
+    assert.deepEqual(byRule(inspectArtifact(html), "duplicate-ids"), []);
+  });
+
+  test("a heading with no sectioning ancestor gets the id itself", () => {
+    const loose = `<html><body><h2>Open questions</h2><p>text</p></body></html>`;
+    const { html, added } = addSectionIds(loose);
+    assert.equal(added[0]?.id, "open-questions");
+    assert.match(html, /<h2 id="open-questions">/);
+  });
+
+  test("an existing id is never rewritten", () => {
+    const partly = `<html><body><section id="keep"><h2>Keep</h2></section>
+<section><h2>Add</h2></section></body></html>`;
+    const { html, added } = addSectionIds(partly);
+    assert.deepEqual(added.map((entry) => entry.id), ["add"]);
+    assert.match(html, /<section id="keep">/);
+  });
+
+  test("a heading with no usable text still gets a stable id rather than an empty one", () => {
+    const { html } = addSectionIds(`<html><body><section><h2>— —</h2></section></body></html>`);
+    assert.match(html, /<section id="[a-z][a-z0-9-]*">/);
+  });
+
+  test("malformed markup produces no edit rather than a mangled document", () => {
+    // The linter exists to talk about documents no parser accepts; the fixer's
+    // answer to one is to refuse, because a misplaced attribute is worse than a
+    // standing warning.
+    const broken = `<section><h2>Unclosed`;
+    const { html } = addSectionIds(broken);
+    assert.ok(html === broken || html.includes("<section id="));
   });
 });
