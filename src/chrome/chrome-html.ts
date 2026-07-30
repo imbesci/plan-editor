@@ -140,6 +140,13 @@ export function renderChrome(session: Session): string {
       </div>
     </details>
 
+    <!-- A real handle for the whole entry area. The textarea's native corner
+         grip resizes only itself, is a few pixels wide, and is forgotten on
+         reload — writing a long note meant dragging an invisible target every
+         time. This is a separator, so it is focusable and takes arrow keys. -->
+    <div class="composer-grip" id="composerGrip" role="separator" aria-orientation="horizontal"
+         tabindex="0" aria-label="Resize the note area — arrow keys, or double-click to reset"
+         title="Drag to resize · double-click to reset"></div>
     <div class="composer" id="composer">
       <div class="target-hint" id="targetHint"></div>
       <div class="target-actions" id="targetActions" hidden>

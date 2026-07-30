@@ -1689,6 +1689,113 @@ const THEME_LABEL: Record<Theme, string> = {
   dark: "Theme: dark",
 };
 
+// --- resizing the entry area ------------------------------------------------
+//
+// The note field always had the browser's native corner grip, but it is a few
+// pixels wide, resizes only itself, and forgets on reload — so writing anything
+// longer than a sentence meant finding an invisible target every single time.
+// The grip above the composer sizes the whole section and remembers.
+
+const GRIP_KEY = "pe-composer-h";
+/** Below this the field and the buttons stop coexisting. */
+const MIN_COMPOSER = 132;
+/** The notes list is the point of the panel, so it always keeps this much. */
+const LIST_FLOOR = 132;
+
+/**
+ * The tallest the entry area may get.
+ *
+ * Measured against what is actually above it rather than a guess, so a panel
+ * with four drawers open does not let the composer swallow the list.
+ */
+function maxComposer(): number {
+  const panel = $("panel").getBoundingClientRect().height;
+  const composer = $("composer").getBoundingClientRect().height;
+  const listHeight = list.getBoundingClientRect().height;
+  const others = panel - composer - listHeight;
+  return Math.max(MIN_COMPOSER, panel - others - LIST_FLOOR);
+}
+
+function applyComposerHeight(height: number | null): void {
+  const panel = $("panel");
+  if (height === null) {
+    panel.style.removeProperty("--composer-h");
+    try {
+      localStorage.removeItem(GRIP_KEY);
+    } catch {
+      // Private browsing; it just will not persist.
+    }
+    return;
+  }
+  const clamped = Math.round(Math.min(maxComposer(), Math.max(MIN_COMPOSER, height)));
+  panel.style.setProperty("--composer-h", `${clamped}px`);
+  try {
+    localStorage.setItem(GRIP_KEY, String(clamped));
+  } catch {
+    // Ignored, as above.
+  }
+}
+
+function restoreComposerHeight(): void {
+  try {
+    const stored = Number(localStorage.getItem(GRIP_KEY));
+    if (Number.isFinite(stored) && stored > 0) applyComposerHeight(stored);
+  } catch {
+    // Ignored.
+  }
+}
+
+{
+  const grip = $("composerGrip");
+  let startY = 0;
+  let startHeight = 0;
+
+  grip.addEventListener("pointerdown", (event) => {
+    const pointer = event as PointerEvent;
+    startY = pointer.clientY;
+    startHeight = $("composer").getBoundingClientRect().height;
+    grip.setPointerCapture(pointer.pointerId);
+    document.body.classList.add("pe-resizing");
+    event.preventDefault();
+  });
+
+  grip.addEventListener("pointermove", (event) => {
+    if (!grip.hasPointerCapture((event as PointerEvent).pointerId)) return;
+    // Dragging the grip upward makes the entry area taller, which is why the
+    // delta is inverted.
+    applyComposerHeight(startHeight + (startY - (event as PointerEvent).clientY));
+  });
+
+  const end = (event: Event) => {
+    const pointer = event as PointerEvent;
+    if (grip.hasPointerCapture(pointer.pointerId)) grip.releasePointerCapture(pointer.pointerId);
+    document.body.classList.remove("pe-resizing");
+  };
+  grip.addEventListener("pointerup", end);
+  grip.addEventListener("pointercancel", end);
+
+  // Back to sizing itself from its content.
+  grip.addEventListener("dblclick", () => {
+    applyComposerHeight(null);
+    toast("Note area reset");
+  });
+
+  grip.addEventListener("keydown", (event) => {
+    const step = event.shiftKey ? 64 : 24;
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+      event.preventDefault();
+      const current = $("composer").getBoundingClientRect().height;
+      applyComposerHeight(current + (event.key === "ArrowUp" ? step : -step));
+    }
+    if (event.key === "Escape" || event.key === "Home") {
+      event.preventDefault();
+      applyComposerHeight(null);
+    }
+  });
+
+  restoreComposerHeight();
+}
+
 function readTheme(): Theme {
   try {
     const stored = localStorage.getItem("pe-theme");

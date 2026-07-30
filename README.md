@@ -533,6 +533,7 @@ The presence indicator shows which session is bound and when it was last seen.
 | `Enter` | Jump the document to the focused note |
 | `a` / `r` | Accept or reject the focused note |
 | `u` | Undo a verdict on the focused note |
+| Drag the grip above the note box | Resize the entry area — it remembers, double-click resets |
 | Theme button | Cycle system → light → dark |
 | `Esc` | Close an overlay, disarm a gesture, cancel re-pointing, or clear the selection |
 | `?` | Shortcut list |
