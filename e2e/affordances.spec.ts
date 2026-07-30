@@ -149,3 +149,80 @@ test("an artifact that cannot hold an anchor says so, where the human can act on
     await bare.dispose();
   }
 });
+
+// --- the document navigator, now a popover in the top bar --------------------
+//
+// A drawer needed no dismissal; a popover needs three, and it overlays the
+// document it is describing. Each of these is a way to leave it that a human will
+// reach for, and any one of them missing leaves a panel floating over the page.
+
+test("the navigator opens from the top bar and lists the document's sections", async ({ page }) => {
+  await expect(page.locator("#navPanel")).toBeHidden();
+  await expect(page.locator("#outlineCount")).toHaveText(/\d/);
+  await page.locator("#navToggle").click();
+  await expect(page.locator("#navPanel")).toBeVisible();
+  await expect(page.locator("#outline")).toContainText("Risks");
+});
+
+test("it closes on Escape, on a click away, and on picking a section", async ({ page }) => {
+  await page.locator("#navToggle").click();
+  await expect(page.locator("#navPanel")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#navPanel")).toBeHidden();
+
+  await page.locator("#navToggle").click();
+  await expect(page.locator("#navPanel")).toBeVisible();
+  // Anywhere in the chrome that is not the navigator itself.
+  await page.locator("#phaseTitle").click();
+  await expect(page.locator("#navPanel")).toBeHidden();
+
+  await page.locator("#navToggle").click();
+  await page.locator("#outline [data-section]").first().click();
+  // The point of the click was to look at the document underneath it.
+  await expect(page.locator("#navPanel")).toBeHidden();
+});
+
+test("/ still opens it and focuses find, from inside the artifact", async ({ page }) => {
+  await artifactFrame(page).locator("#idea-p").click();
+  await page.keyboard.press("/");
+  await expect(page.locator("#navPanel")).toBeVisible();
+  await expect(page.locator("#find")).toBeFocused();
+});
+
+test("moving it out of the panel gives the notes back their space", async ({ page }) => {
+  // The reason for the move, measured. With the navigator still in the panel and
+  // every drawer open, the notes list sat pinned to its 132px floor at every
+  // window height up to 1100px — the floor is the only thing that stopped it
+  // becoming a sliver. Without it the list clears the floor: 189px measured here.
+  await page.setViewportSize({ width: 1024, height: 1100 });
+  await page.goto(h.url);
+  await waitForArtifact(page);
+  await page.evaluate(() => {
+    for (const drawer of document.querySelectorAll<HTMLDetailsElement>(".drawer")) drawer.open = true;
+  });
+  await page.waitForTimeout(300);
+
+  // Structural, and true at every height: the outline is no longer competing for
+  // the panel's vertical space at all.
+  expect(await page.locator("#panel #outline").count()).toBe(0);
+  expect(await page.locator("#panel .drawer").count()).toBe(2);
+
+  const listHeight = await page.locator("#list").evaluate((el) => el.getBoundingClientRect().height);
+  expect(listHeight).toBeGreaterThan(132);
+});
+
+test("the popover never widens the page, at any width", async ({ page }) => {
+  for (const width of [1440, 900, 620]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(h.url);
+    await waitForArtifact(page);
+    await page.locator("#navToggle").click();
+    await expect(page.locator("#navPanel")).toBeVisible();
+    // An absolutely-positioned child still counts toward scrollWidth.
+    const overflow = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }));
+    expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth + 1);
+  }
+});

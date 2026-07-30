@@ -77,9 +77,16 @@ body {
  * and took the panel off the right-hand edge with it — the Send button was
  * clipped before the artifact was even uncomfortable. */
 .bar {
-  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   padding: 10px 16px; border-bottom: 1px solid var(--line);
   min-width: 0;
+  /* Queried by the controls inside it, not the viewport — the panel is
+     user-resizable, so the bar's width and the window's width are independent.
+     Sizing a toolbar control off `@media` would give the wrong answer to anyone
+     who has dragged the panel. Containment is safe here because the bar's width
+     comes from the grid column, never from its contents, which is the same
+     property `min-width: 0` above is protecting. */
+  container-type: inline-size;
 }
 .file { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 /* The three gestures sit together and push right as one group: they are
@@ -563,11 +570,11 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
   background: var(--panel); border: 1px solid var(--line);
 }
 .drawer-hint { margin: 0 16px 8px; font-size: 12px; color: var(--muted); }
-.finder { display: flex; align-items: center; gap: 8px; padding: 0 16px 8px; }
+.finder { display: flex; align-items: center; gap: 8px; padding: 10px 10px 8px; }
 .find-count { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 /* Capped against the window too, not just a fixed pixel count: on a short
-   window 210px of outline is most of the panel. */
-.outline { max-height: min(210px, 26vh); overflow-y: auto; padding: 0 12px 10px; display: flex; flex-direction: column; gap: 1px; }
+   window 210px of outline is most of the screen. */
+.outline { max-height: min(320px, 46vh); overflow-y: auto; padding: 0 8px 8px; display: flex; flex-direction: column; gap: 1px; }
 .section {
   flex: 0 0 auto; display: flex; align-items: center; gap: 8px; text-align: left;
   background: transparent; border: 0; border-radius: 6px; color: var(--fg);
@@ -800,7 +807,10 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
      nesting a scroller inside a scroller, the whole panel becomes one column
      that scrolls and the list gives up its own. */
   .list { overflow: visible; flex: 0 0 auto; min-height: 0; }
-  .outline, .rules, .locklist, .chat { max-height: none; }
+  /* `.outline` is deliberately not in this list any more: it lives in a popover
+     in the toolbar now, not in the scrolling panel, so uncapping it would let it
+     run off the bottom of the window with no scroller of its own. */
+  .rules, .locklist, .chat { max-height: none; }
   /* Send has to stay reachable without scrolling to the bottom first — but a
      full-size composer pinned to a short panel leaves almost nothing above it,
      so it is tightened here rather than merely pinned. */
@@ -908,3 +918,75 @@ body.pe-resizing-x, body.pe-resizing-x * { user-select: none !important; cursor:
 .palette-row.active .prow-hint, .palette-row.active kbd { color: #fff; opacity: .8; }
 .prow-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prow-hint { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* --- the document navigator, in the top bar ---------------------------------
+ *
+ * It was the first of four drawers in the review panel, which is the wrong place
+ * twice over: it is the only part of that panel that was never about the review,
+ * and it was competing for vertical space with the notes — the thing the panel
+ * exists for. With every drawer open the list collapsed to a sliver, which is
+ * what `.list`'s min-height exists to stop.
+ *
+ * A popover, so it costs nothing at all until it is asked for, positioned inside
+ * a `position: relative` wrapper rather than fixed to the viewport — it belongs
+ * to the button, and it has to follow it when the toolbar wraps at a narrow
+ * width. */
+.doc-nav { position: relative; flex: 0 0 auto; }
+.doc-toggle {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel);
+  color: var(--fg); font: inherit; font-size: 12px; cursor: pointer;
+  transition: border-color .15s ease;
+}
+.doc-toggle:hover { border-color: var(--accent); }
+.doc-toggle.armed { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.doc-icon { font-size: 11px; color: var(--muted); }
+.doc-toggle b {
+  font-size: 10.5px; line-height: 1; padding: 2px 6px; border-radius: 999px;
+  background: var(--bg); border: 1px solid var(--line); color: var(--muted);
+}
+.doc-panel {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 40;
+  /* Clamped to the window as well as to a fixed width, so it can never widen the
+     page — an absolutely-positioned child still counts toward scrollWidth, and a
+     toolbar control escaping the viewport is the bug `responsive.spec.ts` exists
+     for. */
+  width: 340px; max-width: min(340px, calc(100vw - 24px));
+  display: flex; flex-direction: column;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--bg); box-shadow: 0 16px 44px rgba(0,0,0,.22);
+}
+.doc-panel .search { margin: 0; }
+
+/* The toolbar must stay one row.
+ *
+ * Adding the Document button took the bar's content from 993px to 1129px against
+ * 1128px available at a 1500px window — it wrapped by a single pixel, and a
+ * second toolbar row costs the artifact height across the full width of the app,
+ * permanently. That is a worse trade than the panel space the move was for.
+ *
+ * So the label is hidden by default and only appears when the bar can prove it
+ * has room. Hidden is the safe direction: a browser without container query
+ * support gets the compact form and never wraps. */
+.doc-label { display: none; }
+@container (min-width: 1220px) {
+  .doc-label { display: inline; }
+}
+
+/* Adding the button also had to *pay* for itself, or the move would just have
+ * traded panel space for a toolbar that wraps at a width where it used to fit.
+ *
+ * Measured: the bar needs 1058px of the 1128px it has at a 1500px window. Before
+ * the Document button it needed 985px, so the wrap threshold had moved from a
+ * ~1357px window up to ~1430px — straight through the middle of common laptop
+ * widths. These two drop 91px, more than the button's 73px, so the threshold ends
+ * up slightly better than it started.
+ *
+ * Both are the least load-bearing things in the bar: the shortcut hint is a
+ * reminder rather than a control, and the agent's session id is in the pill's
+ * tooltip either way. */
+@container (max-width: 1060px) {
+  .bar kbd { display: none; }
+  .presence .who { display: none; }
+}

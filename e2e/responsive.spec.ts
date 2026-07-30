@@ -48,6 +48,38 @@ for (const width of WIDTHS) {
   });
 }
 
+test("the toolbar stays on one row at desktop widths", async ({ page }) => {
+  // Adding one control to the bar took its content from 993px to 1129px against
+  // 1128px available — it wrapped by a single pixel, and nothing caught it: the
+  // overflow test above passes happily, because wrapping is how the bar avoids
+  // overflowing. A second toolbar row costs the artifact height across the full
+  // width of the app, permanently, which is worse than whatever the control was
+  // added for.
+  // Below roughly 1340px the bar genuinely cannot hold its controls on one line
+  // and wrapping is the designed behaviour — that was true before the Document
+  // button existed too. These are the widths where one row is achievable.
+  for (const width of [1680, 1500, 1400]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(h.url);
+    await waitForArtifact(page);
+
+    // Measured by height, not by counting distinct child offsets: the controls
+    // have different heights and are vertically centred, so their `top` values
+    // differ *within* a single row. Counting those reports five rows for a bar
+    // that has one, which is a test that fails on a correct layout.
+    const bar = await page.evaluate(() => {
+      const el = document.querySelector(".bar")!;
+      const style = getComputedStyle(el);
+      const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+      const tallest = Math.max(...[...el.children].map((child) => child.getBoundingClientRect().height));
+      return { height: el.getBoundingClientRect().height, oneRow: tallest + padding };
+    });
+    // +4 for the border and sub-pixel rounding; a second row costs ~33px, so
+    // there is no ambiguity between the two cases.
+    expect(bar.height, `the toolbar wrapped at ${width}px`).toBeLessThanOrEqual(bar.oneRow + 4);
+  }
+});
+
 test("the drawers stay separated and legible as the panel narrows", async ({ page }) => {
   for (const width of [1440, 1024, 900, 720]) {
     await page.setViewportSize({ width, height: 900 });
@@ -63,7 +95,9 @@ test("the drawers stay separated and legible as the panel narrows", async ({ pag
       return boxes;
     });
 
-    expect(drawers.length).toBeGreaterThanOrEqual(3);
+    // The standing contract and the locks. The document navigator used to be a
+    // third drawer here and is now a popover in the toolbar.
+    expect(drawers.length).toBeGreaterThanOrEqual(2);
     for (const drawer of drawers) {
       // A header squeezed to a sliver is unreadable — this is what three
       // unlabelled grey bars looked like.

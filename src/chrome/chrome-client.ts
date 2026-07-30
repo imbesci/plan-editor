@@ -63,7 +63,8 @@ const targetActions = $("targetActions");
 const layout = $("layout");
 const filtersBar = $("filters");
 const outlineBox = $("outline");
-const navigator_ = $<HTMLDetailsElement>("navigator");
+const navPanel = $("navPanel");
+const navToggle = $<HTMLButtonElement>("navToggle");
 const findCount = $("findCount");
 const contractList = $("contractList");
 const ruleInput = $<HTMLTextAreaElement>("ruleInput");
@@ -777,6 +778,34 @@ function renderOutline(): void {
     : `<p class="empty">No headings in this document.</p>`;
 }
 
+// --- the document navigator, in the top bar ---------------------------------
+//
+// It used to be the first of four drawers in the review panel, which is the wrong
+// place twice over: it is the only part of that panel not about the review, and
+// it was taking vertical space from the notes — with every drawer open the list
+// collapsed to a sliver, which is what `.list`'s floor exists to stop. As a
+// popover next to the file name it costs nothing until it is asked for.
+
+function setNav(open: boolean): void {
+  navPanel.hidden = !open;
+  navToggle.setAttribute("aria-expanded", String(open));
+  navToggle.classList.toggle("armed", open);
+}
+
+const navOpen = () => !navPanel.hidden;
+
+navToggle.addEventListener("click", () => setNav(!navOpen()));
+
+// A popover has to be dismissible by clicking away from it, which a drawer did
+// not — this is the cost of the move, and forgetting it leaves a panel floating
+// over the document with no obvious way to put it back.
+document.addEventListener("click", (event) => {
+  if (!navOpen()) return;
+  const target = event.target as Node;
+  if ($("docNav").contains(target)) return;
+  setNav(false);
+});
+
 /**
  * Jump the document to a section from the navigator.
  *
@@ -791,6 +820,9 @@ outlineBox.addEventListener("click", (event) => {
   const section = sections[Number(button.dataset.section)];
   if (!section) return;
   toFrame({ type: "pe:scrollTo", id: section.id, selector: `#${section.id}`, text: section.text });
+  // Closed on the way out: it now overlays the document, and the whole point of
+  // the click was to look at the part of it underneath.
+  setNav(false);
 });
 
 function renderContract(): void {
@@ -2257,6 +2289,12 @@ function handleKey(event: Keystroke): void {
   }
   if (event.key === "Escape") {
     if (!overlay.hidden) return closeOverlay();
+    // Before the gestures: it is on screen and over the document, so it is the
+    // most immediate thing Escape can mean.
+    if (navOpen()) {
+      setNav(false);
+      return navToggle.focus();
+    }
     if (gesture) return armGesture(null);
     if (repointing) {
       repointing = null;
@@ -2308,7 +2346,7 @@ function handleKey(event: Keystroke): void {
   }
   if (event.key === "/") {
     event.preventDefault();
-    navigator_.open = true;
+    setNav(true);
     return findBox.focus();
   }
   // The composer is where every note starts and reaching it meant a mouse trip
@@ -2487,9 +2525,10 @@ function commands(): Command[] {
     })),
     { label: "Send the review", keys: "⇧⌘Enter", run: () => void sendReview() },
     { label: "Find in the document", keys: "/", run: () => {
-      navigator_.open = true;
+      setNav(true);
       findBox.focus();
     } },
+    { label: "The document's sections", hint: "outline", run: () => setNav(true) },
     { label: "Filter your notes", keys: "⌘F", run: () => search.focus() },
     { label: "Version history and diff", keys: "⌘H", run: () => void openHistory() },
     { label: "Undo the last change", keys: "⌘Z", run: () => undoButton.click() },
@@ -3564,15 +3603,21 @@ function connect(): void {
         presenceState = payload.state;
         agentView = payload.agent;
         presence.dataset.state = payload.state;
-        const who = agentView.session ? ` · ${agentView.session}` : "";
-        presence.textContent =
+        // The session id is in its own element so the toolbar can drop it when it
+        // needs the width: it is the least load-bearing thing in the bar — the
+        // tooltip carries it, and the state word is the part anyone reads.
+        const who = agentView.session ? `<span class="who"> · ${escapeHtml(agentView.session)}</span>` : "";
+        const state =
           presenceState === "working"
-            ? `agent working…${who}`
+            ? "agent working…"
             : presenceState === "listening"
-              ? `${agentView.viaHooks ? "agent connected" : "agent listening"}${who}`
+              ? agentView.viaHooks
+                ? "agent connected"
+                : "agent listening"
               : agentView.session
-                ? `agent idle · ${agentView.session}`
+                ? "agent idle"
                 : "no agent";
+        presence.innerHTML = `${escapeHtml(state)}${who}`;
         presence.title = agentView.session
           ? `Bound to Claude session ${agentView.session}…${
               agentView.lastContact ? `\nLast seen ${new Date(agentView.lastContact).toLocaleTimeString()}` : "\nNot seen yet"

@@ -658,6 +658,39 @@ otherwise a scroll through the outline.
   worth having.
 - **Matching is a subsequence**, so a half-remembered name still finds the thing.
 
+**The document navigator lives in the toolbar, not the panel.** It was the first
+of four drawers there, which is the wrong place twice over: it is the only part of
+that panel that was never about the review, and it competed for vertical space
+with the notes. Measured, with every drawer open: the list sat pinned to its 132px
+floor at every window height up to 1100px, and clears it once the navigator is
+gone. As a popover it also gets more room than the drawer's 26vh cap ever allowed.
+
+A popover costs three dismissals a drawer did not need — Escape, a click away, and
+picking a section — and all three go through one `setNav`. Escape takes it before
+the gestures, because it is on screen and over the document.
+
+**A control added to the toolbar has to pay for its own width.** The bar needs
+1058px of the 1128px it has at a 1500px window; before the Document button it
+needed 985px. Unpaid, that moved the wrap threshold from a ~1357px window to
+~1430px — straight through common laptop widths — and a second toolbar row costs
+the artifact height across the full width of the app, permanently, which is a
+worse trade than whatever the control was added for. It is paid for by dropping
+the shortcut hint and the agent's session id when the bar is under 1060px.
+
+Those thresholds are **container queries on `.bar`, never `@media`**: the panel is
+user-resizable, so the bar's width and the window's width are independent, and a
+media query gives the wrong answer to anyone who has dragged the panel. Note that
+`container-type: inline-size` also makes `.bar` a containing block for
+`position: fixed` descendants, so a popover in there cannot be positioned against
+the viewport.
+
+Two things to know before testing this: **count toolbar rows by height, not by
+distinct child offsets.** The controls have different heights and are vertically
+centred, so their `top` values differ *within* one row — counting those reports
+five rows for a bar that has one. And the horizontal-overflow test cannot catch a
+wrap at all, because wrapping is precisely how the bar avoids overflowing; that is
+why the one-pixel wrap this introduced went unnoticed until it was looked at.
+
 The same principle covers the rest of the panel's affordances. Each one existed as
 a capability the tool already had and never offered:
 

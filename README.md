@@ -304,7 +304,10 @@ flagged and offered ranked candidates to re-point to in one click, rather than
 the tool guessing and attaching your note to the wrong element.
 
 `⌘F` filters notes by text or anchor. `/` searches inside the document itself,
-and the outline lists every section with a count of the notes open on it.
+and the outline — the **Document** button in the toolbar — lists every section
+with a count of the notes open on it. It sits beside the file name rather than in
+the panel: it is the one part of the panel that was never about the review, and
+the notes are what the panel is for.
 
 ---
 
@@ -525,7 +528,7 @@ The presence indicator shows which session is bound and when it was last seen.
 | `⌘Enter` | Add the note you are typing |
 | `⇧⌘Enter` | Send the review |
 | `⌘F` | Filter notes |
-| `/` | Find in the document |
+| `/` | Find in the document — opens the Document popover in the toolbar |
 | `⌘Z` | Undo the last change |
 | `⇧⌘Z` | Put it back |
 | `⌘H` | Version history |

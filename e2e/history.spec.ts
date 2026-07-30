@@ -92,7 +92,10 @@ test("churn names the sections that keep being rewritten", async ({ page }) => {
 });
 
 test("the navigator lists the document's sections and finds text in it", async ({ page }) => {
-  await page.locator("#navigator").click();
+  // It lives in the top bar now, as a popover: it is the one part of the review
+  // panel that was never about the review, and it was taking vertical space from
+  // the notes.
+  await page.locator("#navToggle").click();
   await expect(page.locator("#outline")).toContainText("The idea", { timeout: 10_000 });
   await expect(page.locator("#outline")).toContainText("Risks");
 
@@ -102,7 +105,7 @@ test("the navigator lists the document's sections and finds text in it", async (
 });
 
 test("clicking an outline entry scrolls the artifact to it", async ({ page }) => {
-  await page.locator("#navigator").click();
+  await page.locator("#navToggle").click();
   await page.locator("#outline [data-section]").last().click();
   await page.waitForTimeout(900);
   const scrolled = await artifactFrame(page).locator("body").evaluate(() => window.scrollY);

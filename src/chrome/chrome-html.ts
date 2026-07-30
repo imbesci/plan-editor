@@ -53,6 +53,27 @@ export function renderChrome(session: Session): string {
         <span>${escapeHtml(name)}</span><span class="caret">▾</span>
       </button>
 
+      <!-- The document's structure belongs next to the document's name, not in
+           the review panel: it is the one section of that panel that was never
+           about the review, and it was taking vertical space from the notes —
+           the thing the panel exists for. A popover rather than a drawer, so it
+           costs nothing at all until it is asked for. -->
+      <div class="doc-nav" id="docNav">
+        <!-- The visible label is hidden when the toolbar cannot spare the width,
+             so the accessible name cannot come from it. -->
+        <button class="doc-toggle" id="navToggle" type="button" aria-expanded="false" aria-controls="navPanel"
+                aria-label="Document sections and find" title="The document's sections, and find in it (/)">
+          <span class="doc-icon" aria-hidden="true">☰</span><span class="doc-label">Document</span><b id="outlineCount">0</b>
+        </button>
+        <div class="doc-panel" id="navPanel" hidden>
+          <div class="finder">
+            <input id="find" class="search" type="search" placeholder="Find in the document…  /" autocomplete="off">
+            <span class="find-count" id="findCount"></span>
+          </div>
+          <div class="outline" id="outline"></div>
+        </div>
+      </div>
+
       <!-- Three ways to say what you want, in order of how precise they are:
            prose, the exact words, the structural operation. They are mutually
            exclusive gestures, so they sit together and only one can be lit. -->
@@ -118,18 +139,6 @@ export function renderChrome(session: Session): string {
       <div class="filters" id="filters" hidden></div>
       <input id="search" class="search" type="search" placeholder="Filter notes…  ⌘F" autocomplete="off">
     </div>
-
-    <!-- The document's own structure. Past ~15 notes the list stops being
-         scannable and the only shape the human still has in their head is the
-         document's. -->
-    <details class="drawer" id="navigator">
-      <summary>Document <b id="outlineCount">0</b></summary>
-      <div class="finder">
-        <input id="find" class="search" type="search" placeholder="Find in the document…  /" autocomplete="off">
-        <span class="find-count" id="findCount"></span>
-      </div>
-      <div class="outline" id="outline"></div>
-    </details>
 
     <!-- Deliberately not a review item: these outlive every review. -->
     <details class="drawer standing" id="standingPanel">
