@@ -67,11 +67,17 @@ body {
 }
 .layout { display: grid; grid-template-columns: 1fr 340px; height: 100%; }
 .stage { display: flex; flex-direction: column; min-width: 0; }
+/* `min-width: 0` and the wrap are what stop the toolbar dictating the width of
+ * the whole app. A flex row defaults to its min-content width, so as the window
+ * narrowed the bar refused to shrink, pushed the grid wider than the viewport,
+ * and took the panel off the right-hand edge with it — the Send button was
+ * clipped before the artifact was even uncomfortable. */
 .bar {
-  display: flex; align-items: center; gap: 16px;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   padding: 10px 16px; border-bottom: 1px solid var(--line);
+  min-width: 0;
 }
-.file { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 /* The three gestures sit together and push right as one group: they are
    alternatives to each other, and a toolbar that spread them apart implied you
    could arm two. */
@@ -134,7 +140,16 @@ iframe { width: 100%; height: 100%; border: 0; display: block; background: var(-
   border-left: 1px solid var(--line); background: var(--panel);
 }
 .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; padding: 14px 16px 8px; }
-.list { flex: 1; overflow-y: auto; padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+/* The review list is the point of the panel, so it gets a floor.
+ *
+ * `overflow-y: auto` zeroes a flex item's automatic minimum height, so with
+ * three drawers open above it the list collapsed to a few pixels — the notes,
+ * the thing being reviewed, were squeezed into a sliver between two headers
+ * while an outline nobody had asked for took half the panel. */
+.list {
+  flex: 1 1 auto; min-height: 132px; overflow-y: auto;
+  padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px;
+}
 .empty { color: var(--muted); font-size: 13px; padding: 8px 4px; }
 
 .card {
@@ -298,13 +313,13 @@ button:disabled { opacity: .5; cursor: default; }
 .file .caret { color: var(--muted); font-size: 10px; }
 
 /* --- conversation --- */
-.conversation { border-top: 1px solid var(--line); }
+.conversation { flex: 0 0 auto; border: 1px solid var(--line); border-radius: 10px; margin: 8px 12px; background: var(--bg); overflow: hidden; }
 .conversation summary {
   padding: 10px 16px; font-size: 12px; text-transform: uppercase;
   letter-spacing: .06em; color: var(--muted); cursor: pointer; user-select: none;
 }
 .conversation summary b { color: var(--fg); }
-.chat { max-height: 190px; overflow-y: auto; padding: 0 16px 12px; display: flex; flex-direction: column; gap: 8px; }
+.chat { max-height: min(190px, 24vh); overflow-y: auto; padding: 0 16px 12px; display: flex; flex-direction: column; gap: 8px; }
 .chat .msg { font-size: 13px; color: var(--fg); }
 .chat .msg b { display: inline-block; margin-right: 5px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
 .chat .msg.agent b { color: var(--accent); }
@@ -481,17 +496,45 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
 .gesture-select.armed { background: var(--pending); border-color: var(--pending); color: #1a1205; font-weight: 600; }
 
 /* --- panel drawers: navigator, contract, locks --- */
-.drawer { border-bottom: 1px solid var(--line); }
+/* Each drawer reads as its own block.
+ *
+ * Stacked with nothing but a hairline between them they became a wall of
+ * identical bars — Document, Standing contract, Locked regions, Conversation,
+ * one after another at the same weight — and on a small window that wall is
+ * most of the panel. Nothing in it was findable at a glance, and a note card
+ * sitting between two of them looked like it belonged to neither. */
+.drawer {
+  /* Never shrink. As flex items the drawers were compressed to ~12px slivers
+     with their labels clipped whenever the panel got short — three unlabelled
+     grey bars where the navigation used to be. */
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin: 8px 12px;
+  background: var(--bg);
+  overflow: hidden;
+}
 .drawer[hidden] { display: none; }
 .drawer > summary {
-  padding: 9px 16px; font-size: 11.5px; text-transform: uppercase;
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; font-size: 11.5px; text-transform: uppercase;
   letter-spacing: .06em; color: var(--muted); cursor: pointer; user-select: none;
 }
-.drawer > summary b { color: var(--fg); }
+.drawer > summary:hover { color: var(--fg); background: var(--panel); }
+/* The rule only appears once the drawer is open, so a row of closed drawers
+   stays quiet instead of drawing four more lines across the panel. */
+.drawer[open] > summary { border-bottom: 1px solid var(--line); }
+.drawer > summary b {
+  color: var(--fg); font-size: 11px; line-height: 1;
+  padding: 3px 7px; border-radius: 999px;
+  background: var(--panel); border: 1px solid var(--line);
+}
 .drawer-hint { margin: 0 16px 8px; font-size: 12px; color: var(--muted); }
 .finder { display: flex; align-items: center; gap: 8px; padding: 0 16px 8px; }
 .find-count { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
-.outline { max-height: 210px; overflow-y: auto; padding: 0 12px 10px; display: flex; flex-direction: column; gap: 1px; }
+/* Capped against the window too, not just a fixed pixel count: on a short
+   window 210px of outline is most of the panel. */
+.outline { max-height: min(210px, 26vh); overflow-y: auto; padding: 0 12px 10px; display: flex; flex-direction: column; gap: 1px; }
 .section {
   flex: 0 0 auto; display: flex; align-items: center; gap: 8px; text-align: left;
   background: transparent; border: 0; border-radius: 6px; color: var(--fg);
@@ -509,7 +552,7 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
    these persist, so they are typeset as a list of statements rather than as
    cards with a lifecycle. */
 .standing { background: color-mix(in srgb, var(--accent) 5%, transparent); }
-.rules { padding: 0 12px 8px; display: flex; flex-direction: column; gap: 4px; }
+.rules { max-height: min(220px, 26vh); overflow-y: auto; padding: 0 12px 8px; display: flex; flex-direction: column; gap: 4px; }
 .rule {
   display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: baseline;
   padding: 7px 10px; border-left: 3px solid var(--accent); border-radius: 0 6px 6px 0;
@@ -525,7 +568,7 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
 .retired > summary { font-size: 11.5px; color: var(--muted); cursor: pointer; padding: 4px 2px; }
 .rule-add { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 6px; }
 
-.locklist { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 4px; }
+.locklist { max-height: min(200px, 24vh); overflow-y: auto; padding: 0 12px 12px; display: flex; flex-direction: column; gap: 4px; }
 .lock {
   display: flex; gap: 8px; align-items: baseline; font-size: 12.5px;
   padding: 6px 10px; border: 1px dashed var(--line); border-radius: 6px; background: var(--bg);
@@ -674,3 +717,58 @@ body[data-phase="sent"] #send { background: var(--pending); border-color: var(--
 
 /* Sheets scroll as one column; the versions strip keeps its own row scroll. */
 .sheet > .form, .sheet > .shortcuts, .sheet > .sessions { overflow-y: auto; }
+
+/* --- small windows ---------------------------------------------------------
+ *
+ * There were no breakpoints at all: `1fr 340px` held the panel at full width
+ * while the artifact was squeezed to nothing, and below roughly 800px the
+ * layout simply overflowed the viewport.
+ *
+ * Reviewing needs both halves legible at once, so the panel narrows first and
+ * only stacks when side-by-side stops being readable. Stacked, the artifact
+ * keeps the top of the window — it is the thing being reviewed — and the panel
+ * takes the rest with its own scroll. `⌘\` still collapses the panel entirely
+ * when the document is what matters. */
+@media (max-width: 1180px) {
+  .layout { grid-template-columns: 1fr 300px; }
+  .drawer { margin: 6px 10px; }
+}
+
+@media (max-width: 860px) {
+  .layout { grid-template-columns: 1fr; grid-template-rows: minmax(220px, 42%) 1fr; }
+  .panel { border-left: 0; border-top: 1px solid var(--line); overflow-y: auto; }
+  /* Stacked, the panel is short and every section competes for it. Rather than
+     nesting a scroller inside a scroller, the whole panel becomes one column
+     that scrolls and the list gives up its own. */
+  .list { overflow: visible; flex: 0 0 auto; min-height: 0; }
+  .outline, .rules, .locklist, .chat { max-height: none; }
+  /* Send has to stay reachable without scrolling to the bottom first — but a
+     full-size composer pinned to a short panel leaves almost nothing above it,
+     so it is tightened here rather than merely pinned. */
+  .composer { position: sticky; bottom: 0; background: var(--panel); padding: 10px; gap: 6px; }
+  /* `rows` sets the intrinsic height, so min-height alone cannot shrink these —
+     it takes an explicit height. Still user-resizable. */
+  .composer > textarea { height: 46px; min-height: 46px; }
+  .overall textarea { height: 40px; min-height: 40px; }
+  .overall { padding-top: 8px; margin-top: 2px; }
+  .drawer { margin: 8px 10px; }
+  /* Collapsing hides the panel, so the artifact needs the row back. */
+  .layout.collapsed { grid-template-rows: 1fr; }
+
+  .bar { gap: 10px; padding: 8px 12px; }
+  /* The shortcut hints are the first thing to go: they are a reminder, not a
+     control, and every pixel here is one the artifact does not get. */
+  .bar kbd { display: none; }
+  .presence { max-width: 100%; }
+
+  .panel h2, .panel-head { padding-left: 12px; padding-right: 12px; }
+  .list { padding: 0 10px 12px; }
+}
+
+/* Below this the toolbar cannot hold its controls on one line at all, so it is
+   allowed to wrap onto two rather than clipping them off the edge. */
+@media (max-width: 620px) {
+  .gestures { margin-left: 0; width: 100%; }
+  .toggle-text { font-size: 12px; }
+  .drawer { margin: 6px 8px; }
+}
